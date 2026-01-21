@@ -1,1 +1,0 @@
-{"task_file": "trec.jsonl", "dataset_name": "trec", "length_meta": 3806, "prompt_chars": 22071, "answers_gold": ["Other location"], "answer_pred": "Vik", "ram_rss_mb_before": 202.140625, "ram_rss_mb_after": 217.28125, "input_tokens": 5664, "output_tokens": 64, "latency_s": 23.198772417003056, "tokens_per_sec": 2.758766664441802}

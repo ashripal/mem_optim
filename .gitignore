@@ -205,3 +205,6 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Data
+/Users/ashripal/mem_optim/thesis_code/baseline_trunc/tier2_disk/longbench_repo
