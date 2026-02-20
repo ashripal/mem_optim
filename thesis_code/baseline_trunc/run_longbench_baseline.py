@@ -69,11 +69,26 @@ def find_jsonl_files(repo_dir: Path) -> list[Path]:
 def load_jsonl_as_dataset(path: Path):
     return load_dataset("json", data_files=str(path), split="train")
 
-def build_prompt(example: Dict[str, Any]) -> str:
-    context = example.get("context", "")
+# def build_prompt(example: Dict[str, Any]) -> str:
+#     context = example.get("context", "")
+#     question = example.get("input", "")
+#     return (
+#         "Use the following context to answer the question.\n\n"
+#         f"Context:\n{context}\n\n"
+#         f"Question:\n{question}\n"
+#         "Answer (be concise):"
+#     )
+def build_prompt(example: Dict[str, Any], use_context: bool) -> str:
     question = example.get("input", "")
+    if not use_context:
+        return (
+            "Answer the question as best as you can.\n\n"
+            f"Question:\n{question}\n"
+            "Answer (be concise):"
+        )
+    context = example.get("context", "")
     return (
-        "Use the following context to answer the question.\n\n"
+        "Use the following context to answer the question. Strictly use the context provided and no other information to answer the question.\n\n"
         f"Context:\n{context}\n\n"
         f"Question:\n{question}\n"
         "Answer (be concise):"
@@ -153,6 +168,13 @@ def main() -> None:
     ap.add_argument("--max_cache_items", type=int, default=64)
     ap.add_argument("--max_input_tokens", type=int, default=8192)
     ap.add_argument("--cpu_fallback_on_long", action="store_true", help="If True, use CPU when MPS OOM occurs")
+    ap.add_argument(
+    "--baseline_mode",
+    choices=["llm", "oracle_gold", "llm_no_context"],
+    default="llm",
+    help="llm = LLM answers using dataset context; llm_no_context = LLM answers without dataset context; oracle_gold = use dataset's gold answer (upper bound)"
+)
+
     args = ap.parse_args()
 
     tier2_repo = Path(args.tier2_repo).resolve()
@@ -235,8 +257,15 @@ def main() -> None:
                     break
 
                 # prompt = build_prompt(example)
-                messages = [{"role": "user", "content": build_prompt(example)}]
+                # messages = [{"role": "user", "content": build_prompt(example)}]
+                # prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+                use_context = (args.baseline_mode == "llm")  # default: uses dataset context
+                if args.baseline_mode == "llm_no_context":
+                    use_context = False
+
+                messages = [{"role": "user", "content": build_prompt(example, use_context=use_context)}]
                 prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+
 
                 # approx prompt length (for routing + logs)
                 # token_ids = tokenizer(
@@ -291,6 +320,9 @@ def main() -> None:
                 mem_after = rss_mb()
 
                 record = {
+                    "baseline_mode": args.baseline_mode,
+                    "used_dataset_context": (args.baseline_mode == "llm"),
+                    "used_llm": (args.baseline_mode in ["llm", "llm_no_context"]),
                     "status": status,
                     "task_file": task_file.name,
                     # "approx_prompt_tokens": approx_len,
