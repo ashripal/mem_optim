@@ -62,3 +62,4 @@ tzdata==2025.3
 urllib3==2.6.3
 xxhash==3.6.0
 yarl==1.22.0
+matplotlib==3.9.0
