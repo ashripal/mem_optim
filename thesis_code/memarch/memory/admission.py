@@ -1,174 +1,141 @@
-# memarch/memory/policy.py
+# memarch/memory/admission.py
 """
-Deterministic retrieval + budget policies for memarch.
+Admission policy: decides what gets stored after generation.
 
-Phase 1 focus:
-- Exact-match routing only (semantic disabled by default)
-- Personalization-first scope ordering
-- Safety gating: freshness (TTL) + context match + version scoping
+Phase 1 goals:
+- deterministic (no LLM decisions)
+- lightweight + unit-testable
+- scope-aware TTL + storage enablement
 
-This module contains *decision rules*, not storage or model calls.
-Keep it pure and unit-testable.
+This module is called by MemoryManager.store().
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
-from memarch.memory.schema import MemoryItem, MemoryQuery, MemoryHit, MatchType, Scope
-
-
-@dataclass(frozen=True)
-class BudgetPolicy:
-    """
-    Guardrails to keep memory operations bounded on constrained devices.
-
-    Phase 1:
-      - exact-match lookups are cheap, but disk can still be slow
-      - these budgets prevent pathological loops or huge scans
-    """
-    max_ram_reads: int = 64
-    max_disk_reads: int = 16
-    allow_semantic: bool = False  # keep off for Phase 1
-
-    def __post_init__(self) -> None:
-        if self.max_ram_reads < 0 or self.max_disk_reads < 0:
-            raise ValueError("max_ram_reads/max_disk_reads must be >= 0")
+from memarch.memory.schema import MemoryQuery, QualitySignals, Scope
 
 
 @dataclass(frozen=True)
-class RetrievalPolicy:
+class AdmissionPolicy:
     """
-    Rules for deciding if a retrieved MemoryItem is safe to use.
+    Controls whether we store generated answers and where.
 
-    These checks should be cheap and deterministic.
+    Storage enablement:
+      - allow_session/user/cohort/global decide which scopes can be written.
+
+    Content gating:
+      - min_answer_chars avoids storing trivial outputs
+      - max_answer_chars avoids huge responses filling disk
+
+    Quality gating (optional):
+      - if require_success_if_provided=True, then QualitySignals.success must be True
+        when it is provided (default behavior).
     """
-    scope_order: List[Scope]
-    require_context_match: bool = True
-    require_prompt_version_match: bool = True
-    require_model_id_match: bool = True
-    enforce_ttl: bool = True
+    allow_session: bool = True
+    allow_user: bool = True
+    allow_cohort: bool = False
+    allow_global: bool = False
 
-    def __post_init__(self) -> None:
-        if not self.scope_order:
-            raise ValueError("scope_order must be non-empty")
+    min_answer_chars: int = 20
+    max_answer_chars: int = 50_000
+
+    require_success_if_provided: bool = True
+
+    # TTL per scope (seconds). None means "no expiry" (not recommended for session).
+    ttl_session_seconds: int = 60 * 60 * 2        # 2 hours
+    ttl_user_seconds: int = 60 * 60 * 24 * 14     # 14 days
+    ttl_cohort_seconds: int = 60 * 60 * 24 * 30   # 30 days
+    ttl_global_seconds: int = 60 * 60 * 24 * 90   # 90 days
 
 
-def default_retrieval_policy() -> RetrievalPolicy:
-    return RetrievalPolicy(scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL])
+def default_admission_policy() -> AdmissionPolicy:
+    # Phase 1: write personalization memory (session/user), no cohort/global by default.
+    return AdmissionPolicy()
 
 
-def budget_from_query(mq: MemoryQuery) -> BudgetPolicy:
+def decide_store_scopes(mq: MemoryQuery, policy: AdmissionPolicy) -> List[Scope]:
     """
-    Construct BudgetPolicy from MemoryQuery.
+    Decide which scopes are *eligible* to store into for this query.
 
-    This keeps budgets configurable from config/runner without coupling policy to config.py.
+    Note: this does not apply content/quality gating; that's done in should_store().
     """
-    return BudgetPolicy(
-        max_ram_reads=mq.max_ram_reads,
-        max_disk_reads=mq.max_disk_reads,
-        allow_semantic=mq.allow_semantic,
-    )
+    scopes: List[Scope] = []
+
+    if policy.allow_session and mq.session_id:
+        scopes.append(Scope.SESSION)
+
+    if policy.allow_user and mq.user_id:
+        scopes.append(Scope.USER)
+
+    if policy.allow_cohort and mq.cohort_id:
+        scopes.append(Scope.COHORT)
+
+    if policy.allow_global:
+        scopes.append(Scope.GLOBAL)
+
+    return scopes
 
 
-def _now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+def choose_ttl_seconds(scope: Scope, policy: AdmissionPolicy) -> int:
+    if scope == Scope.SESSION:
+        return int(policy.ttl_session_seconds)
+    if scope == Scope.USER:
+        return int(policy.ttl_user_seconds)
+    if scope == Scope.COHORT:
+        return int(policy.ttl_cohort_seconds)
+    if scope == Scope.GLOBAL:
+        return int(policy.ttl_global_seconds)
+    # Defensive fallback
+    return int(policy.ttl_user_seconds)
 
 
-def is_fresh(item: MemoryItem, now_utc: Optional[datetime] = None) -> bool:
-    if item.expires_at_utc is None:
-        return True
-    now = now_utc or _now_utc()
-    return now < item.expires_at_utc
-
-
-def context_matches(mq: MemoryQuery, item: MemoryItem) -> bool:
-    """
-    Phase 1 context matching:
-    - MemoryItem.context_signature must match mq.context_signature used for keying
-
-    NOTE:
-    In Phase 1, we usually enforce context matching through the key itself
-    (since key includes context signature). This function exists for defense-in-depth
-    and for cases where you may relax keying later.
-    """
-    # We do not compute signatures here to keep policy pure.
-    # manager.py should pass/compare signatures if needed.
-    return True
-
-
-def version_matches(mq: MemoryQuery, item: MemoryItem, *, require_model: bool, require_prompt: bool) -> bool:
-    if require_model and item.provenance.model_id != mq.model_id:
-        return False
-    if require_prompt and item.provenance.prompt_version != mq.prompt_version:
-        return False
-    return True
-
-
-def accept_item(
+def should_store(
     mq: MemoryQuery,
-    item: MemoryItem,
-    *,
-    policy: RetrievalPolicy,
-    now_utc: Optional[datetime] = None,
-    query_context_signature: Optional[str] = None,
-) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Decide whether to accept a retrieved item for reuse.
-
-    Returns:
-      (accepted, debug_info)
-    """
-    dbg: Dict[str, Any] = {"reason": "accepted"}
-
-    # TTL / freshness
-    if policy.enforce_ttl:
-        if not is_fresh(item, now_utc=now_utc):
-            dbg["reason"] = "expired"
-            return False, dbg
-
-    # Version gating
-    if not version_matches(
-        mq,
-        item,
-        require_model=policy.require_model_id_match,
-        require_prompt=policy.require_prompt_version_match,
-    ):
-        dbg["reason"] = "version_mismatch"
-        dbg["item_model_id"] = item.provenance.model_id
-        dbg["item_prompt_version"] = item.provenance.prompt_version
-        return False, dbg
-
-    # Context gating (defense-in-depth)
-    if policy.require_context_match and query_context_signature is not None:
-        if item.context_signature != query_context_signature:
-            dbg["reason"] = "context_mismatch"
-            return False, dbg
-
-    return True, dbg
-
-
-def score_exact_hit() -> float:
-    """Exact-match hits get a perfect confidence score."""
-    return 1.0
-
-
-def make_hit_debug(
+    answer_text: str,
+    quality: QualitySignals,
     *,
     scope: Scope,
-    namespace: str,
-    source: str,
-    accepted_reason: str,
-    extra: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    d: Dict[str, Any] = {
-        "scope": scope.value,
-        "namespace": namespace,
-        "source": source,
-        "reason": accepted_reason,
-    }
-    if extra:
-        d.update(extra)
-    return d
+    policy: AdmissionPolicy,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Content/quality gating: returns (ok_to_store, debug_dict).
+    """
+    ans = answer_text or ""
+    n = len(ans)
+
+    if n < policy.min_answer_chars:
+        return False, {"reason": "too_short", "len": n, "min": policy.min_answer_chars}
+
+    if n > policy.max_answer_chars:
+        return False, {"reason": "too_large", "len": n, "max": policy.max_answer_chars}
+
+    if policy.require_success_if_provided and (quality is not None):
+        # If success is explicitly False, reject.
+        if hasattr(quality, "success") and (quality.success is False):
+            return False, {"reason": "quality_failed"}
+
+    # Scope enablement checks (defensive; scopes are usually pre-filtered)
+    if scope == Scope.SESSION and not (policy.allow_session and mq.session_id):
+        return False, {"reason": "scope_disabled_or_missing_id", "scope": scope.value}
+    if scope == Scope.USER and not (policy.allow_user and mq.user_id):
+        return False, {"reason": "scope_disabled_or_missing_id", "scope": scope.value}
+    if scope == Scope.COHORT and not (policy.allow_cohort and mq.cohort_id):
+        return False, {"reason": "scope_disabled_or_missing_id", "scope": scope.value}
+    if scope == Scope.GLOBAL and not policy.allow_global:
+        return False, {"reason": "scope_disabled_or_missing_id", "scope": scope.value}
+
+    return True, {"reason": "accepted"}
+
+
+# Convenience wrapper used by some callers
+def should_store_default(
+    mq: MemoryQuery,
+    answer_text: str,
+    quality: QualitySignals,
+    *,
+    scope: Scope,
+) -> Tuple[bool, Dict[str, Any]]:
+    return should_store(mq, answer_text, quality, scope=scope, policy=default_admission_policy())
