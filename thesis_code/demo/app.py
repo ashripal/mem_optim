@@ -339,6 +339,9 @@ def render_turn_card(turn: Dict[str, Any]) -> None:
     st.markdown("**Answer**")
     st.write(turn["answer"])
 
+    with st.expander("Debug: raw meta"):
+        st.write(turn.get("meta_raw", {}))
+
     with st.expander("Context used (PDF chunks)"):
         st.write(
             {
@@ -429,7 +432,8 @@ def handle_ask(question: str) -> None:
         user_id=(ident["user_id"] or None),
         session_id=(ident["session_id"] or None),
         cohort_id=(ident["cohort_id"] or None) if ident.get("cohort_id") else None,
-        task=ident["task"],
+        # task=ident["task"],
+        task=f"{ident['task']}|doc={doc['doc_signature'][:12]}",
         model_id=ident["model_id"],
         prompt_version=ident["prompt_version"],
         context={
@@ -456,7 +460,17 @@ def handle_ask(question: str) -> None:
     turn_id = len(turns) + 1
 
     # Namespaces checked: your manager may already provide this; otherwise keep minimal.
-    namespaces_checked = meta.get("namespaces_checked") or []
+    # namespaces_checked = meta.get("namespaces_checked") or []
+    expected_scopes = []
+    if ident.get("user_id"):
+        expected_scopes.append(f"user:{ident['user_id']}")
+    if ident.get("session_id"):
+        expected_scopes.append(f"session:{ident['session_id']}")
+    if ident.get("cohort_id"):
+        expected_scopes.append(f"cohort:{ident['cohort_id']}")
+    expected_scopes.append("global")
+
+    namespaces_checked = meta.get("namespaces_checked") or expected_scopes
 
     # Prompt preview: only available on compute path (miss). On hit, leave None.
     prompt_preview = generator.last_prompt if (not meta.get("used_memory") and cfg["show_prompt_preview"]) else None
@@ -478,9 +492,46 @@ def handle_ask(question: str) -> None:
         "timings_ms": timings,
         "stored": meta.get("stored", None),
         "stored_scopes": meta.get("stored_scopes", []),
+        "meta_raw": meta
     }
     turns.append(turn)
 
+def hard_reset_memory() -> None:
+    mem = st.session_state["mem"]
+
+    # 1) Clear RAM if present
+    if mem.get("ram") is not None:
+        mem["ram"].clear()
+
+    # 2) Close disk handle if your DiskStoreSQLite has it (safe best-effort)
+    if mem.get("disk") is not None:
+        try:
+            mem["disk"].close()  # implement in DiskStoreSQLite if missing
+        except Exception:
+            pass
+
+    # 3) Drop references so Streamlit will recreate objects
+    mem["disk"] = None
+    mem["manager"] = None
+
+    # 4) Delete the sqlite file
+    try:
+        if os.path.exists(mem["disk_path"]):
+            os.remove(mem["disk_path"])
+    except Exception as e:
+        st.warning(f"Could not delete disk db: {e}")
+
+    # 5) Rebuild fresh
+    build_or_rebuild_manager(clear_ram=False)
+
+# In sidebar:
+if st.button("Clear RAM"):
+    st.session_state["mem"]["ram"].clear()
+    st.success("RAM cleared.")
+
+if st.button("Hard reset (clear RAM + delete Disk DB)"):
+    hard_reset_memory()
+    st.success("RAM cleared and disk DB deleted; fresh manager created.")
 
 # ======================================================================================
 # Streamlit app
