@@ -301,30 +301,87 @@ class MemoryManager:
 
         return stored
 
+    # def answer(self, mq: MemoryQuery, generator: Generator) -> Tuple[str, Dict[str, Any]]:
+    #     """
+    #     Primary entrypoint used by pipeline:
+    #       - retrieve from memory
+    #       - if hit and configured to return directly -> return answer
+    #       - else generate and store
+
+    #     Returns:
+    #       (answer_text, metadata)
+    #     """
+    #     hit = self.retrieve(mq)
+    #     if hit is not None and self._cfg.return_memory_directly:
+    #         return hit.item.answer_text, {
+    #             "used_memory": True,
+    #             "hit": {
+    #                 "source_tier": hit.source_tier.value,
+    #                 "match_type": hit.match_type.value,
+    #                 "score": hit.score,
+    #                 **dict(hit.debug),
+    #             },
+    #         }
+
+    #     # Miss -> generate
+    #     answer_text, provenance, quality = generator.generate(mq, retrieved=hit)
+
+    #     store_dbg = self.store(
+    #         mq,
+    #         answer_text=answer_text,
+    #         provenance=provenance,
+    #         quality=quality,
+    #         meta={
+    #             "used_memory_context": hit is not None,
+    #             "memory_context_source": hit.source_tier.value if hit else None,
+    #         },
+    #     )
+
+    #     return answer_text, {
+    #         "used_memory": False,
+    #         "generated": True,
+    #         "hit_before_generate": {
+    #             "present": hit is not None,
+    #             "source_tier": hit.source_tier.value if hit else None,
+    #             "match_type": hit.match_type.value if hit else None,
+    #         },
+    #         "store": store_dbg,
+    #     }
+
     def answer(self, mq: MemoryQuery, generator: Generator) -> Tuple[str, Dict[str, Any]]:
         """
         Primary entrypoint used by pipeline:
-          - retrieve from memory
-          - if hit and configured to return directly -> return answer
-          - else generate and store
+        - retrieve from memory
+        - if hit and configured to return directly -> return answer
+        - else generate and store
 
         Returns:
-          (answer_text, metadata)
+        (answer_text, metadata)
         """
         hit = self.retrieve(mq)
+
+        # STRICT Phase 1 invariant:
+        # If we have a hit and return_memory_directly is enabled, NEVER call the generator.
         if hit is not None and self._cfg.return_memory_directly:
             return hit.item.answer_text, {
                 "used_memory": True,
+                "generated": False,
+                "source_tier": hit.source_tier.value,
+                "match_type": hit.match_type.value,
+                "score": hit.score,
                 "hit": {
-                    "source_tier": hit.source_tier.value,
-                    "match_type": hit.match_type.value,
-                    "score": hit.score,
                     **dict(hit.debug),
                 },
+                "stored": False,
+                "stored_scopes": [],
+                "memory_lookup_ms": 0.0,     # pipeline/evaluator can overwrite with measured values
+                "generation_ms_est": 0.0,
             }
 
-        # Miss -> generate
-        answer_text, provenance, quality = generator.generate(mq, retrieved=hit)
+        # Only reach this point on:
+        #   - true miss
+        #   - or a future mode where you intentionally regenerate despite a hit
+        answer_text, provenance, quality = generator.generate(mq, retrieved=None)
 
         store_dbg = self.store(
             mq,
@@ -332,19 +389,24 @@ class MemoryManager:
             provenance=provenance,
             quality=quality,
             meta={
-                "used_memory_context": hit is not None,
-                "memory_context_source": hit.source_tier.value if hit else None,
+                "used_memory_context": False,
+                "memory_context_source": None,
             },
         )
 
         return answer_text, {
             "used_memory": False,
             "generated": True,
+            "source_tier": "compute",
+            "match_type": None,
+            "score": None,
             "hit_before_generate": {
                 "present": hit is not None,
                 "source_tier": hit.source_tier.value if hit else None,
                 "match_type": hit.match_type.value if hit else None,
             },
+            "stored": len(store_dbg.get("stored", [])) > 0,
+            "stored_scopes": [x["scope"] for x in store_dbg.get("stored", [])],
             "store": store_dbg,
         }
 
