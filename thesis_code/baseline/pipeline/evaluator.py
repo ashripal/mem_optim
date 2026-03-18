@@ -20,6 +20,7 @@ from __future__ import annotations
 import time
 from typing import Any, Dict
 
+from baseline.utils.metrics import compute_basic_metrics
 from baseline.utils.system import get_rss_mb
 
 
@@ -64,20 +65,33 @@ def evaluate_example(
     rss_before = get_rss_mb()
 
     # ------------------------------
-    # Tier 1 lookup
+    # Total timer starts here
     # ------------------------------
+    total_t0 = time.time()
+
+    # ------------------------------
+    # Tier 1 lookup timing
+    # ------------------------------
+    lookup_t0 = time.time()
     cached = cache.get(cache_key)
+    lookup_latency_s = time.time() - lookup_t0
+
     cache_hit = cached is not None
 
     if cache_hit:
         output_text = cached["output_text"]
         meta = cached["meta"]
-        latency_s = 0.0
+
+        compute_latency_s = 0.0
+        served_from = "tier1_ram"
+        tier_path = ["tier1_ram"]
+        llm_bypassed = True
+
     else:
         # ------------------------------
         # Tier 0 compute
         # ------------------------------
-        t0 = time.time()
+        compute_t0 = time.time()
 
         generation = compute.generate(
             prompt=prompt,
@@ -85,12 +99,23 @@ def evaluate_example(
             max_new_tokens=getattr(cfg, "max_new_tokens", 64),
         )
 
-        latency_s = time.time() - t0
+        compute_latency_s = time.time() - compute_t0
+
+        if not generation.get("ok", False):
+            raise RuntimeError(
+                f"Tier0 generation failed on device={generation.get('device')}: "
+                f"{generation.get('error', 'unknown error')}"
+            )
+
+        if "output_text" not in generation:
+            raise RuntimeError(
+                f"Tier0 generation returned ok=True but no output_text. "
+                f"Keys={sorted(generation.keys())}"
+            )
 
         output_text = generation["output_text"]
         meta = generation
 
-        # Store in cache
         cache.put(
             cache_key,
             {
@@ -99,10 +124,21 @@ def evaluate_example(
             },
         )
 
+        served_from = "tier0_compute"
+        tier_path = ["tier1_ram", "tier0_compute"]
+        llm_bypassed = False
+
+    total_latency_s = time.time() - total_t0
+
     # ------------------------------
     # Memory after
     # ------------------------------
     rss_after = get_rss_mb()
+
+    # ------------------------------
+    # Quality metrics
+    # ------------------------------
+    quality = compute_basic_metrics(output_text, example)
 
     # ------------------------------
     # Build result record
@@ -112,17 +148,47 @@ def evaluate_example(
         "ok": True,
         "task": example.get("task"),
         "example_id": example.get("example_id"),
+
+        # Cache / serving behavior
         "cache_hit": cache_hit,
-        "latency_s": latency_s,
+        "served_from": served_from,
+        "source_tier": served_from,  # kept for compatibility with benchmark executor
+        "tier_path": tier_path,
+        "llm_bypassed": llm_bypassed,
+
+        # Latency breakdown
+        "latency_s": total_latency_s,
+        "lookup_latency_s": lookup_latency_s,
+        "compute_latency_s": compute_latency_s,
+        "gen_time_s": meta.get("gen_time_s"),
+
+        # Memory
         "rss_before_mb": rss_before,
         "rss_after_mb": rss_after,
         "rss_delta_mb": rss_after - rss_before,
+
+        # Generation metadata
         "input_tokens": meta.get("input_tokens"),
         "output_tokens": meta.get("output_tokens"),
         "device": meta.get("device"),
         "truncated": meta.get("truncated"),
+        "fallback_from": meta.get("fallback_from"),
+        "fallback_reason": meta.get("fallback_reason"),
+        "device_switch_persisted": meta.get("device_switch_persisted"),
+
+        # Output / scoring
+        "output_text": output_text,
+        "ref_text": quality.get("ref_text"),
+        "exact_match": quality.get("exact_match"),
+        "contains_answer": quality.get("contains_answer"),
+        "token_f1": quality.get("token_f1"),
+        "char_f1": quality.get("char_f1"),
+
+        # Throughput
         "tokens_per_second": (
-            meta.get("output_tokens", 0) / latency_s if latency_s > 0 else None
+            meta.get("output_tokens", 0) / compute_latency_s
+            if compute_latency_s and compute_latency_s > 0
+            else None
         ),
     }
 

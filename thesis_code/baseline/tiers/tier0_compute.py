@@ -18,7 +18,6 @@ This module should NOT:
 from __future__ import annotations
 
 import time
-from dataclasses import asdict
 from typing import Any, Dict, Optional, Tuple
 
 import torch
@@ -46,8 +45,7 @@ def _truncate_input_ids(
     Truncate tokenized input to max_input_tokens.
 
     Strategy (baseline, simple & reproducible):
-      - Keep the *last* max_input_tokens tokens (tail truncation).
-      - This is commonly used for long-context prompts.
+      - Keep the last max_input_tokens tokens (tail truncation).
 
     Returns:
       (possibly truncated input_ids, truncated_flag)
@@ -55,7 +53,6 @@ def _truncate_input_ids(
     if max_input_tokens is None or max_input_tokens <= 0:
         return input_ids, False
 
-    # input_ids shape: [1, seq_len]
     seq_len = int(input_ids.shape[-1])
     if seq_len <= max_input_tokens:
         return input_ids, False
@@ -77,36 +74,31 @@ class ComputeEngine:
         self.model_id: str = getattr(cfg, "model_id")
         self.cpu_fallback_on_long: bool = bool(getattr(cfg, "cpu_fallback_on_long", False))
 
-        # Select device and load artifacts
         self.preferred_device: str = _select_preferred_device(cfg)
+        self.active_device: str = self.preferred_device
 
-        # Tokenizer
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_id, use_fast=True)
 
-        # Ensure pad token exists for generation if needed
         if self.tokenizer.pad_token_id is None:
-            # Common fallback: use EOS as PAD for causal LMs
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Model (baseline: full precision; keep simple and explicit)
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_id,
-            torch_dtype=None,  # baseline simplicity; rely on HF defaults
+            torch_dtype=None,
             low_cpu_mem_usage=True,
         )
         self.model.eval()
-
-        # Move to preferred device
-        self._move_model(self.preferred_device)
+        self._move_model(self.active_device)
 
     def _move_model(self, device: str) -> None:
         """
-        Move model to device. Kept separate to support CPU fallback retry.
+        Move model to the target device and update active_device.
         """
         if device == "mps":
             self.model.to("mps")
         else:
             self.model.to("cpu")
+        self.active_device = device
 
     def _generate_once(
         self,
@@ -119,20 +111,17 @@ class ComputeEngine:
         """
         Perform a single generation attempt on the specified device.
         """
-        # Tokenize on CPU first (tokenizer is CPU anyway)
         enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
-        input_ids = enc["input_ids"]  # [1, seq_len]
+        input_ids = enc["input_ids"]
 
         input_ids, truncated = _truncate_input_ids(input_ids, max_input_tokens)
         input_tokens = int(input_ids.shape[-1])
 
-        # Move inputs to device
         if device == "mps":
             input_ids = input_ids.to("mps")
         else:
             input_ids = input_ids.to("cpu")
 
-        # Generation config (baseline, deterministic)
         gen_kwargs = dict(
             max_new_tokens=int(max_new_tokens),
             do_sample=False,
@@ -146,20 +135,15 @@ class ComputeEngine:
             out_ids = self.model.generate(input_ids=input_ids, **gen_kwargs)
         gen_time_s = time.time() - t0
 
-        # out_ids includes the prompt + generated continuation
         out_total_tokens = int(out_ids.shape[-1])
         output_tokens = max(0, out_total_tokens - input_tokens)
 
-        # Decode full output, then strip prompt prefix as best-effort
         full_text = self.tokenizer.decode(out_ids[0], skip_special_tokens=True)
-
-        # Best-effort to isolate the generated continuation:
-        # Decode prompt_used from input_ids to handle truncation properly.
         prompt_used = self.tokenizer.decode(input_ids[0], skip_special_tokens=True)
+
         if full_text.startswith(prompt_used):
             output_text = full_text[len(prompt_used) :].lstrip()
         else:
-            # Fallback: return full text if matching fails
             output_text = full_text
 
         return {
@@ -189,12 +173,17 @@ class ComputeEngine:
           - token counts
           - truncation flag
           - timing
+
+        Important behavior:
+        - Uses self.active_device first
+        - If MPS fails and cpu_fallback_on_long=True, permanently switches
+          subsequent requests to CPU for this ComputeEngine instance
         """
         max_input_tokens = int(max_input_tokens or getattr(self.cfg, "max_input_tokens", 8192))
         max_new_tokens = int(max_new_tokens or getattr(self.cfg, "max_new_tokens", 64))
 
-        # Attempt on preferred device
-        device = self.preferred_device
+        device = self.active_device
+
         try:
             return self._generate_once(
                 prompt=prompt,
@@ -203,11 +192,11 @@ class ComputeEngine:
                 max_new_tokens=max_new_tokens,
             )
         except RuntimeError as e:
-            # Optional CPU fallback (primarily for MPS long-sequence instability)
             if device == "mps" and self.cpu_fallback_on_long:
-                # Move model to CPU and retry once
-                self._move_model("cpu")
                 try:
+                    self._move_model("cpu")
+                    self.preferred_device = "cpu"
+
                     out = self._generate_once(
                         prompt=prompt,
                         device="cpu",
@@ -216,6 +205,7 @@ class ComputeEngine:
                     )
                     out["fallback_from"] = "mps"
                     out["fallback_reason"] = f"{type(e).__name__}: {e}"
+                    out["device_switch_persisted"] = True
                     return out
                 except Exception as e2:
                     return {
@@ -224,9 +214,9 @@ class ComputeEngine:
                         "error": f"CPU fallback also failed: {type(e2).__name__}: {e2}",
                         "fallback_from": "mps",
                         "fallback_reason": f"{type(e).__name__}: {e}",
+                        "device_switch_persisted": True,
                     }
 
-            # No fallback or not eligible
             return {
                 "ok": False,
                 "device": device,

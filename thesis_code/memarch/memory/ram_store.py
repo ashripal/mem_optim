@@ -26,7 +26,6 @@ from typing import Dict, Optional, Tuple
 
 from memarch.memory.schema import MemoryItem
 
-
 def _estimate_item_bytes(item: MemoryItem) -> int:
     """
     Deterministic, portable size estimate for memory budgeting.
@@ -90,14 +89,22 @@ class RamStoreLRU:
     Internal structure:
       self._ns_maps[namespace] = OrderedDict[key, (MemoryItem, est_bytes)]
     """
-    def __init__(self, max_mb: int) -> None:
+    def __init__(self, max_mb: int = 64, max_items: Optional[int] = None) -> None:
         if max_mb <= 0:
             raise ValueError("max_mb must be > 0")
+        if max_items is not None and max_items <= 0:
+            raise ValueError("max_items must be > 0 when provided")
+
         self._capacity_bytes: int = int(max_mb) * 1024 * 1024
+        self._capacity_items: Optional[int] = int(max_items) if max_items is not None else None
+
         self._ns_maps: Dict[str, OrderedDict[str, Tuple[MemoryItem, int]]] = {}
         self._bytes_current: int = 0
         self._stats = RamStoreStats(bytes_capacity=self._capacity_bytes)
 
+    def item_count(self) -> int:
+        return sum(len(od) for od in self._ns_maps.values())
+    
     def capacity_bytes(self) -> int:
         return self._capacity_bytes
 
@@ -177,45 +184,42 @@ class RamStoreLRU:
 
     def _evict_as_needed(self) -> None:
         """
-        Evict least-recently-used entries across namespaces until under capacity.
-
-        Deterministic eviction policy:
-        - Find the globally oldest entry among namespaces by looking at each namespace's
-          first (least-recent) key, then pick the namespace whose LRU entry has the
-          oldest last_access timestamp (or None treated as oldest).
-        - If timestamps are equal/missing, break ties lexicographically by namespace.
-
-        This avoids biasing eviction toward the largest namespace and keeps behavior testable.
+        Evict least-recently-used entries across namespaces until under both:
+        - byte capacity
+        - optional item-count capacity
         """
-        while self._bytes_current > self._capacity_bytes and self._ns_maps:
+        def over_capacity() -> bool:
+            over_bytes = self._bytes_current > self._capacity_bytes
+            over_items = (
+                self._capacity_items is not None and self.item_count() > self._capacity_items
+            )
+            return over_bytes or over_items
+
+        while over_capacity() and self._ns_maps:
             victim_ns = None
             victim_key = None
             victim_last_access = None
 
-            # Select a victim among per-namespace LRUs
             for ns, od in self._ns_maps.items():
                 if not od:
                     continue
                 k, (itm, est) = next(iter(od.items()))
-                la = itm.stats.last_access_utc  # may be None
+                la = itm.stats.last_access_utc
+
                 if victim_ns is None:
                     victim_ns, victim_key, victim_last_access = ns, k, la
                     continue
 
-                # None considered "older" than any timestamp
                 if victim_last_access is None and la is not None:
                     continue
                 if victim_last_access is not None and la is None:
                     victim_ns, victim_key, victim_last_access = ns, k, la
                     continue
 
-                # both None or both non-None
                 if la is None and victim_last_access is None:
-                    # tie-break by namespace then key for determinism
                     if (ns, k) < (victim_ns, victim_key):
                         victim_ns, victim_key, victim_last_access = ns, k, la
                 else:
-                    # both timestamps exist
                     if la < victim_last_access:
                         victim_ns, victim_key, victim_last_access = ns, k, la
                     elif la == victim_last_access:
@@ -230,7 +234,6 @@ class RamStoreLRU:
             self._bytes_current -= est
             self._stats.evictions += 1
 
-            # cleanup empty namespace maps
             if not od:
                 del self._ns_maps[victim_ns]
 

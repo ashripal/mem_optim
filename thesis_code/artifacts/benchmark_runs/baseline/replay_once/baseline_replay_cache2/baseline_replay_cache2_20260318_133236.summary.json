@@ -1,0 +1,167 @@
+{
+  "run_jsonl": "/Users/ashripal/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/replay_once/baseline_replay_cache2/baseline_replay_cache2_20260318_133236.jsonl",
+  "counts": {
+    "total": 8,
+    "ok": 8,
+    "err": 0,
+    "ok_rate": 1.0
+  },
+  "latency": {
+    "count": 8,
+    "mean": 3.1615322530269623,
+    "median": 2.4137264490127563,
+    "p90": 4.2374932765960684,
+    "p95": 6.280631661415097,
+    "p99": 7.915142369270323,
+    "min": 2.3790018558502197,
+    "max": 8.32377004623413
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 8,
+      "mean": 512.0,
+      "median": 512.0,
+      "p90": 512.0,
+      "p95": 512.0,
+      "p99": 512.0,
+      "min": 512.0,
+      "max": 512.0
+    },
+    "output_tokens": {
+      "count": 8,
+      "mean": 8.0,
+      "median": 8.0,
+      "p90": 8.0,
+      "p95": 8.0,
+      "p99": 8.0,
+      "min": 8.0,
+      "max": 8.0
+    },
+    "tokens_per_second": {
+      "count": 8,
+      "mean": 3.008636066113238,
+      "median": 3.3144825538146456,
+      "p90": 3.3460573072706756,
+      "p95": 3.3544129812546237,
+      "p99": 3.361097520441782,
+      "min": 0.9611452152447458,
+      "max": 3.362768655238572
+    },
+    "truncated_count": 8,
+    "truncated_rate": 1.0
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 8,
+      "mean": 190.90234375,
+      "median": 211.1875,
+      "p90": 213.5390625,
+      "p95": 213.73046875,
+      "p99": 213.88359375,
+      "min": 60.375,
+      "max": 213.921875
+    },
+    "rss_after_mb": {
+      "count": 8,
+      "mean": 210.48828125,
+      "median": 212.3515625,
+      "p90": 215.3,
+      "p95": 216.9078125,
+      "p99": 218.1940625,
+      "min": 197.625,
+      "max": 218.515625
+    },
+    "rss_delta_mb": {
+      "count": 8,
+      "mean": 19.5859375,
+      "median": 3.1171875,
+      "p90": 45.692187499999974,
+      "p95": 91.47109374999992,
+      "p99": 128.09421874999995,
+      "min": 0.546875,
+      "max": 137.25
+    }
+  },
+  "devices": {
+    "counts": {
+      "mps": 8
+    },
+    "shares": {
+      "mps": 1.0
+    }
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 8,
+    "hit_rate": 0.0
+  },
+  "quality": {
+    "exact_match": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "contains_answer": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "token_f1": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "char_f1": {
+      "count": 8,
+      "mean": 0.2611453799278697,
+      "median": 0.2309090909090909,
+      "p90": 0.4651162790697675,
+      "p95": 0.46511627906976755,
+      "p99": 0.46511627906976755,
+      "min": 0.1176470588235294,
+      "max": 0.46511627906976755
+    }
+  },
+  "run_id": "baseline_replay_cache2_20260318_133236",
+  "created_at": "2026-03-18T13:32:46.382594",
+  "config": {
+    "benchmark_name": "baseline_replay_cache2",
+    "notes": "",
+    "tier2_repo": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data",
+    "out_dir": "artifacts/benchmark_runs/baseline",
+    "model_id": "microsoft/Phi-3-mini-128k-instruct",
+    "max_input_tokens": 512,
+    "max_new_tokens": 8,
+    "max_cache_items": 2,
+    "cpu_fallback_on_long": true,
+    "workload": {
+      "task_glob": "trec",
+      "max_examples": 4,
+      "mode": "replay_once",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-03-18T13:33:11.685709"
+}

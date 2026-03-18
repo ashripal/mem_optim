@@ -1,0 +1,163 @@
+{
+  "run_jsonl": "/Users/ashripal/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/replay_once/baseline_smoke/baseline_smoke_20260317_203856.jsonl",
+  "counts": {
+    "total": 20,
+    "ok": 0,
+    "err": 20,
+    "ok_rate": 0.0
+  },
+  "latency": {
+    "count": 0,
+    "mean": null,
+    "median": null,
+    "p90": null,
+    "p95": null,
+    "p99": null,
+    "min": null,
+    "max": null
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "output_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "tokens_per_second": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "truncated_count": 0,
+    "truncated_rate": null
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "rss_after_mb": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "rss_delta_mb": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    }
+  },
+  "devices": {
+    "counts": {},
+    "shares": {}
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 0,
+    "hit_rate": null
+  },
+  "quality": {
+    "exact_match": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "contains_answer": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "token_f1": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "char_f1": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    }
+  },
+  "run_id": "baseline_smoke_20260317_203856",
+  "created_at": "2026-03-17T20:39:08.203588",
+  "config": {
+    "benchmark_name": "baseline_smoke",
+    "notes": "",
+    "tier2_repo": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data",
+    "out_dir": "artifacts/benchmark_runs/baseline",
+    "model_id": "microsoft/Phi-3-mini-128k-instruct",
+    "max_input_tokens": 8192,
+    "max_new_tokens": 64,
+    "max_cache_items": 64,
+    "cpu_fallback_on_long": false,
+    "workload": {
+      "task_glob": "",
+      "max_examples": 10,
+      "mode": "replay_once",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-03-17T20:39:24.727298"
+}
