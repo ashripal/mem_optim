@@ -6,13 +6,14 @@ Phase 1 goals:
 - Deterministic behavior (testable)
 - Bounded memory usage (MB budget) for Jetson-class devices
 - Namespace isolation (session/user/cohort/global stored separately)
-- Store interface mirrors disk_store (get/put/stats)
+- Store interface mirrors disk_store:
+    get / put / delete / iter_namespace / stats
 
 Notes:
 - We estimate item size using UTF-8 byte lengths of key fields.
-  This is not perfect, but it's deterministic and portable.
-- For strict accuracy you could use sys.getsizeof recursively, but that tends to be noisy,
-  Python-version dependent, and less portable.
+  This is not perfect, but it is deterministic and portable.
+- Semantic retrieval fields are included shallowly in the estimate so
+  embedding-enabled items are budgeted more realistically.
 
 Thread-safety:
 - This implementation is NOT thread-safe. If you later add concurrency, wrap with a lock.
@@ -22,9 +23,10 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Iterator, Optional, Tuple
 
 from memarch.memory.schema import MemoryItem
+
 
 def _estimate_item_bytes(item: MemoryItem) -> int:
     """
@@ -33,11 +35,11 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
     Counts UTF-8 bytes for:
     - key, namespace, canonical query, context_signature
     - answer_text
-    - minimal provenance fields (model_id, prompt_version)
-    - meta keys/values are not deeply counted (to avoid huge variance);
-      you can extend if needed.
+    - minimal provenance fields
+    - shallow quality/meta fields
+    - semantic fields (embedding model id, norm, embedding length)
 
-    Adds a small overhead constant to account for object structure.
+    This is intentionally approximate but stable across platforms.
     """
     overhead = 512  # rough constant for Python object/container overhead
     n = overhead
@@ -59,14 +61,26 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
     if item.provenance.quantization:
         n += b(item.provenance.quantization)
 
-    # quality signals (very small)
-    # metrics dict can vary; count only keys to keep stable-ish
+    # quality signals
     for k in item.quality.metrics.keys():
         n += b(str(k))
 
-    # meta: count shallow keys only to keep estimate stable
+    # shallow meta
     for k in item.meta.keys():
         n += b(str(k))
+
+    # semantic fields
+    if item.embedding_model_id:
+        n += b(item.embedding_model_id)
+
+    if item.embedding_norm is not None:
+        n += 16  # small fixed accounting for stored float metadata
+
+    if item.query_embedding is not None:
+        # Rough accounting:
+        # a Python float typically costs much more than 4 bytes, but we do not want a
+        # highly version-dependent estimate. Use a fixed per-dimension budget instead.
+        n += len(item.query_embedding) * 8
 
     return n
 
@@ -77,7 +91,9 @@ class RamStoreStats:
     hits: int = 0
     misses: int = 0
     puts: int = 0
+    deletes: int = 0
     evictions: int = 0
+    iter_calls: int = 0
     bytes_current: int = 0
     bytes_capacity: int = 0
 
@@ -89,6 +105,7 @@ class RamStoreLRU:
     Internal structure:
       self._ns_maps[namespace] = OrderedDict[key, (MemoryItem, est_bytes)]
     """
+
     def __init__(self, max_mb: int = 64, max_items: Optional[int] = None) -> None:
         if max_mb <= 0:
             raise ValueError("max_mb must be > 0")
@@ -104,7 +121,7 @@ class RamStoreLRU:
 
     def item_count(self) -> int:
         return sum(len(od) for od in self._ns_maps.values())
-    
+
     def capacity_bytes(self) -> int:
         return self._capacity_bytes
 
@@ -112,14 +129,15 @@ class RamStoreLRU:
         return self._bytes_current
 
     def stats(self) -> RamStoreStats:
-        # return a shallow copy to prevent external mutation
         s = self._stats
         return RamStoreStats(
             gets=s.gets,
             hits=s.hits,
             misses=s.misses,
             puts=s.puts,
+            deletes=s.deletes,
             evictions=s.evictions,
+            iter_calls=s.iter_calls,
             bytes_current=self._bytes_current,
             bytes_capacity=self._capacity_bytes,
         )
@@ -140,11 +158,11 @@ class RamStoreLRU:
             self._stats.misses += 1
             return None
 
-        item, est = entry
-        # mark as most-recently-used
+        item, _est = entry
         od.move_to_end(key, last=True)
         self._stats.hits += 1
-        # touch access stats
+
+        # Touch access stats
         item.stats.touch()
         return item
 
@@ -152,7 +170,6 @@ class RamStoreLRU:
         if not namespace or not key:
             raise ValueError("namespace and key must be non-empty")
         if item.key != key:
-            # guard against accidental mismatch (easy bug to make)
             raise ValueError("key must match item.key")
 
         self._stats.puts += 1
@@ -164,16 +181,13 @@ class RamStoreLRU:
 
         # If overwriting existing, subtract old size first
         if key in od:
-            old_item, old_est = od.pop(key)
+            _old_item, old_est = od.pop(key)
             self._bytes_current -= old_est
 
         est = _estimate_item_bytes(item)
 
-        # If a single item exceeds capacity, we can't store it. Fail soft.
+        # If a single item exceeds capacity, do not store it
         if est > self._capacity_bytes:
-            # revert overwrite removal? We already removed old entry above.
-            # For Phase 1, we choose to NOT keep the old entry if overwrite attempted.
-            # This is simplest and deterministic; admission policy can avoid huge items.
             return
 
         od[key] = (item, est)
@@ -181,6 +195,46 @@ class RamStoreLRU:
         self._bytes_current += est
 
         self._evict_as_needed()
+
+    def delete(self, namespace: str, key: str) -> None:
+        if not namespace or not key:
+            return
+
+        od = self._ns_maps.get(namespace)
+        if od is None:
+            return
+
+        entry = od.pop(key, None)
+        if entry is None:
+            return
+
+        _item, est = entry
+        self._bytes_current -= est
+        self._stats.deletes += 1
+
+        if not od:
+            del self._ns_maps[namespace]
+
+    def iter_namespace(self, namespace: str) -> Iterator[MemoryItem]:
+        """
+        Iterate items in a namespace from least-recently-used to most-recently-used.
+
+        This is mainly used by Phase 1 semantic retrieval for bounded brute-force scans.
+        Iteration does not mutate LRU order.
+        """
+        self._stats.iter_calls += 1
+        if not namespace:
+            return iter(())
+
+        od = self._ns_maps.get(namespace)
+        if od is None:
+            return iter(())
+
+        def _gen() -> Iterator[MemoryItem]:
+            for item, _est in od.values():
+                yield item
+
+        return _gen()
 
     def _evict_as_needed(self) -> None:
         """
@@ -203,7 +257,8 @@ class RamStoreLRU:
             for ns, od in self._ns_maps.items():
                 if not od:
                     continue
-                k, (itm, est) = next(iter(od.items()))
+
+                k, (itm, _est) = next(iter(od.items()))
                 la = itm.stats.last_access_utc
 
                 if victim_ns is None:
@@ -230,7 +285,7 @@ class RamStoreLRU:
                 break
 
             od = self._ns_maps[victim_ns]
-            itm, est = od.pop(victim_key)
+            _itm, est = od.pop(victim_key)
             self._bytes_current -= est
             self._stats.evictions += 1
 

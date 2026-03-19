@@ -10,7 +10,7 @@ Phase 1 goals:
     put(namespace, key, item) -> None
     delete(namespace, key) -> None
     iter_namespace(namespace) -> Iterator[MemoryItem]
-    stats() -> DiskStoreStats
+    stats() -> Dict[str, int]
     close() -> None
 
 Implementation choice (Phase 1):
@@ -20,34 +20,33 @@ Implementation choice (Phase 1):
 Notes:
 - This is not designed for multi-process concurrent writers. Single-process usage is assumed.
 - SQLite WAL mode is enabled for better write performance.
+- Semantic retrieval fields are stored as part of the serialized MemoryItem payload.
 """
 
 from __future__ import annotations
 
 import json
 import sqlite3
-from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional
 
 from memarch.memory.schema import (
+    AccessStats,
     MemoryItem,
     Provenance,
     QualitySignals,
-    AccessStats,
     Scope,
 )
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _dt_to_str(dt: Optional[datetime]) -> Optional[str]:
     if dt is None:
         return None
     if dt.tzinfo is None:
-        # enforce UTC-awareness to avoid portability bugs
         raise ValueError("datetime must be timezone-aware (UTC)")
     return dt.astimezone(timezone.utc).isoformat()
 
@@ -57,7 +56,6 @@ def _dt_from_str(s: Optional[str]) -> Optional[datetime]:
         return None
     dt = datetime.fromisoformat(s)
     if dt.tzinfo is None:
-        # treat as UTC if missing tz (should not happen if we wrote it)
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc)
 
@@ -66,7 +64,7 @@ def _serialize_item(item: MemoryItem) -> str:
     """
     Convert MemoryItem to a JSON string.
 
-    We avoid naive asdict() for enums/datetimes by doing a controlled serialization.
+    We avoid naive asdict() for enums/datetimes by doing controlled serialization.
     """
     d: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -97,16 +95,22 @@ def _serialize_item(item: MemoryItem) -> str:
             "last_access_utc": _dt_to_str(item.stats.last_access_utc),
         },
         "meta": item.meta,
+        # Semantic retrieval fields
+        "query_embedding": item.query_embedding,
+        "embedding_model_id": item.embedding_model_id,
+        "embedding_norm": item.embedding_norm,
     }
     return json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _deserialize_item(payload: str) -> MemoryItem:
     d = json.loads(payload)
-    # Backward/forward compatibility hooks
-    sv = int(d.get("schema_version", 0))
-    if sv != SCHEMA_VERSION:
-        raise ValueError(f"Unsupported schema_version: {sv} (expected {SCHEMA_VERSION})")
+    sv = int(d.get("schema_version", 1))
+
+    if sv not in (1, 2):
+        raise ValueError(
+            f"Unsupported schema_version: {sv} (expected one of 1, 2)"
+        )
 
     prov_d = d["provenance"]
     provenance = Provenance(
@@ -131,6 +135,15 @@ def _deserialize_item(payload: str) -> MemoryItem:
         last_access_utc=_dt_from_str(sd.get("last_access_utc")),
     )
 
+    query_embedding = d.get("query_embedding")
+    if query_embedding is not None:
+        query_embedding = [float(x) for x in query_embedding]
+
+    embedding_model_id = d.get("embedding_model_id")
+    embedding_norm = d.get("embedding_norm")
+    if embedding_norm is not None:
+        embedding_norm = float(embedding_norm)
+
     item = MemoryItem(
         key=d["key"],
         scope=Scope(d["scope"]),
@@ -145,6 +158,9 @@ def _deserialize_item(payload: str) -> MemoryItem:
         expires_at_utc=_dt_from_str(d.get("expires_at_utc")),
         stats=stats,
         meta=dict(d.get("meta") or {}),
+        query_embedding=query_embedding,
+        embedding_model_id=embedding_model_id,
+        embedding_norm=embedding_norm,
     )
     return item
 
@@ -174,8 +190,6 @@ class DiskStoreSQLite:
         self._path = str(Path(path))
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
 
-        # check_same_thread=False allows usage across threads if you later add a lock;
-        # for Phase 1, single-thread/single-process is assumed.
         self._conn = sqlite3.connect(self._path, timeout=30.0, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
@@ -232,7 +246,8 @@ class DiskStoreSQLite:
 
         self._stats.hits += 1
         item = _deserialize_item(row[0])
-        # touch access stats on read (like RAM store)
+
+        # Touch access stats on read, mirroring RAM-store behavior in spirit.
         item.stats.touch()
         return item
 
@@ -262,14 +277,17 @@ class DiskStoreSQLite:
         if not namespace or not key:
             return
         self._stats.deletes += 1
-        self._conn.execute("DELETE FROM kv WHERE namespace=? AND key=?;", (namespace, key))
+        self._conn.execute(
+            "DELETE FROM kv WHERE namespace=? AND key=?;",
+            (namespace, key),
+        )
         self._conn.commit()
 
     def iter_namespace(self, namespace: str) -> Iterator[MemoryItem]:
         """
         Iterate all items in a namespace.
 
-        Use sparingly (e.g., future index building). Not needed for Phase 1 exact-match.
+        Phase 1 semantic retrieval may use this for bounded brute-force scanning.
         """
         self._stats.iter_calls += 1
         if not namespace:

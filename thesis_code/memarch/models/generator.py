@@ -11,7 +11,8 @@ Purpose:
     3) behavior is portable across Mac / Jetson / other constrained devices
 
 Phase 1 design:
-- Deterministic-ish prompt builder
+- Exact hits may return directly from MemoryManager
+- Semantic hits are typically used as context assistance only
 - Local text generation with transformers
 - Returns:
     (answer_text, Provenance, QualitySignals)
@@ -25,12 +26,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from memarch.memory.schema import MemoryHit, MemoryQuery, Provenance, QualitySignals
+from memarch.memory.schema import MatchType, MemoryHit, MemoryQuery, Provenance, QualitySignals
 
 
 def _mps_available() -> bool:
@@ -80,10 +81,6 @@ class GeneratorConfig:
     """
     Configuration for the generation backend.
 
-    Default model is intentionally a placeholder-compatible setting.
-    For your thesis setup, you will likely override this with a real local model path
-    or a small instruct model while iterating.
-
     Example overrides:
       model_id="mistralai/Mistral-7B-Instruct-v0.2"
       model_id="/path/to/local/model"
@@ -105,6 +102,7 @@ class GeneratorConfig:
     # Prompt behavior
     include_retrieved_memory_context: bool = True
     include_dataset_context: bool = True
+    include_doc_signature: bool = True
 
     # Cleanup
     skip_special_tokens: bool = True
@@ -130,7 +128,6 @@ class HFGenerator:
             local_files_only=self.cfg.local_files_only,
         )
 
-        # Many causal models need a pad token for batched generation
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -144,7 +141,6 @@ class HFGenerator:
         self.model.eval()
         self.model.to(self.device)
 
-        # Stores last prompt for debugging / demo proof of context injection
         self.last_prompt: Optional[str] = None
 
     @staticmethod
@@ -167,50 +163,94 @@ class HFGenerator:
 
         raise ValueError(f"Unsupported torch_dtype: {dtype_name}")
 
+    @staticmethod
+    def _safe_text(value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _retrieved_section(self, retrieved: MemoryHit) -> str:
+        """
+        Build a safe retrieved-memory section.
+
+        Phase 1 policy:
+        - retrieved semantic memory is assistive, not authoritative
+        - the model should use it only if consistent with the current document context
+        """
+        answer_text = self._safe_text(retrieved.item.answer_text)
+        if not answer_text:
+            return ""
+
+        lines = [
+            "RETRIEVED ANSWER FOR A SIMILAR EARLIER QUESTION:",
+            answer_text,
+        ]
+
+        meta_parts = []
+        meta_parts.append(f"match_type={retrieved.match_type.value}")
+        meta_parts.append(f"source_tier={retrieved.source_tier.value}")
+        meta_parts.append(f"score={retrieved.score:.4f}")
+
+        if retrieved.semantic_rank is not None:
+            meta_parts.append(f"semantic_rank={retrieved.semantic_rank}")
+
+        lines.append("")
+        lines.append("RETRIEVAL METADATA:")
+        lines.append(", ".join(meta_parts))
+
+        if retrieved.match_type == MatchType.SEMANTIC:
+            lines.append("")
+            lines.append(
+                "Use the retrieved answer only if it is consistent with the document context "
+                "and the current question."
+            )
+
+        return "\n".join(lines)
+
     def build_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
         """
         Build the final prompt passed to the model.
-
-        Prompt sections:
-        - Optional retrieved memory context (Phase 1: if manager chooses to still generate)
-        - Optional dataset context (LongBench / PDF chunk context)
-        - User question
-
-        The structure is intentionally explicit for debugability and demo clarity.
         """
         parts = []
 
-        parts.append("You are a helpful assistant. Answer the user's question using the provided context when relevant.")
-
-        if self.cfg.include_retrieved_memory_context and retrieved is not None:
-            parts.append(
-                "PREVIOUSLY USEFUL MEMORY:\n"
-                f"{retrieved.item.answer_text}"
-            )
+        parts.append(
+            "You are a helpful assistant. Answer the current question using the provided "
+            "document context. If a retrieved prior answer is provided, use it only when "
+            "it is consistent with the document context and current question."
+        )
 
         if self.cfg.include_dataset_context:
-            dataset_ctx = (mq.context or {}).get("dataset_context", "") or ""
+            dataset_ctx = self._safe_text((mq.context or {}).get("dataset_context", ""))
             if dataset_ctx:
-                parts.append(f"DATASET CONTEXT:\n{dataset_ctx}")
+                parts.append(f"DOCUMENT CONTEXT:\n{dataset_ctx}")
 
-        # Optional document signature, useful for debugging / reproducibility
-        doc_sig = (mq.context or {}).get("doc_signature")
-        if doc_sig:
-            parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
+        if self.cfg.include_doc_signature:
+            doc_sig = (mq.context or {}).get("doc_signature")
+            if doc_sig:
+                parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
 
-        parts.append(f"QUESTION:\n{mq.raw_query}")
+        if self.cfg.include_retrieved_memory_context and retrieved is not None:
+            retrieved_block = self._retrieved_section(retrieved)
+            if retrieved_block:
+                parts.append(retrieved_block)
+
+        parts.append(f"CURRENT QUESTION:\n{self._safe_text(mq.raw_query)}")
+        parts.append(
+            "ANSWER THE CURRENT QUESTION ONLY. Do not mention retrieval metadata unless it is directly relevant."
+        )
         parts.append("ANSWER:")
 
         prompt = "\n\n".join(parts)
         self.last_prompt = prompt
         return prompt
 
-    def generate(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> Tuple[str, Provenance, QualitySignals]:
+    def generate(
+        self,
+        mq: MemoryQuery,
+        retrieved: Optional[MemoryHit] = None,
+    ) -> Tuple[str, Provenance, QualitySignals]:
         """
         Generate an answer for the given MemoryQuery.
-
-        Returns:
-            answer_text, provenance, quality_signals
         """
         prompt = self.build_prompt(mq, retrieved=retrieved)
 
@@ -225,26 +265,28 @@ class HFGenerator:
         input_ids = enc["input_ids"].to(self.device)
         attention_mask = enc["attention_mask"].to(self.device)
 
-        with torch.inference_mode():
-            output_ids = self.model.generate(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=self.cfg.max_new_tokens,
-                do_sample=self.cfg.do_sample,
-                temperature=self.cfg.temperature if self.cfg.do_sample else None,
-                top_p=self.cfg.top_p if self.cfg.do_sample else None,
-                pad_token_id=self.tokenizer.pad_token_id,
-                eos_token_id=self.tokenizer.eos_token_id,
-            )
+        generate_kwargs: Dict[str, object] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": self.cfg.max_new_tokens,
+            "do_sample": self.cfg.do_sample,
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
 
-        # We only want the newly generated portion, not the echoed prompt
-        generated_ids = output_ids[0][input_ids.shape[1] :]
+        if self.cfg.do_sample:
+            generate_kwargs["temperature"] = self.cfg.temperature
+            generate_kwargs["top_p"] = self.cfg.top_p
+
+        with torch.inference_mode():
+            output_ids = self.model.generate(**generate_kwargs)
+
+        generated_ids = output_ids[0][input_ids.shape[1]:]
         answer_text = self.tokenizer.decode(
             generated_ids,
             skip_special_tokens=self.cfg.skip_special_tokens,
         ).strip()
 
-        # Fallback: if the model returns empty text, return a safe placeholder
         if not answer_text:
             answer_text = "(No answer generated.)"
 
@@ -257,12 +299,16 @@ class HFGenerator:
             context_window=self.cfg.max_input_length,
         )
 
-        # Phase 1 quality signal is intentionally simple.
-        # Real task metrics or user feedback can populate this later.
+        quality_metrics: Dict[str, float] = {}
+        if retrieved is not None and retrieved.match_type == MatchType.SEMANTIC:
+            quality_metrics["semantic_retrieval_score"] = float(retrieved.score)
+        elif retrieved is not None and retrieved.match_type == MatchType.EXACT:
+            quality_metrics["retrieval_score"] = float(retrieved.score)
+
         quality = QualitySignals(
             score=None,
             success=True if answer_text and answer_text != "(No answer generated.)" else False,
-            metrics={},
+            metrics=quality_metrics,
         )
 
         return answer_text, provenance, quality
@@ -279,4 +325,10 @@ class HFGenerator:
             "temperature": self.cfg.temperature,
             "top_p": self.cfg.top_p,
             "do_sample": self.cfg.do_sample,
+            "include_retrieved_memory_context": self.cfg.include_retrieved_memory_context,
+            "include_dataset_context": self.cfg.include_dataset_context,
+            "include_doc_signature": self.cfg.include_doc_signature,
         }
+
+
+Generator = HFGenerator

@@ -2,32 +2,32 @@
 """
 Embedding backend for memarch using Hugging Face Transformers.
 
-Why this exists:
-- Phase 1 demo does not require semantic retrieval, but the architecture should already
-  have a stable embedding interface for Phase 2.
-- This wrapper keeps embedding logic separate from memory policy / storage logic.
-- It is designed to work on:
+Phase 1 semantic retrieval goals:
+- provide a stable embedding interface for semantic memory lookup
+- keep embedding logic separate from memory policy / storage logic
+- support constrained and heterogeneous devices:
     - MacBook (CPU / MPS if available)
-    - Jetson Orin Nano (CPU / CUDA if available)
-    - Other Linux edge devices
+    - Jetson Orin Nano / AGX Orin (CPU / CUDA if available)
+    - other Linux edge devices
 
 Design choices:
 - Uses AutoTokenizer + AutoModel from transformers
 - Uses mean pooling over the last hidden state
 - Supports optional L2 normalization
-- Returns plain Python lists for maximum portability with the rest of memarch
+- Returns plain Python lists for portability with SQLite / JSON-backed storage
 
 Notes:
-- This file intentionally does NOT build a vector index. That belongs in:
+- This file does NOT build a vector index. That belongs in:
     memarch/memory/embed_index.py
-- This file intentionally does NOT implement caching. That belongs in:
+- This file does NOT implement caching. That belongs in:
     memarch/memory/manager.py or a higher-level embedding cache if needed.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence
+from math import sqrt
+from typing import Dict, List, Optional, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -53,8 +53,6 @@ def _select_device(device: str = "auto") -> str:
       1. CUDA
       2. MPS
       3. CPU
-
-    This keeps behavior portable and predictable.
     """
     device = (device or "auto").lower().strip()
 
@@ -92,7 +90,7 @@ class EmbedderConfig:
     This is a practical default because it is:
     - widely used
     - small enough for constrained devices
-    - easy to use with transformers directly
+    - effective for semantic similarity tasks
     """
     model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
     device: str = "auto"
@@ -104,7 +102,7 @@ class EmbedderConfig:
     # Output behavior
     normalize: bool = True
 
-    # Local files only mode is useful in constrained/offline environments.
+    # Useful for offline / pre-downloaded environments
     local_files_only: bool = False
 
 
@@ -113,12 +111,12 @@ class HFEmbedder:
     Lightweight embedding wrapper around a Hugging Face encoder model.
 
     Public API:
-      - encode(text) -> List[float]
-      - encode_batch(texts) -> List[List[float]]
+      - embed(text) -> List[float]
+      - embed_batch(texts) -> List[List[float]]
 
-    Example:
-        embedder = HFEmbedder()
-        v = embedder.encode("What is systems engineering?")
+    Backward-compatible aliases:
+      - encode(text)
+      - encode_batch(texts)
     """
 
     def __init__(self, cfg: Optional[EmbedderConfig] = None) -> None:
@@ -139,6 +137,18 @@ class HFEmbedder:
         self.model.to(self.device)
 
     @staticmethod
+    def _sanitize_text(text: Optional[str]) -> str:
+        """
+        Convert inputs into deterministic strings for embedding.
+
+        This keeps behavior stable across pipeline components and prevents
+        accidental None handling issues.
+        """
+        if text is None:
+            return ""
+        return str(text).strip()
+
+    @staticmethod
     def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
         """
         Mean pooling over non-padding tokens.
@@ -156,18 +166,16 @@ class HFEmbedder:
         counts = mask.sum(dim=1).clamp(min=1e-9)
         return summed / counts
 
-    def encode(self, text: str) -> Vector:
+    def embed(self, text: str) -> Vector:
         """
-        Encode a single text into one embedding vector.
+        Embed a single text into one vector.
         """
-        if text is None:
-            raise ValueError("text must not be None")
-        out = self.encode_batch([text])
+        out = self.embed_batch([text])
         return out[0]
 
-    def encode_batch(self, texts: Sequence[str]) -> List[Vector]:
+    def embed_batch(self, texts: Sequence[str]) -> List[Vector]:
         """
-        Encode a batch of texts.
+        Embed a batch of texts.
 
         Returns:
             List of embeddings as plain Python lists.
@@ -177,13 +185,11 @@ class HFEmbedder:
         if len(texts) == 0:
             return []
 
-        # Convert to strings defensively
-        texts = ["" if t is None else str(t) for t in texts]
-
+        cleaned_texts = [self._sanitize_text(t) for t in texts]
         all_vectors: List[Vector] = []
 
-        for start in range(0, len(texts), self.cfg.batch_size):
-            batch = texts[start : start + self.cfg.batch_size]
+        for start in range(0, len(cleaned_texts), self.cfg.batch_size):
+            batch = cleaned_texts[start : start + self.cfg.batch_size]
 
             enc = self.tokenizer(
                 batch,
@@ -202,18 +208,23 @@ class HFEmbedder:
                     attention_mask=attention_mask,
                 )
 
-                # Standard transformer encoder output
                 last_hidden_state = outputs.last_hidden_state
                 pooled = self._mean_pool(last_hidden_state, attention_mask)
 
                 if self.cfg.normalize:
                     pooled = F.normalize(pooled, p=2, dim=1)
 
-                # Move to CPU and convert to Python-native lists
                 batch_vectors = pooled.detach().cpu().tolist()
                 all_vectors.extend(batch_vectors)
 
         return all_vectors
+
+    # Backward-compatible aliases
+    def encode(self, text: str) -> Vector:
+        return self.embed(text)
+
+    def encode_batch(self, texts: Sequence[str]) -> List[Vector]:
+        return self.embed_batch(texts)
 
     def embedding_dim(self) -> int:
         """
@@ -226,7 +237,20 @@ class HFEmbedder:
             raise RuntimeError("Could not determine embedding dimension from model config.")
         return int(hidden_size)
 
-    def info(self) -> dict:
+    @staticmethod
+    def embedding_norm(vector: Sequence[float]) -> float:
+        """
+        Compute the L2 norm of a vector.
+
+        Useful for:
+        - optional storage/debugging in MemoryItem.embedding_norm
+        - validation if normalization settings change
+        """
+        if vector is None:
+            raise ValueError("vector must not be None")
+        return float(sqrt(sum(float(x) * float(x) for x in vector)))
+
+    def info(self) -> Dict[str, object]:
         """
         Lightweight metadata for logging/debugging.
         """
@@ -238,3 +262,7 @@ class HFEmbedder:
             "normalize": self.cfg.normalize,
             "embedding_dim": self.embedding_dim(),
         }
+
+
+# Simple canonical interface for the rest of memarch
+Embedder = HFEmbedder

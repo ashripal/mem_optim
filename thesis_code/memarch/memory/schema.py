@@ -4,7 +4,8 @@ Core, shared data structures for memarch.
 
 Phase 1 focus:
 - Deterministic routing (no LLM-based policy)
-- Exact-match retrieval (semantic fields are optional/stubs)
+- Exact-match retrieval remains primary
+- Semantic retrieval is optional and assistive/context-only
 - Personalization via scopes (SESSION / USER / COHORT / GLOBAL)
 """
 
@@ -12,7 +13,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Dict, Optional, Mapping
+from typing import Any, Dict, Optional, Mapping, List
 from datetime import datetime, timedelta, timezone
 
 
@@ -37,7 +38,7 @@ class SourceTier(str, Enum):
 class MatchType(str, Enum):
     """How we matched."""
     EXACT = "exact"
-    SEMANTIC = "semantic"  # Phase 2 (optional). Keep for forward-compat.
+    SEMANTIC = "semantic"
 
 
 # -------------------------
@@ -98,7 +99,7 @@ class MemoryQuery:
     """
     Inputs to MemoryManager for a single user request.
 
-    Keep this as the *single* object passed across memory/generator boundaries,
+    Keep this as the single object passed across memory/generator boundaries,
     so pipeline code stays simple and consistent across devices.
     """
     raw_query: str
@@ -113,8 +114,8 @@ class MemoryQuery:
     # Task/domain scoping (recommended to avoid cross-task contamination)
     task: str = "default"
 
-    # Context is structured and may include device/tool state, recent turns, etc.
-    # IMPORTANT: context must be JSON-serializable if you plan to log it.
+    # Context is structured and may include device/tool state, dataset metadata,
+    # recent turns, etc. Must remain JSON-serializable if logged or stored.
     context: Dict[str, Any] = field(default_factory=dict)
 
     # Versioning to prevent stale reuse when templates change
@@ -123,10 +124,10 @@ class MemoryQuery:
     # Model identity used for version scoping (e.g., "mistral-7b-instruct")
     model_id: str = "mistral-7b-instruct"
 
-    # Budget knobs (Phase 1: semantic typically off; still include for future-proofing)
+    # Retrieval knobs
     allow_semantic: bool = False
-    max_disk_reads: int = 16  # guardrail; used by manager/policy
-    max_ram_reads: int = 64   # guardrail; used by manager/policy
+    max_disk_reads: int = 16
+    max_ram_reads: int = 64
 
     def __post_init__(self) -> None:
         if not self.raw_query or not self.raw_query.strip():
@@ -140,9 +141,12 @@ class MemoryItem:
     """
     A stored memory record.
 
-    Phase 1: used for exact-match personalized reuse.
+    Phase 1:
+    - exact-match retrieval remains primary
+    - semantic fields are optional and may be absent for older records
     """
-    # Stable key (derived from canonical query + scope + namespace + context signature + versioning)
+    # Stable key (derived from canonical query + scope + namespace +
+    # context signature + versioning)
     key: str
 
     # Scope & namespace determine who can see this memory item
@@ -168,8 +172,20 @@ class MemoryItem:
     # Usage stats (for promotion/eviction decisions)
     stats: AccessStats = field(default_factory=AccessStats)
 
-    # Free-form metadata (must remain JSON-serializable if logged)
+    # Free-form metadata (must remain JSON-serializable if logged/stored)
     meta: Dict[str, Any] = field(default_factory=dict)
+
+    # -------------------------
+    # Semantic retrieval fields
+    # -------------------------
+    # Stored as a plain list for JSON / SQLite compatibility.
+    query_embedding: Optional[List[float]] = None
+
+    # Embedding model used to generate the vector.
+    embedding_model_id: Optional[str] = None
+
+    # Useful for validation/debugging; especially if normalization behavior changes.
+    embedding_norm: Optional[float] = None
 
     def __post_init__(self) -> None:
         if not self.key:
@@ -195,7 +211,7 @@ class MemoryItem:
         if self.expires_at_utc is not None and self.expires_at_utc.tzinfo is None:
             raise ValueError("MemoryItem.expires_at_utc must be timezone-aware (UTC)")
 
-        # Scope-specific sanity (avoid silent cross-user contamination)
+        # Scope-specific sanity checks
         if self.scope == Scope.SESSION and not self.namespace.startswith("session:"):
             raise ValueError("SESSION scope requires namespace starting with 'session:'")
         if self.scope == Scope.USER and not self.namespace.startswith("user:"):
@@ -204,6 +220,23 @@ class MemoryItem:
             raise ValueError("COHORT scope requires namespace starting with 'cohort:'")
         if self.scope == Scope.GLOBAL and not self.namespace.startswith("global:"):
             raise ValueError("GLOBAL scope requires namespace starting with 'global:'")
+
+        # Semantic field sanity
+        if self.query_embedding is not None:
+            if not isinstance(self.query_embedding, list):
+                raise TypeError("MemoryItem.query_embedding must be a list[float] or None")
+            if len(self.query_embedding) == 0:
+                raise ValueError("MemoryItem.query_embedding cannot be an empty list")
+            for i, value in enumerate(self.query_embedding):
+                try:
+                    float(value)
+                except (TypeError, ValueError) as exc:
+                    raise TypeError(
+                        f"MemoryItem.query_embedding[{i}] must be numeric, got {value!r}"
+                    ) from exc
+
+        if self.embedding_norm is not None and float(self.embedding_norm) < 0.0:
+            raise ValueError("MemoryItem.embedding_norm must be >= 0 or None")
 
     def is_expired(self, now_utc: Optional[datetime] = None) -> bool:
         if self.expires_at_utc is None:
@@ -214,15 +247,26 @@ class MemoryItem:
 
 @dataclass(frozen=True)
 class MemoryHit:
-    """Returned by MemoryManager.retrieve() when it finds an item."""
+    """
+    Returned by MemoryManager.retrieve() when it finds an item.
+
+    Phase 1 notes:
+    - EXACT hits can still return directly
+    - SEMANTIC hits are primarily intended for context assistance
+    - bypass_allowed is present for forward compatibility, but can remain False
+    """
     item: MemoryItem
     source_tier: SourceTier
     match_type: MatchType = MatchType.EXACT
 
-    # Similarity/confidence score: for EXACT can be 1.0, for SEMANTIC in [0,1]
+    # For EXACT this is typically 1.0. For SEMANTIC it is cosine similarity.
     score: float = 1.0
 
-    # Optional debug info (e.g., which scope matched, what thresholds applied)
+    # Semantic retrieval metadata
+    semantic_rank: Optional[int] = None
+    bypass_allowed: bool = False
+
+    # Optional debug info (e.g., applied thresholds, filter reasons)
     debug: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -232,3 +276,5 @@ class MemoryHit:
             raise TypeError("MemoryHit.match_type must be a MatchType")
         if not (0.0 <= float(self.score) <= 1.0):
             raise ValueError(f"MemoryHit.score must be in [0,1], got {self.score}")
+        if self.semantic_rank is not None and self.semantic_rank < 1:
+            raise ValueError("MemoryHit.semantic_rank must be >= 1 when provided")

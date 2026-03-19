@@ -1,14 +1,15 @@
 # tests/test_manager_retrieve_store.py
 #
-# These tests validate the *end-to-end* behavior of MemoryManager across:
+# These tests validate the end-to-end behavior of MemoryManager across:
 #   - tiered retrieval (RAM then DISK)
 #   - disk-hit promotion back to RAM
 #   - generator invocation on miss
 #   - deterministic scoping/namespace ordering (SESSION -> USER -> COHORT -> GLOBAL)
 #   - TTL/expiration gating (expired items must not be reused)
+#   - Phase 1 semantic retrieval as context assistance after exact-match miss
 #
-# This is one of the most important Phase 1 gates because it proves the architecture
-# actually behaves like a multi-tier cache rather than a collection of independent modules.
+# This is one of the most important gates because it proves the architecture
+# actually behaves like a multi-tier memory system rather than a collection of modules.
 
 from __future__ import annotations
 
@@ -20,15 +21,18 @@ import pytest
 
 from memarch.memory.disk_store import DiskStoreSQLite
 from memarch.memory.manager import MemoryManager, MemoryManagerConfig
+from memarch.memory.policy import RetrievalPolicy
 from memarch.memory.ram_store import RamStoreLRU
 from memarch.memory.schema import (
+    MatchType,
+    MemoryHit,
     MemoryItem,
     MemoryQuery,
     Provenance,
     QualitySignals,
     Scope,
-    MemoryHit,
 )
+from memarch.models.embedder import EmbedderConfig, HFEmbedder
 from memarch.utils.text import canonicalize, context_signature, make_key
 
 
@@ -39,20 +43,30 @@ from memarch.utils.text import canonicalize, context_signature, make_key
 @dataclass
 class FakeGenerator:
     """
-    A tiny deterministic generator used for unit tests.
+    Tiny deterministic generator used for unit tests.
 
     - Records how many times it was called
+    - Records the retrieved hit passed into generation
     - Returns a stable answer based on input query
-    - Returns fixed provenance/quality for storage decisions
     """
     call_count: int = 0
     last_query: Optional[str] = None
+    last_retrieved: Optional[MemoryHit] = None
 
     def generate(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> Tuple[str, Provenance, QualitySignals]:
         self.call_count += 1
         self.last_query = mq.raw_query
+        self.last_retrieved = retrieved
 
-        ans = f"GEN:{mq.raw_query} | ctx_len={len((mq.context or {}).get('dataset_context', '') or '')}"
+        suffix = ""
+        if retrieved is not None:
+            suffix = f" | retrieved={retrieved.match_type.value}:{retrieved.score:.4f}"
+
+        ans = (
+            f"GEN:{mq.raw_query} | "
+            f"ctx_len={len((mq.context or {}).get('dataset_context', '') or '')}"
+            f"{suffix}"
+        )
         prov = Provenance(
             model_id=mq.model_id,
             prompt_version=mq.prompt_version,
@@ -63,6 +77,33 @@ class FakeGenerator:
         )
         qual = QualitySignals(score=1.0, success=True, metrics={"unit": 1.0})
         return ans, prov, qual
+
+
+class TinyTestEmbedder:
+    """
+    Deterministic, dependency-free embedder for semantic retrieval tests.
+    """
+    def __init__(self, model_id: str = "tiny-test-embedder") -> None:
+        self.cfg = type("Cfg", (), {"model_id": model_id})()
+
+    def embed(self, text: str):
+        text = (text or "").lower().strip()
+
+        # Small handcrafted semantic mapping for deterministic tests.
+        if "reset the device" in text:
+            return [1.0, 0.0, 0.0]
+        if "restart the device" in text:
+            return [0.99, 0.01, 0.0]
+        if "torque setting" in text:
+            return [0.0, 1.0, 0.0]
+        if "sensor a" in text:
+            return [0.0, 0.0, 1.0]
+
+        return [0.2, 0.2, 0.2]
+
+    @staticmethod
+    def embedding_norm(vec):
+        return sum(float(x) * float(x) for x in vec) ** 0.5
 
 
 # -------------------------
@@ -76,12 +117,19 @@ def _mk_item_for_scope(
     mq: MemoryQuery,
     answer_text: str,
     expires_at_utc: Optional[datetime] = None,
+    query_embedding: Optional[list[float]] = None,
+    embedding_model_id: Optional[str] = None,
+    embedding_norm: Optional[float] = None,
+    raw_query_override: Optional[str] = None,
 ) -> MemoryItem:
     """
-    Create a MemoryItem consistent with the manager's keying scheme.
-    This lets us inject controlled items directly into stores for scope-order testing.
+    Create a MemoryItem consistent with manager keying.
+
+    raw_query_override is useful for semantic tests where the stored query differs
+    from the current query and therefore must not exact-match.
     """
-    q_can = canonicalize(mq.raw_query)
+    raw_query = raw_query_override if raw_query_override is not None else mq.raw_query
+    q_can = canonicalize(raw_query)
     ctx_sig = context_signature(mq.context)
 
     key = make_key(
@@ -112,11 +160,23 @@ def _mk_item_for_scope(
         provenance=prov,
         quality=QualitySignals(score=1.0, success=True),
         expires_at_utc=expires_at_utc,
-        meta={"unit_test": True},
+        meta={
+            "unit_test": True,
+            "task": mq.task,
+            "doc_signature": mq.context.get("doc_signature"),
+        },
+        query_embedding=query_embedding,
+        embedding_model_id=embedding_model_id,
+        embedding_norm=embedding_norm,
     )
 
 
-def _build_manager(tmp_path) -> Tuple[MemoryManager, RamStoreLRU, DiskStoreSQLite]:
+def _build_manager(
+    tmp_path,
+    *,
+    retrieval_policy: Optional[RetrievalPolicy] = None,
+    embedder=None,
+) -> Tuple[MemoryManager, RamStoreLRU, DiskStoreSQLite]:
     """
     Build a fresh manager + stores for each test.
     """
@@ -124,15 +184,19 @@ def _build_manager(tmp_path) -> Tuple[MemoryManager, RamStoreLRU, DiskStoreSQLit
     disk = DiskStoreSQLite(str(tmp_path / "mem.sqlite"))
 
     mm_cfg = MemoryManagerConfig(
+        retrieval_policy=retrieval_policy or RetrievalPolicy(
+            scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL]
+        ),
         promote_disk_hits_to_ram=True,
         return_memory_directly=True,
+        embedder=embedder,
     )
     mgr = MemoryManager(ram=ram, disk=disk, cfg=mm_cfg)
     return mgr, ram, disk
 
 
 # -------------------------
-# Tests
+# Exact-match tests
 # -------------------------
 
 def test_manager_miss_calls_generator_and_stores_then_hits_from_ram(tmp_path):
@@ -154,20 +218,17 @@ def test_manager_miss_calls_generator_and_stores_then_hits_from_ram(tmp_path):
         prompt_version="v1",
     )
 
-    # 1) First call should invoke generator
     ans1, meta1 = mgr.answer(mq, gen)
     assert gen.call_count == 1
     assert meta1.get("generated") is True
     assert meta1.get("used_memory") is False
     assert ans1.startswith("GEN:")
 
-    # 2) Second call should be a RAM hit (since we write-through RAM+DISK)
     ans2, meta2 = mgr.answer(mq, gen)
-    assert gen.call_count == 1  # no additional calls
+    assert gen.call_count == 1
     assert meta2.get("used_memory") is True
     assert ans2 == ans1
 
-    # Sanity: RAM/DISK stats should reflect activity
     ram_stats = ram.stats()
     disk_stats = disk.stats()
     assert ram_stats.puts >= 1
@@ -195,20 +256,16 @@ def test_manager_disk_hit_promotes_to_ram(tmp_path):
         prompt_version="v1",
     )
 
-    # Populate (miss -> generate -> store)
-    ans1, meta1 = mgr.answer(mq, gen)
+    ans1, _meta1 = mgr.answer(mq, gen)
     assert gen.call_count == 1
 
-    # Clear RAM to force DISK path
     ram.clear()
 
-    # Retrieve: should hit DISK (and promote)
     hit = mgr.retrieve(mq)
     assert hit is not None
     assert hit.source_tier.value == "disk"
     assert hit.item.answer_text == ans1
 
-    # After promotion, RAM should now have the item; retrieve again should hit RAM
     hit2 = mgr.retrieve(mq)
     assert hit2 is not None
     assert hit2.source_tier.value == "ram"
@@ -218,11 +275,6 @@ def test_manager_disk_hit_promotes_to_ram(tmp_path):
 def test_manager_respects_scope_order_session_over_user(tmp_path):
     """
     Validates SESSION -> USER ordering.
-
-    We inject two items:
-      - session-scoped item with answer "SESSION_ANSWER"
-      - user-scoped item with answer "USER_ANSWER"
-    Retrieval should return the session-scoped answer first.
     """
     mgr, ram, disk = _build_manager(tmp_path)
 
@@ -237,11 +289,9 @@ def test_manager_respects_scope_order_session_over_user(tmp_path):
         prompt_version="v1",
     )
 
-    # Build deterministic namespaces exactly like namespace.py does
     ns_session = "session:s1"
     ns_user = "user:u1"
 
-    # Create and insert items directly into DISK (source of truth)
     session_item = _mk_item_for_scope(
         scope=Scope.SESSION, namespace=ns_session, mq=mq, answer_text="SESSION_ANSWER"
     )
@@ -252,7 +302,6 @@ def test_manager_respects_scope_order_session_over_user(tmp_path):
     disk.put(ns_session, session_item.key, session_item)
     disk.put(ns_user, user_item.key, user_item)
 
-    # Ensure RAM is empty so we test pure retrieval ordering
     ram.clear()
 
     hit = mgr.retrieve(mq)
@@ -263,9 +312,7 @@ def test_manager_respects_scope_order_session_over_user(tmp_path):
 
 def test_manager_rejects_expired_items(tmp_path):
     """
-    Validates TTL/expiration gating at retrieval time.
-
-    If an item is expired, MemoryManager.retrieve should return None even if it exists in stores.
+    If an item is expired, MemoryManager.retrieve should return None even if it exists.
     """
     mgr, ram, disk = _build_manager(tmp_path)
 
@@ -290,18 +337,16 @@ def test_manager_rejects_expired_items(tmp_path):
         expires_at_utc=expired_time,
     )
 
-    # Insert expired item into both tiers
     disk.put(ns_user, expired_item.key, expired_item)
     ram.put(ns_user, expired_item.key, expired_item)
 
     hit = mgr.retrieve(mq)
-    assert hit is None  # must not reuse expired memory
+    assert hit is None
 
 
 def test_manager_miss_after_expired_item_calls_generator(tmp_path):
     """
-    If only expired memory exists, manager.answer should generate a fresh response
-    and overwrite stored memory.
+    If only expired memory exists, manager.answer should generate a fresh response.
     """
     mgr, ram, disk = _build_manager(tmp_path)
     gen = FakeGenerator()
@@ -330,12 +375,225 @@ def test_manager_miss_after_expired_item_calls_generator(tmp_path):
 
     ans, meta = mgr.answer(mq, gen)
 
-    # Should generate because expired item must be rejected
     assert gen.call_count == 1
     assert meta.get("generated") is True
     assert ans.startswith("GEN:")
 
-    # After generation, a new retrieval should hit memory with fresh answer
     hit = mgr.retrieve(mq)
     assert hit is not None
     assert hit.item.answer_text == ans
+
+
+# -------------------------
+# Semantic retrieval tests
+# -------------------------
+
+def test_manager_semantic_hit_is_used_as_generation_context_not_direct_bypass(tmp_path):
+    """
+    Phase 1 default:
+      - exact miss
+      - semantic hit found
+      - generator is still called
+      - retrieved semantic hit is passed into generator
+    """
+    pol = RetrievalPolicy(
+        scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
+        semantic_enabled=True,
+        semantic_threshold_context=0.85,
+        semantic_threshold_bypass=1.01,  # disable bypass in Phase 1
+    )
+    embedder = TinyTestEmbedder()
+    mgr, ram, disk = _build_manager(tmp_path, retrieval_policy=pol, embedder=embedder)
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="trec",
+        context={
+            "dataset_context": "Device troubleshooting manual.",
+            "doc_signature": "doc-reset-001",
+        },
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        allow_semantic=True,
+    )
+
+    ns_user = "user:u1"
+    stored_query = "How do I reset the device?"
+    stored_vec = embedder.embed(stored_query)
+
+    sem_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override=stored_query,
+        answer_text="Press and hold the reset button for 10 seconds.",
+        query_embedding=stored_vec,
+        embedding_model_id=embedder.cfg.model_id,
+        embedding_norm=embedder.embedding_norm(stored_vec),
+    )
+    disk.put(ns_user, sem_item.key, sem_item)
+
+    ans, meta = mgr.answer(mq, gen)
+
+    assert gen.call_count == 1
+    assert gen.last_retrieved is not None
+    assert gen.last_retrieved.match_type == MatchType.SEMANTIC
+    assert gen.last_retrieved.item.answer_text == "Press and hold the reset button for 10 seconds."
+    assert meta["generated"] is True
+    assert meta["used_memory"] is False
+    assert meta["semantic_used"] is True
+    assert meta["semantic_bypassed"] is False
+    assert "retrieved=semantic" in ans
+
+
+def test_manager_semantic_bypass_returns_directly_when_policy_allows(tmp_path):
+    """
+    If semantic score passes bypass threshold, manager may return directly.
+    """
+    pol = RetrievalPolicy(
+        scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
+        semantic_enabled=True,
+        semantic_threshold_context=0.85,
+        semantic_threshold_bypass=0.95,
+    )
+    embedder = TinyTestEmbedder()
+    mgr, _ram, disk = _build_manager(tmp_path, retrieval_policy=pol, embedder=embedder)
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="trec",
+        context={
+            "dataset_context": "Device troubleshooting manual.",
+            "doc_signature": "doc-reset-001",
+        },
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        allow_semantic=True,
+    )
+
+    ns_user = "user:u1"
+    stored_query = "How do I reset the device?"
+    stored_vec = embedder.embed(stored_query)
+
+    sem_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override=stored_query,
+        answer_text="DIRECT_SEMANTIC_ANSWER",
+        query_embedding=stored_vec,
+        embedding_model_id=embedder.cfg.model_id,
+        embedding_norm=embedder.embedding_norm(stored_vec),
+    )
+    disk.put(ns_user, sem_item.key, sem_item)
+
+    ans, meta = mgr.answer(mq, gen)
+
+    assert ans == "DIRECT_SEMANTIC_ANSWER"
+    assert gen.call_count == 0
+    assert meta["used_memory"] is True
+    assert meta["generated"] is False
+    assert meta["semantic_used"] is True
+    assert meta["semantic_bypassed"] is True
+    assert meta["match_type"] == "semantic"
+
+
+def test_manager_semantic_candidate_rejected_on_document_mismatch(tmp_path):
+    """
+    Semantic retrieval should reject candidates from a different document when
+    doc signatures are available and differ.
+    """
+    pol = RetrievalPolicy(
+        scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
+        semantic_enabled=True,
+        semantic_threshold_context=0.85,
+        semantic_threshold_bypass=1.01,
+    )
+    embedder = TinyTestEmbedder()
+    mgr, _ram, disk = _build_manager(tmp_path, retrieval_policy=pol, embedder=embedder)
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="trec",
+        context={
+            "dataset_context": "Device troubleshooting manual.",
+            "doc_signature": "doc-A",
+        },
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        allow_semantic=True,
+    )
+
+    ns_user = "user:u1"
+    stored_query = "How do I reset the device?"
+    stored_vec = embedder.embed(stored_query)
+
+    sem_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override=stored_query,
+        answer_text="WRONG_DOCUMENT_ANSWER",
+        query_embedding=stored_vec,
+        embedding_model_id=embedder.cfg.model_id,
+        embedding_norm=embedder.embedding_norm(stored_vec),
+    )
+    sem_item.meta["doc_signature"] = "doc-B"
+    disk.put(ns_user, sem_item.key, sem_item)
+
+    ans, meta = mgr.answer(mq, gen)
+
+    assert gen.call_count == 1
+    assert gen.last_retrieved is None
+    assert meta["semantic_used"] is False
+    assert meta["generated"] is True
+    assert ans.startswith("GEN:")
+
+
+def test_manager_store_adds_embedding_fields_when_embedder_present(tmp_path):
+    """
+    Generated items should store query embeddings when an embedder is configured.
+    """
+    pol = RetrievalPolicy(
+        scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
+        semantic_enabled=True,
+        semantic_threshold_context=0.85,
+        semantic_threshold_bypass=1.01,
+    )
+    embedder = TinyTestEmbedder()
+    mgr, ram, disk = _build_manager(tmp_path, retrieval_policy=pol, embedder=embedder)
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="What is the recommended torque setting?",
+        user_id="u1",
+        session_id="s1",
+        task="trec",
+        context={
+            "dataset_context": "Spec sheet context.",
+            "doc_signature": "doc-torque-001",
+        },
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        allow_semantic=True,
+    )
+
+    ans, meta = mgr.answer(mq, gen)
+    assert ans.startswith("GEN:")
+    assert meta["generated"] is True
+
+    hit = mgr.retrieve(mq)
+    assert hit is not None
+    assert hit.match_type == MatchType.EXACT
+    assert hit.item.query_embedding is not None
+    assert hit.item.embedding_model_id == embedder.cfg.model_id
+    assert hit.item.embedding_norm is not None

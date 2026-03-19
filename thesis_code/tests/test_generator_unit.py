@@ -3,10 +3,10 @@
 # Unit tests for memarch/models/generator.py
 #
 # IMPORTANT:
-# These are *unit* tests, not real-model integration tests.
+# These are unit tests, not real-model integration tests.
 # They use fake tokenizer/model objects to validate the wrapper logic only:
 #   - prompt construction
-#   - dataset context injection
+#   - document context injection
 #   - optional retrieved-memory injection
 #   - provenance / quality packaging
 #   - prompt recording via last_prompt
@@ -15,7 +15,7 @@
 # - fast
 # - deterministic
 # - offline
-# - isolates bugs in *our code* from bugs in model loading / environment setup
+# - isolates bugs in our code from bugs in model loading / environment setup
 #
 # Real-model tests should live in a separate file, e.g.:
 #   tests/test_generator_integration.py
@@ -25,6 +25,7 @@ from __future__ import annotations
 import torch
 
 from memarch.memory.schema import (
+    MatchType,
     MemoryHit,
     MemoryItem,
     MemoryQuery,
@@ -44,13 +45,6 @@ from memarch.utils.text import canonicalize, context_signature, make_key
 class FakeTokenizer:
     """
     Minimal tokenizer stub that mimics the methods/attributes HFGenerator expects.
-
-    What it lets us test:
-    - tokenization path
-    - handling of pad/eos token fields
-    - decode path for generated tokens
-
-    It does NOT test real tokenization quality.
     """
     def __init__(self):
         self.pad_token = None
@@ -59,24 +53,18 @@ class FakeTokenizer:
         self.eos_token_id = 99
 
     def __call__(self, prompt, return_tensors="pt", truncation=True, max_length=2048, padding=False):
-        # Pretend every prompt tokenizes to exactly 4 tokens.
         return {
             "input_ids": torch.tensor([[10, 11, 12, 13]], dtype=torch.long),
             "attention_mask": torch.tensor([[1, 1, 1, 1]], dtype=torch.long),
         }
 
     def decode(self, ids, skip_special_tokens=True):
-        # Deterministic decode output.
         return "generated answer from fake model"
 
 
 class FakeModel:
     """
     Minimal causal LM stub that mimics .generate().
-
-    It returns:
-      original input_ids + 3 fake generated tokens
-    so that HFGenerator can slice off the prompt tokens and decode only the "new" text.
     """
     def eval(self):
         return self
@@ -103,13 +91,16 @@ class FakeModel:
 # Helpers
 # --------------------------------------------------------------------------------------
 
-def _make_memory_hit(answer_text: str = "previous useful answer") -> MemoryHit:
+def _make_memory_hit(
+    answer_text: str = "previous useful answer",
+    *,
+    match_type: MatchType = MatchType.EXACT,
+    score: float = 1.0,
+    semantic_rank: int | None = None,
+) -> MemoryHit:
     """
     Construct a valid MemoryHit so we can test prompt injection
     of previously retrieved memory.
-
-    This is useful even in Phase 1, because the generator wrapper itself
-    should be able to include retrieved context if requested.
     """
     mq = MemoryQuery(
         raw_query="What is systems engineering?",
@@ -147,7 +138,13 @@ def _make_memory_hit(answer_text: str = "previous useful answer") -> MemoryHit:
         quality=QualitySignals(success=True),
     )
 
-    return MemoryHit(item=item, source_tier=SourceTier.RAM)
+    return MemoryHit(
+        item=item,
+        source_tier=SourceTier.RAM,
+        match_type=match_type,
+        score=score,
+        semantic_rank=semantic_rank,
+    )
 
 
 def _patch_generator_deps(monkeypatch) -> None:
@@ -168,10 +165,10 @@ def _patch_generator_deps(monkeypatch) -> None:
 # Tests
 # --------------------------------------------------------------------------------------
 
-def test_build_prompt_includes_dataset_context(monkeypatch):
+def test_build_prompt_includes_document_context(monkeypatch):
     """
     Verifies the most important prompt invariant:
-    dataset context from MemoryQuery must appear in the final prompt.
+    dataset/document context from MemoryQuery must appear in the final prompt.
     """
     _patch_generator_deps(monkeypatch)
 
@@ -192,19 +189,17 @@ def test_build_prompt_includes_dataset_context(monkeypatch):
 
     prompt = gen.build_prompt(mq)
 
-    assert "DATASET CONTEXT:" in prompt
+    assert "DOCUMENT CONTEXT:" in prompt
     assert "SYSTEMS_ENGINEERING_MARKER" in prompt
-    assert "QUESTION:" in prompt
+    assert "CURRENT QUESTION:" in prompt
     assert "What is systems engineering?" in prompt
     assert "DOCUMENT SIGNATURE: abc123" in prompt
+    assert "ANSWER:" in prompt
 
 
 def test_build_prompt_can_include_retrieved_memory(monkeypatch):
     """
     Verifies optional injection of previously retrieved memory context.
-
-    Even though Phase 1 bypasses generation on hits, the generator wrapper should still
-    support this path for future use and for explicit tests of prompt composition.
     """
     _patch_generator_deps(monkeypatch)
 
@@ -228,18 +223,59 @@ def test_build_prompt_can_include_retrieved_memory(monkeypatch):
 
     prompt = gen.build_prompt(mq, retrieved=hit)
 
-    assert "PREVIOUSLY USEFUL MEMORY:" in prompt
+    assert "RETRIEVED ANSWER FOR A SIMILAR EARLIER QUESTION:" in prompt
     assert "A prior cached explanation" in prompt
-    assert "DATASET CONTEXT:" in prompt
+    assert "RETRIEVAL METADATA:" in prompt
+    assert "match_type=exact" in prompt
+    assert "source_tier=ram" in prompt
+    assert "score=1.0000" in prompt
+    assert "DOCUMENT CONTEXT:" in prompt
     assert "NASA context" in prompt
+
+
+def test_build_prompt_for_semantic_hit_includes_safety_instruction(monkeypatch):
+    """
+    Semantic retrieved memory should be explicitly framed as advisory.
+    """
+    _patch_generator_deps(monkeypatch)
+
+    gen = HFGenerator(
+        GeneratorConfig(
+            device="cpu",
+            include_retrieved_memory_context=True,
+        )
+    )
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="pdf_qa",
+        context={"dataset_context": "Device manual context"},
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+    )
+    hit = _make_memory_hit(
+        "Press the reset button.",
+        match_type=MatchType.SEMANTIC,
+        score=0.97,
+        semantic_rank=1,
+    )
+
+    prompt = gen.build_prompt(mq, retrieved=hit)
+
+    assert "RETRIEVED ANSWER FOR A SIMILAR EARLIER QUESTION:" in prompt
+    assert "Press the reset button." in prompt
+    assert "match_type=semantic" in prompt
+    assert "score=0.9700" in prompt
+    assert "semantic_rank=1" in prompt
+    assert "Use the retrieved answer only if it is consistent" in prompt
 
 
 def test_generate_returns_answer_provenance_and_quality(monkeypatch):
     """
     Verifies the generator's return contract:
       (answer_text, provenance, quality)
-
-    This is what MemoryManager depends on.
     """
     _patch_generator_deps(monkeypatch)
 
@@ -265,12 +301,38 @@ def test_generate_returns_answer_provenance_and_quality(monkeypatch):
     assert quality.success is True
 
 
+def test_generate_with_semantic_retrieval_adds_quality_metric(monkeypatch):
+    """
+    Semantic retrieval score should be surfaced in quality metrics for logging/eval.
+    """
+    _patch_generator_deps(monkeypatch)
+
+    gen = HFGenerator(GeneratorConfig(device="cpu"))
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="pdf_qa",
+        context={"dataset_context": "Device manual excerpt"},
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+    )
+    hit = _make_memory_hit(
+        "Press the reset button.",
+        match_type=MatchType.SEMANTIC,
+        score=0.96,
+        semantic_rank=1,
+    )
+
+    _answer, _provenance, quality = gen.generate(mq, retrieved=hit)
+
+    assert quality.metrics["semantic_retrieval_score"] == 0.96
+
+
 def test_generate_records_last_prompt(monkeypatch):
     """
     Verifies that the final prompt is saved to last_prompt.
-
-    This matters because your Streamlit demo uses last_prompt as proof
-    that dataset context was actually fed into the LLM path.
     """
     _patch_generator_deps(monkeypatch)
 
@@ -291,6 +353,7 @@ def test_generate_records_last_prompt(monkeypatch):
     assert gen.last_prompt is not None
     assert "NASA handbook excerpt" in gen.last_prompt
     assert "What is systems engineering?" in gen.last_prompt
+    assert "CURRENT QUESTION:" in gen.last_prompt
 
 
 def test_generator_sets_pad_token_when_missing(monkeypatch):
@@ -330,3 +393,6 @@ def test_info_returns_expected_metadata(monkeypatch):
     assert info["temperature"] == 0.1
     assert info["top_p"] == 0.9
     assert info["do_sample"] is False
+    assert info["include_retrieved_memory_context"] is True
+    assert info["include_dataset_context"] is True
+    assert info["include_doc_signature"] is True

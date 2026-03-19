@@ -101,7 +101,7 @@ def test_real_generator_build_prompt_includes_dataset_context(local_generator: H
 
     prompt = local_generator.build_prompt(mq)
 
-    assert "DATASET CONTEXT:" in prompt
+    assert "DOCUMENT CONTEXT:" in prompt
     assert "SYSTEMS_ENGINEERING_MARKER" in prompt
     assert "QUESTION:" in prompt
     assert "What is systems engineering?" in prompt
@@ -172,7 +172,7 @@ def test_real_generator_records_last_prompt(local_generator: HFGenerator):
 
     assert local_generator.last_prompt is not None
     assert marker in local_generator.last_prompt
-    assert "DATASET CONTEXT:" in local_generator.last_prompt
+    assert "DOCUMENT CONTEXT:" in local_generator.last_prompt
     assert "QUESTION:" in local_generator.last_prompt
 
 

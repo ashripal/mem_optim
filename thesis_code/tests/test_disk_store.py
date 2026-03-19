@@ -8,6 +8,7 @@
 #   - Namespace isolation
 #   - Delete + iter_namespace behavior
 #   - Basic stats counters
+#   - Semantic retrieval fields persist cleanly
 
 from __future__ import annotations
 
@@ -31,6 +32,9 @@ def _mk_item(
     prompt_version: str = "v1",
     ttl_seconds: int | None = None,
     expires_at_utc: datetime | None = None,
+    query_embedding: list[float] | None = None,
+    embedding_model_id: str | None = None,
+    embedding_norm: float | None = None,
 ) -> MemoryItem:
     """
     Helper to create a valid MemoryItem with deterministic keying.
@@ -68,7 +72,10 @@ def _mk_item(
         quality=QualitySignals(score=1.0, success=True, metrics={"em": 1.0}),
         ttl_seconds=ttl_seconds,
         expires_at_utc=expires_at_utc,
-        meta={"unit_test": True},
+        meta={"unit_test": True, "task": "trec", "doc_signature": ctx.get("doc_signature")},
+        query_embedding=query_embedding,
+        embedding_model_id=embedding_model_id,
+        embedding_norm=embedding_norm,
     )
 
 
@@ -89,7 +96,7 @@ def test_disk_store_put_get_roundtrip(tmp_path):
     assert got.context_signature == item.context_signature
     assert got.answer_text == item.answer_text
 
-    # Provenance roundtrip (fields that matter for version gating)
+    # Provenance roundtrip
     assert got.provenance.model_id == item.provenance.model_id
     assert got.provenance.prompt_version == item.provenance.prompt_version
     assert got.provenance.quantization == item.provenance.quantization
@@ -177,6 +184,19 @@ def test_disk_store_iter_namespace_returns_only_that_namespace(tmp_path):
     store.close()
 
 
+def test_disk_store_iter_namespace_empty_namespace_returns_empty_list(tmp_path):
+    db_path = tmp_path / "mem.sqlite"
+    store = DiskStoreSQLite(str(db_path))
+
+    items = list(store.iter_namespace("user:u1"))
+    assert items == []
+
+    stats = store.stats()
+    assert stats["iter_calls"] == 1
+
+    store.close()
+
+
 def test_disk_store_serializes_ttl_and_expires_at(tmp_path):
     """
     Verifies that TTL and expires_at fields survive disk roundtrip and remain UTC-aware.
@@ -202,8 +222,7 @@ def test_disk_store_serializes_ttl_and_expires_at(tmp_path):
     assert got is not None
     assert got.ttl_seconds == 60
     assert got.expires_at_utc is not None
-    assert got.expires_at_utc.tzinfo is not None  # should be timezone-aware UTC
-    # allow tiny drift due to serialization precision
+    assert got.expires_at_utc.tzinfo is not None
     assert abs((got.expires_at_utc - expires).total_seconds()) < 1.0
 
     store.close()
@@ -236,5 +255,90 @@ def test_disk_store_get_miss_increments_miss_count(tmp_path):
     assert stats["gets"] == 1
     assert stats["misses"] == 1
     assert stats["hits"] == 0
+
+    store.close()
+
+
+def test_disk_store_roundtrip_preserves_semantic_fields(tmp_path):
+    """
+    Semantic retrieval depends on embeddings surviving disk persistence.
+    """
+    db_path = tmp_path / "mem.sqlite"
+    store = DiskStoreSQLite(str(db_path))
+
+    ns = "user:u1"
+    item = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="semantic question",
+        ctx={"dataset_context": "abc", "doc_signature": "doc123"},
+        query_embedding=[0.1, 0.2, 0.3, 0.4],
+        embedding_model_id="sentence-transformers/all-MiniLM-L6-v2",
+        embedding_norm=0.5477,
+    )
+    store.put(ns, item.key, item)
+
+    got = store.get(ns, item.key)
+    assert got is not None
+    assert got.query_embedding == [0.1, 0.2, 0.3, 0.4]
+    assert got.embedding_model_id == "sentence-transformers/all-MiniLM-L6-v2"
+    assert got.embedding_norm == pytest.approx(0.5477, abs=1e-6)
+
+    store.close()
+
+
+def test_disk_store_semantic_fields_persist_across_reopen(tmp_path):
+    db_path = tmp_path / "mem.sqlite"
+    ns = "user:u1"
+
+    item = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="persist semantic",
+        ctx={"dataset_context": "abc", "doc_signature": "docXYZ"},
+        query_embedding=[0.5, 0.6, 0.7],
+        embedding_model_id="sentence-transformers/all-MiniLM-L6-v2",
+        embedding_norm=1.0488088,
+    )
+
+    store1 = DiskStoreSQLite(str(tmp_path / "mem.sqlite"))
+    store1.put(ns, item.key, item)
+    store1.close()
+
+    store2 = DiskStoreSQLite(str(tmp_path / "mem.sqlite"))
+    got = store2.get(ns, item.key)
+
+    assert got is not None
+    assert got.query_embedding == [0.5, 0.6, 0.7]
+    assert got.embedding_model_id == "sentence-transformers/all-MiniLM-L6-v2"
+    assert got.embedding_norm == pytest.approx(1.0488088, abs=1e-6)
+
+    store2.close()
+
+
+def test_disk_store_allows_items_without_semantic_fields(tmp_path):
+    """
+    Backward compatibility: items without embedding fields should still load cleanly.
+    """
+    db_path = tmp_path / "mem.sqlite"
+    store = DiskStoreSQLite(str(db_path))
+
+    ns = "user:u1"
+    item = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="legacy style",
+        ctx={"dataset_context": "abc"},
+        query_embedding=None,
+        embedding_model_id=None,
+        embedding_norm=None,
+    )
+    store.put(ns, item.key, item)
+
+    got = store.get(ns, item.key)
+    assert got is not None
+    assert got.query_embedding is None
+    assert got.embedding_model_id is None
+    assert got.embedding_norm is None
 
     store.close()
