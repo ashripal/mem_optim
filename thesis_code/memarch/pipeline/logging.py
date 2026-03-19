@@ -5,13 +5,14 @@ Structured logging for memarch runs.
 Goals:
 - Append-only JSONL logs (easy to stream, analyze, and summarize)
 - Portable across macOS / Jetson / other Linux devices
-- Deterministic schema (committee-friendly)
+- Deterministic schema
 
 What we log per example:
 - identifiers (run_id, example_id, task)
 - query + minimal context preview (optional)
 - timings (total, memory, generation)
 - memory decision metadata (hit/miss, scope, tier)
+- semantic retrieval metadata
 - resource snapshots (rss_mb, gpu mem if available later)
 - store outcomes (what was written)
 
@@ -79,7 +80,6 @@ class JsonlLogger:
 
         self.run_info = run_info
         if self.run_info is not None:
-            # Write a run header as the first event (idempotent-ish if repeated).
             self.write_event(
                 {
                     "type": "run_start",
@@ -96,7 +96,6 @@ class JsonlLogger:
         if not isinstance(event, dict):
             raise TypeError("event must be a dict")
 
-        # Ensure every event has a timestamp
         if "ts_utc" not in event:
             event["ts_utc"] = utc_now_iso()
 
@@ -116,18 +115,41 @@ class JsonlLogger:
     ) -> None:
         """
         Convenience wrapper for a standard per-example event.
+
+        In addition to preserving the raw `meta` dict, this extracts the most
+        important memory/semantic fields into stable top-level columns so that
+        downstream analysis does not have to repeatedly unpack nested metadata.
         """
+        meta = dict(meta or {})
+        timings_ms = dict(timings_ms or {})
+
         evt: Dict[str, Any] = {
             "type": "example",
             "run_id": self.run_info.run_id if self.run_info else None,
             "example_id": example_id,
             "task": task,
             "query": query,
+
+            # Stable top-level decision fields
+            "used_memory": bool(meta.get("used_memory", False)),
+            "generated": bool(meta.get("generated", False)),
+            "source_tier": meta.get("source_tier"),
+            "match_type": meta.get("match_type"),
+            "score": meta.get("score"),
+
+            # Semantic retrieval fields
+            "semantic_used": bool(meta.get("semantic_used", False)),
+            "semantic_bypassed": bool(meta.get("semantic_bypassed", False)),
+            "semantic_candidate_rank": meta.get("semantic_candidate_rank"),
+
+            # Raw nested fields retained for flexibility
             "meta": meta,
             "timings_ms": timings_ms,
         }
+
         if resources is not None:
             evt["resources"] = resources
+
         self.write_event(evt)
 
     def close(self) -> None:

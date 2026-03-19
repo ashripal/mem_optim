@@ -6,7 +6,7 @@ Phase 1 goals:
 - Keep runner thin and deterministic
 - Accept an iterator of MemoryQuery objects (from LongBench or other datasets)
 - Use Evaluator to measure and log
-- Produce a small in-memory summary for convenience (optional)
+- Produce a small in-memory summary for convenience
 
 This module should not embed dataset-specific logic; that belongs in memarch/data/*.
 """
@@ -14,7 +14,7 @@ This module should not embed dataset-specific logic; that belongs in memarch/dat
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Protocol, Tuple
+from typing import Iterable, Iterator, List, Optional, Protocol, Tuple
 
 from memarch.memory.schema import MemoryQuery
 from memarch.pipeline.evaluator import Evaluator, EvalResult
@@ -35,6 +35,9 @@ class ExampleSource(Protocol):
 class RunSummary:
     num_examples: int
     num_used_memory: int
+    num_exact_hits: int
+    num_semantic_used: int
+    num_semantic_bypassed: int
     avg_total_ms: float
     avg_memory_lookup_ms: float
     avg_generation_ms_est: float
@@ -72,7 +75,11 @@ class Runner:
         total_ms: List[float] = []
         mem_ms: List[float] = []
         gen_ms: List[float] = []
+
         used_memory_count = 0
+        exact_hit_count = 0
+        semantic_used_count = 0
+        semantic_bypassed_count = 0
         n = 0
 
         for example_id, task, mq in examples:
@@ -87,8 +94,18 @@ class Runner:
             )
 
             n += 1
+
             if bool(res.meta.get("used_memory")):
                 used_memory_count += 1
+
+            if res.meta.get("match_type") == "exact":
+                exact_hit_count += 1
+
+            if bool(res.meta.get("semantic_used")):
+                semantic_used_count += 1
+
+            if bool(res.meta.get("semantic_bypassed")):
+                semantic_bypassed_count += 1
 
             total_ms.append(float(res.timings_ms.get("total_ms", 0.0)))
             mem_ms.append(float(res.timings_ms.get("memory_lookup_ms", 0.0)))
@@ -97,6 +114,9 @@ class Runner:
         return RunSummary(
             num_examples=n,
             num_used_memory=used_memory_count,
+            num_exact_hits=exact_hit_count,
+            num_semantic_used=semantic_used_count,
+            num_semantic_bypassed=semantic_bypassed_count,
             avg_total_ms=_safe_mean(total_ms),
             avg_memory_lookup_ms=_safe_mean(mem_ms),
             avg_generation_ms_est=_safe_mean(gen_ms),

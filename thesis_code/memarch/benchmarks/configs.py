@@ -81,6 +81,10 @@ class OutputConfig:
     write_workload_manifest: bool = True
     write_summary_json: bool = False
 
+    def validate(self) -> None:
+        if not str(self.root_dir).strip():
+            raise ValueError("root_dir must be non-empty")
+
     def resolve_run_dir(self, benchmark_name: str, workload_mode: str) -> Path:
         return Path(self.root_dir).expanduser().resolve() / workload_mode / benchmark_name
 
@@ -117,14 +121,10 @@ class MemoryConfig:
     """
     Memarch-specific memory and retrieval controls.
 
-    The exact execute.py wiring can choose how to interpret these knobs,
-    but this config gives you the key levers needed for evaluation:
-    - RAM capacity
-    - persistent disk path
-    - similarity threshold
-    - hit promotion policy
-    - whether memory hits bypass generation
-    - whether storing to memory is enabled
+    This config now supports explicit benchmark modes for:
+    - exact-only retrieval
+    - semantic retrieval used as generation context
+    - semantic retrieval with direct bypass
     """
     ram_capacity_items: int = 64
 
@@ -132,13 +132,29 @@ class MemoryConfig:
     disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite"
 
     # When True, delete any existing persistent disk store before the run starts.
-    # Use this for true cold-start memarch experiments.
     clear_disk_store_before_run: bool = False
 
-    # Retrieval / reuse policy
-    similarity_threshold: float = 0.95
+    # Retrieval mode for benchmark comparison
+    retrieval_mode: str = "exact_only"
+    # Allowed:
+    #   - "exact_only"
+    #   - "semantic_context"
+    #   - "semantic_bypass"
+
+    # Exact / direct-return behavior
     promote_disk_hits_to_ram: bool = True
     return_memory_directly: bool = True
+
+    # Semantic retrieval controls
+    semantic_enabled: bool = False
+    semantic_threshold_context: float = 0.85
+    semantic_threshold_bypass: float = 1.01
+    max_semantic_candidates: int = 5
+
+    # Embedder controls
+    embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
+    embedding_device: str = "auto"
+    embedding_local_files_only: bool = False
 
     # Storage / admission toggles
     enable_storage: bool = True
@@ -152,8 +168,35 @@ class MemoryConfig:
         if not str(self.disk_store_path).strip():
             raise ValueError("disk_store_path must be non-empty")
 
-        if not (0.0 <= float(self.similarity_threshold) <= 1.0):
-            raise ValueError("similarity_threshold must be in [0.0, 1.0]")
+        valid_modes = {"exact_only", "semantic_context", "semantic_bypass"}
+        if self.retrieval_mode not in valid_modes:
+            raise ValueError(
+                f"Invalid retrieval_mode: {self.retrieval_mode!r}. "
+                f"Expected one of: {sorted(valid_modes)}"
+            )
+
+        if not (0.0 <= float(self.semantic_threshold_context) <= 1.0):
+            raise ValueError("semantic_threshold_context must be in [0.0, 1.0]")
+
+        if float(self.semantic_threshold_bypass) < 0.0:
+            raise ValueError("semantic_threshold_bypass must be >= 0.0")
+
+        if float(self.semantic_threshold_bypass) < float(self.semantic_threshold_context):
+            raise ValueError(
+                "semantic_threshold_bypass must be >= semantic_threshold_context"
+            )
+
+        if int(self.max_semantic_candidates) <= 0:
+            raise ValueError("max_semantic_candidates must be > 0")
+
+        if not str(self.embedding_model_id).strip():
+            raise ValueError("embedding_model_id must be non-empty")
+
+    def effective_semantic_enabled(self) -> bool:
+        return self.retrieval_mode in {"semantic_context", "semantic_bypass"} and self.semantic_enabled
+
+    def effective_bypass_enabled(self) -> bool:
+        return self.retrieval_mode == "semantic_bypass" and self.semantic_enabled
 
 
 # ---------------------------------------------------------------------
@@ -210,10 +253,6 @@ class BenchmarkConfig:
     namespaces: NamespaceConfig = field(default_factory=NamespaceConfig)
     memory: MemoryConfig = field(default_factory=MemoryConfig)
 
-    # -----------------------------------------------------------------
-    # Compatibility properties
-    # -----------------------------------------------------------------
-
     @property
     def task_glob(self) -> str:
         return self.workload.task_glob
@@ -226,13 +265,8 @@ class BenchmarkConfig:
     def max_cache_items(self) -> int:
         """
         Baseline-compatibility alias for RAM capacity.
-        Useful if any helper logic expects a cache-like field name.
         """
         return self.memory.ram_capacity_items
-
-    # -----------------------------------------------------------------
-    # Validation / serialization helpers
-    # -----------------------------------------------------------------
 
     def validate(self) -> None:
         if not self.tier2_repo or not str(self.tier2_repo).strip():
@@ -245,7 +279,7 @@ class BenchmarkConfig:
             raise ValueError("max_new_tokens must be >= 0")
 
         self.workload.validate()
-        self.output.validate() if hasattr(self.output, "validate") else None
+        self.output.validate()
         self.namespaces.validate()
         self.memory.validate()
 
@@ -257,10 +291,6 @@ class BenchmarkConfig:
         return str(run_dir)
 
     def resolved_disk_store_path(self) -> str:
-        """
-        Resolve the disk store path. Relative paths are interpreted from the
-        repository working directory.
-        """
         return str(Path(self.memory.disk_store_path).expanduser().resolve())
 
     def to_dict(self) -> Dict[str, Any]:
@@ -280,7 +310,14 @@ class BenchmarkConfig:
         ram_capacity_items: int = 64,
         disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
         clear_disk_store_before_run: bool = False,
-        similarity_threshold: float = 0.95,
+        retrieval_mode: str = "exact_only",
+        semantic_enabled: bool = False,
+        semantic_threshold_context: float = 0.85,
+        semantic_threshold_bypass: float = 1.01,
+        max_semantic_candidates: int = 5,
+        embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2",
+        embedding_device: str = "auto",
+        embedding_local_files_only: bool = False,
         promote_disk_hits_to_ram: bool = True,
         return_memory_directly: bool = True,
         enable_storage: bool = True,
@@ -293,10 +330,6 @@ class BenchmarkConfig:
         cohort_id: Optional[str] = None,
         notes: str = "",
     ) -> "BenchmarkConfig":
-        """
-        Convenience constructor for the common case:
-        run across all LongBench task files with a single memarch identity scope.
-        """
         cfg = cls(
             benchmark_name=benchmark_name,
             notes=notes,
@@ -321,7 +354,14 @@ class BenchmarkConfig:
                 ram_capacity_items=ram_capacity_items,
                 disk_store_path=disk_store_path,
                 clear_disk_store_before_run=clear_disk_store_before_run,
-                similarity_threshold=similarity_threshold,
+                retrieval_mode=retrieval_mode,
+                semantic_enabled=semantic_enabled,
+                semantic_threshold_context=semantic_threshold_context,
+                semantic_threshold_bypass=semantic_threshold_bypass,
+                max_semantic_candidates=max_semantic_candidates,
+                embedding_model_id=embedding_model_id,
+                embedding_device=embedding_device,
+                embedding_local_files_only=embedding_local_files_only,
                 promote_disk_hits_to_ram=promote_disk_hits_to_ram,
                 return_memory_directly=return_memory_directly,
                 enable_storage=enable_storage,

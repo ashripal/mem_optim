@@ -4,7 +4,7 @@ Benchmark execution for the memarch LongBench pipeline.
 
 Responsibilities:
 - Build a workload sequence using memarch.benchmarks.workload
-- Initialize RAM store, disk store, memory manager, and generator
+- Initialize RAM store, disk store, memory manager, embedder, and generator
 - Run the workload through memarch retrieval/generation
 - Log benchmark-aware records to JSONL
 - Save a workload manifest next to the run
@@ -13,8 +13,9 @@ Responsibilities:
 Design goal:
 Keep the benchmark protocol parallel to baseline while exposing richer
 multi-tier behavior:
-- RAM hit vs disk hit vs compute miss
+- exact RAM hit vs exact disk hit vs semantic-assisted generation vs compute miss
 - whether generation was bypassed
+- whether semantic retrieval was used
 - whether disk hits were promoted to RAM
 - storage decisions
 - timing breakdowns
@@ -31,7 +32,7 @@ from contextlib import AbstractContextManager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 
@@ -39,13 +40,14 @@ from memarch.benchmarks.configs import BenchmarkConfig
 from memarch.benchmarks.workload import build_workload_manifest, prepare_workload
 from memarch.memory.disk_store import DiskStoreSQLite
 from memarch.memory.manager import MemoryManager, MemoryManagerConfig
+from memarch.memory.policy import RetrievalPolicy
 from memarch.memory.ram_store import RamStoreLRU
-from memarch.memory.schema import MemoryHit, MemoryQuery, Provenance, QualitySignals
+from memarch.memory.schema import MatchType, MemoryHit, MemoryQuery, Provenance, QualitySignals, Scope
+from memarch.models.embedder import Embedder, EmbedderConfig
 
 # Reuse your already-working baseline compute backend for real HF generation.
 from baseline.tiers.tier0_compute import ComputeEngine
 from baseline.utils.metrics import compute_basic_metrics
-
 
 try:
     from memarch.analysis.summarize import summarize_run  # type: ignore
@@ -60,6 +62,7 @@ except Exception:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
 
 def _compose_prompt(context_text: str, query_text: str) -> str:
     if context_text and query_text:
@@ -114,6 +117,7 @@ def _write_json(path: str, payload: Dict[str, Any]) -> str:
     with out.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2, default=str)
     return str(out)
+
 
 def _maybe_clear_disk_store_before_run(cfg: BenchmarkConfig) -> Optional[str]:
     """
@@ -215,11 +219,69 @@ class HFComputeGeneratorAdapter:
         self.call_count = 0
         self.last_prompt: Optional[str] = None
         self.last_generation_meta: Optional[Dict[str, Any]] = None
-    
 
-    def _build_prompt(self, mq: MemoryQuery) -> str:
-        dataset_ctx = (mq.context or {}).get("dataset_context", "") or ""
-        return _compose_prompt(dataset_ctx, mq.raw_query)
+    @staticmethod
+    def _safe_text(value: Optional[str]) -> str:
+        if value is None:
+            return ""
+        return str(value).strip()
+
+    def _build_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
+        dataset_ctx = self._safe_text((mq.context or {}).get("dataset_context", ""))
+        query_text = self._safe_text(mq.raw_query)
+
+        parts = [
+            (
+                "You are a helpful assistant. Answer the current question using the provided "
+                "document context. If a retrieved prior answer is provided, use it only when "
+                "it is consistent with the document context and current question."
+            )
+        ]
+
+        if dataset_ctx:
+            parts.append(f"DOCUMENT CONTEXT:\n{dataset_ctx}")
+
+        doc_sig = (mq.context or {}).get("doc_signature")
+        if doc_sig:
+            parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
+
+        if retrieved is not None:
+            retrieved_answer = self._safe_text(retrieved.item.answer_text)
+            if retrieved_answer:
+                meta_parts = [
+                    f"match_type={retrieved.match_type.value}",
+                    f"source_tier={retrieved.source_tier.value}",
+                    f"score={retrieved.score:.4f}",
+                ]
+                if retrieved.semantic_rank is not None:
+                    meta_parts.append(f"semantic_rank={retrieved.semantic_rank}")
+
+                retrieved_lines = [
+                    "RETRIEVED ANSWER FOR A SIMILAR EARLIER QUESTION:",
+                    retrieved_answer,
+                    "",
+                    "RETRIEVAL METADATA:",
+                    ", ".join(meta_parts),
+                ]
+                if retrieved.match_type == MatchType.SEMANTIC:
+                    retrieved_lines.extend(
+                        [
+                            "",
+                            (
+                                "Use the retrieved answer only if it is consistent with the "
+                                "document context and the current question."
+                            ),
+                        ]
+                    )
+                parts.append("\n".join(retrieved_lines))
+
+        parts.append(f"CURRENT QUESTION:\n{query_text}")
+        parts.append(
+            "ANSWER THE CURRENT QUESTION ONLY. Do not mention retrieval metadata unless it is directly relevant."
+        )
+        parts.append("ANSWER:")
+
+        return "\n\n".join(parts)
 
     def generate(
         self,
@@ -228,7 +290,7 @@ class HFComputeGeneratorAdapter:
     ) -> Tuple[str, Provenance, QualitySignals]:
         self.call_count += 1
 
-        prompt = self._build_prompt(mq)
+        prompt = self._build_prompt(mq, retrieved=retrieved)
         self.last_prompt = prompt
 
         generation = self.compute.generate(
@@ -255,14 +317,20 @@ class HFComputeGeneratorAdapter:
             context_window=int(getattr(self.cfg, "max_input_tokens", 8192)),
         )
 
+        metrics = {
+            "input_tokens": generation.get("input_tokens"),
+            "output_tokens": generation.get("output_tokens"),
+            "gen_time_s": generation.get("gen_time_s"),
+        }
+        if retrieved is not None and retrieved.match_type == MatchType.SEMANTIC:
+            metrics["semantic_retrieval_score"] = retrieved.score
+        elif retrieved is not None and retrieved.match_type == MatchType.EXACT:
+            metrics["retrieval_score"] = retrieved.score
+
         qual = QualitySignals(
             score=1.0 if answer else 0.0,
             success=bool(answer),
-            metrics={
-                "input_tokens": generation.get("input_tokens"),
-                "output_tokens": generation.get("output_tokens"),
-                "gen_time_s": generation.get("gen_time_s"),
-            },
+            metrics=metrics,
         )
         return answer, prov, qual
 
@@ -270,6 +338,8 @@ class HFComputeGeneratorAdapter:
 # ---------------------------------------------------------------------
 # Construction helpers
 # ---------------------------------------------------------------------
+
+
 def _extract_query_text(example: Dict[str, Any]) -> str:
     candidates = [
         example.get("question"),
@@ -295,6 +365,7 @@ def _extract_context_text(example: Dict[str, Any]) -> str:
             return value.strip()
     return ""
 
+
 def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> MemoryQuery:
     query_text = _extract_query_text(example)
     context_text = _extract_context_text(example)
@@ -309,6 +380,11 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
         f"{example.get('task', '')}||{example.get('source_file', '')}||{context_text}"
     )
 
+    allow_semantic = bool(cfg.memory.semantic_enabled) and cfg.memory.retrieval_mode in {
+        "semantic_context",
+        "semantic_bypass",
+    }
+
     return MemoryQuery(
         raw_query=query_text,
         user_id=cfg.namespaces.user_id,
@@ -317,6 +393,7 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
         task=example.get("task") or "longbench_qa",
         model_id=cfg.model_id,
         prompt_version="longbench_v1",
+        allow_semantic=allow_semantic,
         context={
             "dataset_context": context_text,
             "doc_signature": doc_signature,
@@ -327,35 +404,11 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
     )
 
 
-# def _init_ram_store(cfg: BenchmarkConfig) -> Any:
-#     """
-#     Be tolerant to small API differences while keeping one execute.py.
-
-#     The demo app uses RamStoreLRU(max_mb=...).
-#     If your implementation instead supports item-count capacity, this tries that too.
-#     """
-#     candidates = [
-#         {"max_items": int(cfg.memory.ram_capacity_items)},
-#         {"capacity": int(cfg.memory.ram_capacity_items)},
-#         {"max_mb": int(cfg.memory.ram_capacity_items)},
-#     ]
-
-#     last_err: Optional[Exception] = None
-#     for kwargs in candidates:
-#         try:
-#             return RamStoreLRU(**kwargs)
-#         except Exception as e:
-#             last_err = e
-
-#     raise RuntimeError(f"Could not initialize RamStoreLRU with any known signature: {last_err}")
 def _init_ram_store(cfg: BenchmarkConfig) -> Any:
     """
     Initialize RAM store with both:
     - a generous byte budget
     - an explicit item-count cap for benchmark control
-
-    For benchmarking, ram_capacity_items should mean logical entry capacity,
-    not MB. The RAM store now supports max_items directly.
     """
     return RamStoreLRU(
         max_mb=64,
@@ -363,10 +416,46 @@ def _init_ram_store(cfg: BenchmarkConfig) -> Any:
     )
 
 
-def _init_manager(cfg: BenchmarkConfig, ram: Any, disk: Any) -> Any:
+def _init_embedder(cfg: BenchmarkConfig) -> Optional[Embedder]:
+    if not bool(cfg.memory.semantic_enabled):
+        return None
+
+    emb_cfg = EmbedderConfig(
+        model_id=cfg.memory.embedding_model_id,
+        device=cfg.memory.embedding_device,
+        local_files_only=cfg.memory.embedding_local_files_only,
+    )
+    return Embedder(emb_cfg)
+
+
+def _init_retrieval_policy(cfg: BenchmarkConfig) -> RetrievalPolicy:
+    retrieval_mode = str(cfg.memory.retrieval_mode)
+
+    semantic_enabled = bool(cfg.memory.semantic_enabled) and retrieval_mode in {
+        "semantic_context",
+        "semantic_bypass",
+    }
+
+    semantic_threshold_bypass = float(cfg.memory.semantic_threshold_bypass)
+    if retrieval_mode == "semantic_context":
+        # explicitly disable direct semantic bypass in context-only runs
+        semantic_threshold_bypass = 1.01
+
+    return RetrievalPolicy(
+        scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
+        semantic_enabled=semantic_enabled,
+        semantic_threshold_context=float(cfg.memory.semantic_threshold_context),
+        semantic_threshold_bypass=semantic_threshold_bypass,
+        max_semantic_candidates=int(cfg.memory.max_semantic_candidates),
+    )
+
+
+def _init_manager(cfg: BenchmarkConfig, ram: Any, disk: Any, embedder: Optional[Embedder]) -> Any:
     mm_cfg = MemoryManagerConfig(
+        retrieval_policy=_init_retrieval_policy(cfg),
         promote_disk_hits_to_ram=bool(cfg.memory.promote_disk_hits_to_ram),
         return_memory_directly=bool(cfg.memory.return_memory_directly),
+        embedder=embedder,
     )
     return MemoryManager(ram=ram, disk=disk, cfg=mm_cfg)
 
@@ -391,18 +480,6 @@ def _build_ok_record(
     disk: Any,
     cfg: BenchmarkConfig,
 ) -> Dict[str, Any]:
-    # timings_ms = dict(meta.get("timings_ms") or {})
-    # memory_lookup_ms = float(meta.get("memory_lookup_ms", timings_ms.get("memory_lookup_ms", 0.0) or 0.0))
-    # generation_ms_est = float(meta.get("generation_ms_est", timings_ms.get("generation_ms_est", 0.0) or 0.0))
-    # timings_ms.setdefault("memory_lookup_ms", memory_lookup_ms)
-    # timings_ms.setdefault("generation_ms_est", generation_ms_est)
-    # timings_ms.setdefault("total_ms", total_latency_s * 1000.0)
-
-    # source_tier = str(meta.get("source_tier", "compute" if meta.get("generated") else "unknown"))
-    # used_memory = bool(meta.get("used_memory"))
-    # llm_bypassed = used_memory and bool(cfg.memory.return_memory_directly)
-
-    # gen_meta = generator.last_generation_meta or {}
     timings_ms = dict(meta.get("timings_ms") or {})
     gen_meta = generator.last_generation_meta or {}
 
@@ -413,8 +490,6 @@ def _build_ok_record(
         meta.get("generation_ms_est", timings_ms.get("generation_ms_est", 0.0) or 0.0)
     )
 
-    # if generation_ms_est <= 0.0:
-    #     generation_ms_est = float(gen_meta.get("gen_time_s", 0.0) or 0.0) * 1000.0
     if generation_ms_est <= 0.0:
         if bool(meta.get("generated", False)):
             generation_ms_est = float(gen_meta.get("gen_time_s", 0.0) or 0.0) * 1000.0
@@ -427,7 +502,9 @@ def _build_ok_record(
 
     source_tier = str(meta.get("source_tier", "compute" if meta.get("generated") else "unknown"))
     used_memory = bool(meta.get("used_memory"))
-    llm_bypassed = used_memory and bool(cfg.memory.return_memory_directly)
+    llm_bypassed = bool(meta.get("semantic_bypassed", False)) or (
+        used_memory and bool(cfg.memory.return_memory_directly)
+    )
 
     return {
         "type": "example_result",
@@ -460,6 +537,20 @@ def _build_ok_record(
         "promoted_to_ram": bool(meta.get("promoted_to_ram", False)),
         "stored": meta.get("stored"),
         "stored_scopes": meta.get("stored_scopes", []),
+
+        # semantic retrieval metadata
+        "semantic_used": bool(meta.get("semantic_used", False)),
+        "semantic_bypassed": bool(meta.get("semantic_bypassed", False)),
+        "semantic_candidate_rank": meta.get("semantic_candidate_rank"),
+        "semantic_score": meta.get("score")
+        if meta.get("match_type") == "semantic"
+        else meta.get("hit_before_generate", {}).get("score")
+        if bool(meta.get("semantic_used", False))
+        else None,
+
+        # match metadata
+        "match_type": meta.get("match_type"),
+        "hit_before_generate": meta.get("hit_before_generate"),
 
         # latency breakdown
         "latency_s": total_latency_s,
@@ -547,7 +638,7 @@ def _build_error_record(
             or example.get("input")
             or example.get("query")
             or example.get("prompt")
-        )
+        ),
     }
 
 
@@ -567,16 +658,9 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
     """
     cfg.validate()
 
-    # run_dir = Path(cfg.resolved_out_dir()).expanduser().resolve()
-    # run_dir.mkdir(parents=True, exist_ok=True)
-
-    # # Ensure disk-store parent exists
-    # Path(cfg.resolved_disk_store_path()).expanduser().resolve().parent.mkdir(parents=True, exist_ok=True)
-
     run_dir = Path(cfg.resolved_out_dir()).expanduser().resolve()
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    # Ensure disk-store parent exists
     disk_store_parent = Path(cfg.resolved_disk_store_path()).expanduser().resolve().parent
     disk_store_parent.mkdir(parents=True, exist_ok=True)
 
@@ -594,7 +678,8 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
     # Initialize memarch runtime
     ram = _init_ram_store(cfg)
     disk = DiskStoreSQLite(cfg.resolved_disk_store_path())
-    manager = _init_manager(cfg, ram=ram, disk=disk)
+    embedder = _init_embedder(cfg)
+    manager = _init_manager(cfg, ram=ram, disk=disk, embedder=embedder)
 
     # Initialize generator backend
     compute = ComputeEngine(cfg)
@@ -648,7 +733,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                 meta = dict(meta or {})
                 timings_ms = dict(meta.get("timings_ms") or {})
 
-                used_memory = bool(meta.get("used_memory"))
                 gen_calls_after = generator.call_count
                 generation_happened = gen_calls_after > gen_calls_before
 
@@ -662,7 +746,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                     meta["generation_ms_est"] = gen_time_s * 1000.0 if generation_happened else 0.0
 
                 if "memory_lookup_ms" not in meta:
-                    # Approximate lookup time as the non-generation portion of answer latency.
                     lookup_ms = max(0.0, (answer_latency_s - gen_time_s) * 1000.0)
                     meta["memory_lookup_ms"] = lookup_ms
 
@@ -671,7 +754,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                 timings_ms.setdefault("total_ms", total_latency_s * 1000.0)
                 meta["timings_ms"] = timings_ms
 
-                # Make generated status explicit if manager did not provide it.
                 if "generated" not in meta:
                     meta["generated"] = generation_happened
 

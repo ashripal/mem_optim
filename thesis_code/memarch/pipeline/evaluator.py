@@ -102,13 +102,16 @@ class Evaluator:
         Evaluate a single MemoryQuery.
 
         Timing breakdown approach:
-        - We measure total time around manager.answer().
-        - We also measure retrieval-only time by calling manager.retrieve() once first.
-          This adds a small overhead but gives a consistent "memory_lookup_ms".
-        - If retrieval returns a hit and the manager returns directly, generation_ms is 0.
-          Otherwise generation_ms is approximated as total - memory_lookup_ms.
+        - We measure retrieval-only time by calling manager.retrieve() once first.
+        - We then measure full answer() latency separately.
+        - If a hit existed and answer() ultimately served directly from memory,
+          generation_ms is 0.
+        - Otherwise generation_ms is approximated as total - memory_lookup_ms.
+
+        This keeps the evaluator simple and deterministic while preserving the
+        semantic/exact metadata returned by MemoryManager.answer().
         """
-        # 1) time retrieval separately (for breakdown)
+        # 1) time retrieval separately (for breakdown + debugging)
         t0 = time.perf_counter()
         hit = self._manager.retrieve(mq)
         t1 = time.perf_counter()
@@ -120,13 +123,19 @@ class Evaluator:
         t3 = time.perf_counter()
         total_ms = (t3 - t2) * 1000.0
 
+        meta = dict(meta or {})
+
+        used_memory = bool(meta.get("used_memory", False))
+        generated = bool(meta.get("generated", False))
+        semantic_used = bool(meta.get("semantic_used", False))
+        semantic_bypassed = bool(meta.get("semantic_bypassed", False))
+        match_type = meta.get("match_type")
+        source_tier = meta.get("source_tier")
+
         # 3) estimate generation_ms
-        # If a hit existed and manager returns directly, generation cost is effectively 0 here.
-        used_memory = bool(meta.get("used_memory"))
         if hit is not None and used_memory:
             generation_ms = 0.0
         else:
-            # Approximate; note retrieval was measured separately, so this is a coarse proxy.
             generation_ms = max(0.0, total_ms - memory_lookup_ms)
 
         timings_ms = {
@@ -146,11 +155,27 @@ class Evaluator:
         except Exception:
             pass
 
+        # Add normalized evaluator-side helper fields for easier downstream analysis
+        eval_meta: Dict[str, Any] = {
+            **meta,
+            "retrieval_hit_present": hit is not None,
+            "retrieval_hit_match_type": getattr(hit, "match_type", None).value if hit is not None else None,
+            "retrieval_hit_source_tier": getattr(hit, "source_tier", None).value if hit is not None else None,
+            "used_memory": used_memory,
+            "generated": generated,
+            "source_tier": source_tier,
+            "match_type": match_type,
+            "semantic_used": semantic_used,
+            "semantic_bypassed": semantic_bypassed,
+            "semantic_candidate_rank": meta.get("semantic_candidate_rank"),
+            "score": meta.get("score"),
+        }
+
         result = EvalResult(
             example_id=example_id,
             task=task,
             answer_text=answer_text,
-            meta=meta,
+            meta=eval_meta,
             timings_ms=timings_ms,
             resources=resources,
         )
@@ -160,11 +185,7 @@ class Evaluator:
                 example_id=example_id,
                 task=task,
                 query=mq.raw_query if log_query_text else "",
-                meta={
-                    **meta,
-                    # Helpful for debugging: did we have a hit before generating?
-                    "retrieval_hit_present": hit is not None,
-                },
+                meta=eval_meta,
                 timings_ms=timings_ms,
                 resources=resources,
             )

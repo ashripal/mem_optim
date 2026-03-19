@@ -141,19 +141,64 @@ def build_parser() -> argparse.ArgumentParser:
         default="artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
         help="SQLite path for persistent memarch disk store.",
     )
-
     parser.add_argument(
         "--clear_disk_store_before_run",
         action="store_true",
         help="Delete the existing persistent memarch disk store before this run to force a cold start.",
     )
 
+    # Retrieval mode / semantic knobs
     parser.add_argument(
-        "--similarity_threshold",
-        type=float,
-        default=0.95,
-        help="Similarity threshold for memory reuse decisions.",
+        "--retrieval_mode",
+        type=str,
+        default="exact_only",
+        choices=["exact_only", "semantic_context", "semantic_bypass"],
+        help="Retrieval mode for the benchmark run.",
     )
+    parser.add_argument(
+        "--semantic_enabled",
+        action="store_true",
+        help="Enable semantic retrieval support.",
+    )
+    parser.add_argument(
+        "--semantic_threshold_context",
+        type=float,
+        default=0.85,
+        help="Minimum similarity score required to use a semantic hit as generation context.",
+    )
+    parser.add_argument(
+        "--semantic_threshold_bypass",
+        type=float,
+        default=1.01,
+        help="Minimum similarity score required to bypass generation and return a semantic hit directly.",
+    )
+    parser.add_argument(
+        "--max_semantic_candidates",
+        type=int,
+        default=5,
+        help="Maximum number of semantic candidates to rank after filtering.",
+    )
+
+    # Embedder knobs
+    parser.add_argument(
+        "--embedding_model_id",
+        type=str,
+        default="sentence-transformers/all-MiniLM-L6-v2",
+        help="Embedding model id used for semantic retrieval.",
+    )
+    parser.add_argument(
+        "--embedding_device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Device used for embedding generation.",
+    )
+    parser.add_argument(
+        "--embedding_local_files_only",
+        action="store_true",
+        help="Load embedding model only from local files.",
+    )
+
     parser.add_argument(
         "--promote_disk_hits_to_ram",
         action="store_true",
@@ -169,7 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--return_memory_directly",
         action="store_true",
         default=True,
-        help="Bypass generation and return memory hits directly.",
+        help="Return reusable memory hits directly when policy allows.",
     )
     parser.add_argument(
         "--no_return_memory_directly",
@@ -272,7 +317,14 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         ram_capacity_items=args.ram_capacity_items,
         disk_store_path=args.disk_store_path,
         clear_disk_store_before_run=args.clear_disk_store_before_run,
-        similarity_threshold=args.similarity_threshold,
+        retrieval_mode=args.retrieval_mode,
+        semantic_enabled=args.semantic_enabled,
+        semantic_threshold_context=args.semantic_threshold_context,
+        semantic_threshold_bypass=args.semantic_threshold_bypass,
+        max_semantic_candidates=args.max_semantic_candidates,
+        embedding_model_id=args.embedding_model_id,
+        embedding_device=args.embedding_device,
+        embedding_local_files_only=args.embedding_local_files_only,
         promote_disk_hits_to_ram=promote_disk_hits_to_ram,
         return_memory_directly=return_memory_directly,
         enable_storage=enable_storage,

@@ -1,0 +1,40 @@
+{
+  "benchmark_name": "memarch_exact_only_cpu_test",
+  "notes": "",
+  "tier2_repo": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data",
+  "workload_mode": "cold",
+  "task_glob": "",
+  "base_max_examples": 5,
+  "total_workload_examples": 5,
+  "unique_base_examples": 5,
+  "tasks": [
+    "2wikimqa"
+  ],
+  "source_files": [
+    "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data/2wikimqa.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "ram_capacity_items": 64,
+  "disk_store_path": "/Users/ashripal/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
+  "retrieval_mode": "exact_only",
+  "semantic_enabled": false,
+  "semantic_threshold_context": 0.85,
+  "semantic_threshold_bypass": 1.01,
+  "max_semantic_candidates": 5,
+  "embedding_model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "promote_disk_hits_to_ram": true,
+  "return_memory_directly": true,
+  "enable_storage": true,
+  "store_in_ram": true,
+  "store_on_disk": true,
+  "max_input_tokens": 512,
+  "max_new_tokens": 32,
+  "model_id": "microsoft/Phi-3-mini-128k-instruct",
+  "namespaces": {
+    "user_id": "user_a",
+    "session_id": "session_a",
+    "cohort_id": null
+  }
+}

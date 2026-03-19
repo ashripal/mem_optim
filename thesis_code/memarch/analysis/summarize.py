@@ -138,7 +138,10 @@ def summarize_run(log_path: str) -> RunSummary:
     ok_events = [e for e in example_events if bool(e.get("ok"))]
     err_events = [e for e in example_events if not bool(e.get("ok"))]
 
+    total_ok = len(ok_events)
+
     used_memory_count = sum(1 for e in ok_events if bool(e.get("used_memory")))
+    generated_count = sum(1 for e in ok_events if bool(e.get("generated")))
     ram_hits = sum(1 for e in ok_events if e.get("source_tier") == "ram")
     disk_hits = sum(1 for e in ok_events if e.get("source_tier") == "disk")
     compute_served = sum(1 for e in ok_events if e.get("source_tier") == "compute")
@@ -146,34 +149,75 @@ def summarize_run(log_path: str) -> RunSummary:
     llm_bypassed = sum(1 for e in ok_events if bool(e.get("llm_bypassed")))
     stored_count = sum(1 for e in ok_events if bool(e.get("stored")))
 
+    exact_hits = sum(1 for e in ok_events if e.get("match_type") == "exact")
+    semantic_served_directly = sum(
+        1 for e in ok_events
+        if e.get("match_type") == "semantic" and bool(e.get("used_memory"))
+    )
+    semantic_used = sum(1 for e in ok_events if bool(e.get("semantic_used")))
+    semantic_bypassed = sum(1 for e in ok_events if bool(e.get("semantic_bypassed")))
+
+    match_type_counts: Dict[str, int] = {}
+    for e in ok_events:
+        mt = e.get("match_type")
+        if mt is None:
+            mt = "none"
+        match_type_counts[str(mt)] = match_type_counts.get(str(mt), 0) + 1
+
     devices: Dict[str, int] = {}
     for e in ok_events:
         d = e.get("device")
         if d:
             devices[d] = devices.get(d, 0) + 1
 
-    total_ok = len(ok_events)
     device_shares = {
         k: (v / total_ok if total_ok > 0 else 0.0)
         for k, v in devices.items()
     }
 
+    semantic_scores = [
+        e.get("semantic_score")
+        for e in ok_events
+        if _is_number(e.get("semantic_score"))
+    ]
+
+    semantic_ranks = [
+        e.get("semantic_candidate_rank")
+        for e in ok_events
+        if _is_number(e.get("semantic_candidate_rank"))
+    ]
+
     metrics: Dict[str, Any] = {
         "counts": {
             "total": len(example_events),
-            "ok": len(ok_events),
+            "ok": total_ok,
             "err": len(err_events),
-            "ok_rate": (len(ok_events) / len(example_events)) if example_events else 0.0,
+            "ok_rate": (total_ok / len(example_events)) if example_events else 0.0,
         },
         "memory": {
             "used_memory_count": used_memory_count,
-            "memory_hit_rate": (used_memory_count / len(ok_events)) if ok_events else 0.0,
+            "memory_hit_rate": (used_memory_count / total_ok) if total_ok > 0 else 0.0,
+            "total_hit_rate": (used_memory_count / total_ok) if total_ok > 0 else 0.0,
+            "generated_count": generated_count,
+            "generation_rate": (generated_count / total_ok) if total_ok > 0 else 0.0,
             "ram_hits": ram_hits,
             "disk_hits": disk_hits,
             "compute_served": compute_served,
             "promoted_to_ram": promoted_to_ram,
             "llm_bypassed": llm_bypassed,
             "stored_count": stored_count,
+        },
+        "retrieval": {
+            "exact_hits": exact_hits,
+            "exact_hit_rate": (exact_hits / total_ok) if total_ok > 0 else 0.0,
+            "semantic_used_count": semantic_used,
+            "semantic_used_rate": (semantic_used / total_ok) if total_ok > 0 else 0.0,
+            "semantic_bypassed_count": semantic_bypassed,
+            "semantic_bypassed_rate": (semantic_bypassed / total_ok) if total_ok > 0 else 0.0,
+            "semantic_served_directly": semantic_served_directly,
+            "match_type_counts": match_type_counts,
+            "semantic_score": _numeric_stats(semantic_scores),
+            "semantic_candidate_rank": _numeric_stats(semantic_ranks),
         },
         "latency": {
             "total_s": _numeric_stats([e.get("latency_s") for e in ok_events]),
@@ -186,8 +230,8 @@ def summarize_run(log_path: str) -> RunSummary:
             "tokens_per_second": _numeric_stats([e.get("tokens_per_second") for e in ok_events]),
             "truncated_count": sum(1 for e in ok_events if bool(e.get("truncated"))),
             "truncated_rate": (
-                sum(1 for e in ok_events if bool(e.get("truncated"))) / len(ok_events)
-                if ok_events else 0.0
+                sum(1 for e in ok_events if bool(e.get("truncated"))) / total_ok
+                if total_ok > 0 else 0.0
             ),
         },
         "memory_usage": {
@@ -230,6 +274,7 @@ def format_summary(summary: RunSummary) -> str:
     m = summary.metrics
     counts = m["counts"]
     mem = m["memory"]
+    retrieval = m["retrieval"]
     lat = m["latency"]
 
     lines = []
@@ -238,6 +283,18 @@ def format_summary(summary: RunSummary) -> str:
     lines.append(
         f"Memory hit rate: {mem['memory_hit_rate']:.3f} "
         f"({mem['used_memory_count']}/{counts['ok'] if counts['ok'] else 0})"
+    )
+    lines.append(
+        f"Exact hits: {retrieval['exact_hits']} "
+        f"({retrieval['exact_hit_rate']:.3f})"
+    )
+    lines.append(
+        f"Semantic used: {retrieval['semantic_used_count']} "
+        f"({retrieval['semantic_used_rate']:.3f})"
+    )
+    lines.append(
+        f"Semantic bypassed: {retrieval['semantic_bypassed_count']} "
+        f"({retrieval['semantic_bypassed_rate']:.3f})"
     )
     lines.append(
         f"Tier usage: ram={mem['ram_hits']} disk={mem['disk_hits']} compute={mem['compute_served']}"
