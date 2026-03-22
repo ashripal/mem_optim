@@ -25,6 +25,8 @@ def main() -> None:
     print("========================================")
     print(f"Tier2 repo        : {cfg.tier2_repo}")
     print(f"Model             : {cfg.model_id}")
+    print(f"Device            : {cfg.device}")
+    print(f"Dtype             : {cfg.dtype}")
     print(f"Max examples      : {cfg.max_examples}")
     print(f"Max input tokens  : {cfg.max_input_tokens}")
     print(f"Max new tokens    : {cfg.max_new_tokens}")

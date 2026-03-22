@@ -258,6 +258,30 @@ def summarize_quality(records: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def summarize_baseline_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+    rows = records
+    latencies = _collect_numeric(rows, "latency_s")
+    compute_latencies = _collect_numeric(rows, "compute_latency_s")
+    lookup_latencies = _collect_numeric(rows, "lookup_latency_s")
+
+    n_examples = len(rows)
+    n_generated = sum(1 for r in rows if r.get("served_from") == "tier0_compute")
+    n_cache_hits = sum(1 for r in rows if bool(r.get("cache_hit", False)))
+    cache_hit_rate = (n_cache_hits / len(rows)) if rows else 0.0
+
+    return {
+        "n_examples": n_examples,
+        "mean_latency_s": _mean(latencies),
+        "p50_latency_s": _percentile(latencies, 50.0),
+        "p95_latency_s": _percentile(latencies, 95.0),
+        "n_generated": n_generated,
+        "n_cache_hits": n_cache_hits,
+        "cache_hit_rate": cache_hit_rate,
+        "mean_compute_latency_s": _mean(compute_latencies),
+        "mean_lookup_latency_s": _mean(lookup_latencies),
+    }
+
+
 # -----------------------------
 # Main API
 # -----------------------------
@@ -281,6 +305,7 @@ def summarize_run(run_jsonl_path: str) -> Dict[str, Any]:
         "devices": summarize_devices(ex),
         "cache": summarize_cache(ex),
         "quality": summarize_quality(ex),
+        **summarize_baseline_metrics(ex),
     }
 
     # If a header exists, include some provenance fields

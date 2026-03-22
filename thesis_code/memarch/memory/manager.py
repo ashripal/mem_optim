@@ -26,20 +26,19 @@ Design principles:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Protocol, Tuple
 
-from memarch.memory.schema import (
-    MatchType,
-    MemoryHit,
-    MemoryItem,
-    MemoryQuery,
-    Provenance,
-    QualitySignals,
-    Scope,
-    SourceTier,
+from memarch.memory.admission import (
+    AdmissionPolicy,
+    choose_ttl_seconds,
+    decide_store_scopes,
+    default_admission_policy,
+    should_store,
 )
+from memarch.memory.embed_index import EmbedIndexLRU, SemanticCandidate
 from memarch.memory.namespace import resolve_namespaces
 from memarch.memory.policy import (
     RetrievalPolicy,
@@ -51,14 +50,16 @@ from memarch.memory.policy import (
     semantic_candidate_allowed,
     semantic_decision,
 )
-from memarch.memory.admission import (
-    AdmissionPolicy,
-    choose_ttl_seconds,
-    decide_store_scopes,
-    default_admission_policy,
-    should_store,
+from memarch.memory.schema import (
+    MatchType,
+    MemoryHit,
+    MemoryItem,
+    MemoryQuery,
+    Provenance,
+    QualitySignals,
+    Scope,
+    SourceTier,
 )
-from memarch.memory.embed_index import EmbedIndexLRU, SemanticCandidate
 from memarch.models.embedder import Embedder
 from memarch.utils.text import canonicalize, context_signature, make_key
 
@@ -100,10 +101,10 @@ class Generator(Protocol):
 
 @dataclass(frozen=True)
 class MemoryManagerConfig:
-    retrieval_policy: RetrievalPolicy = default_retrieval_policy()
-    admission_policy: AdmissionPolicy = default_admission_policy()
+    retrieval_policy: RetrievalPolicy = field(default_factory=default_retrieval_policy)
+    admission_policy: AdmissionPolicy = field(default_factory=default_admission_policy)
 
-    # Promote exact disk hits to RAM for faster repeat access
+    # Promote exact/semantic disk hits to RAM for faster repeat access
     promote_disk_hits_to_ram: bool = True
 
     # If True, return exact hits directly.
@@ -143,7 +144,7 @@ class MemoryManager:
         *,
         now: datetime,
         ctx_sig: str,
-    ) -> Optional[MemoryHit]:
+    ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
         """
         Attempt exact-match retrieval across scopes and tiers.
 
@@ -155,6 +156,7 @@ class MemoryManager:
         q_can = canonicalize(mq.raw_query)
         ram_reads = 0
         disk_reads = 0
+        namespaces_checked: List[Dict[str, Any]] = []
 
         for rn in resolve_namespaces(mq, scope_order=pol.scope_order, include_missing=False):
             scope = rn.scope
@@ -170,11 +172,23 @@ class MemoryManager:
                 context_sig=ctx_sig,
             )
 
+            ns_dbg: Dict[str, Any] = {
+                "scope": scope.value,
+                "namespace": ns,
+                "key": key,
+                "ram_checked": False,
+                "ram_hit": False,
+                "disk_checked": False,
+                "disk_hit": False,
+            }
+
             # 1) RAM exact
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
+                ns_dbg["ram_checked"] = True
                 item = self._ram.get(ns, key)
                 if item is not None:
+                    ns_dbg["ram_hit"] = True
                     ok, dbg = accept_item(
                         mq,
                         item,
@@ -182,7 +196,9 @@ class MemoryManager:
                         now_utc=now,
                         query_context_signature=ctx_sig,
                     )
+                    ns_dbg["ram_accept_reason"] = dbg.get("reason")
                     if ok:
+                        hit_namespaces_checked = namespaces_checked + [ns_dbg]
                         return MemoryHit(
                             item=item,
                             source_tier=SourceTier.RAM,
@@ -193,15 +209,26 @@ class MemoryManager:
                                 namespace=ns,
                                 source="ram",
                                 accepted_reason=dbg.get("reason", "accepted"),
-                                extra={"ram_reads": ram_reads, "disk_reads": disk_reads},
+                                extra={
+                                    "ram_reads": ram_reads,
+                                    "disk_reads": disk_reads,
+                                    "namespaces_checked": hit_namespaces_checked,
+                                },
                             ),
-                        )
+                        ), {
+                            "ram_reads": ram_reads,
+                            "disk_reads": disk_reads,
+                            "namespaces_checked": hit_namespaces_checked,
+                            "promoted_to_ram": False,
+                        }
 
             # 2) DISK exact
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
+                ns_dbg["disk_checked"] = True
                 item = self._disk.get(ns, key)
                 if item is not None:
+                    ns_dbg["disk_hit"] = True
                     ok, dbg = accept_item(
                         mq,
                         item,
@@ -209,7 +236,10 @@ class MemoryManager:
                         now_utc=now,
                         query_context_signature=ctx_sig,
                     )
+                    ns_dbg["disk_accept_reason"] = dbg.get("reason")
                     if ok:
+                        promoted = False
+                        hit_namespaces_checked = namespaces_checked + [ns_dbg]
                         hit = MemoryHit(
                             item=item,
                             source_tier=SourceTier.DISK,
@@ -220,17 +250,35 @@ class MemoryManager:
                                 namespace=ns,
                                 source="disk",
                                 accepted_reason=dbg.get("reason", "accepted"),
-                                extra={"ram_reads": ram_reads, "disk_reads": disk_reads},
+                                extra={
+                                    "ram_reads": ram_reads,
+                                    "disk_reads": disk_reads,
+                                    "namespaces_checked": hit_namespaces_checked,
+                                },
                             ),
                         )
                         if self._cfg.promote_disk_hits_to_ram:
                             try:
                                 self._ram.put(ns, key, item)
+                                promoted = True
                             except Exception:
-                                pass
-                        return hit
+                                promoted = False
 
-        return None
+                        return hit, {
+                            "ram_reads": ram_reads,
+                            "disk_reads": disk_reads,
+                            "namespaces_checked": hit_namespaces_checked,
+                            "promoted_to_ram": promoted,
+                        }
+
+            namespaces_checked.append(ns_dbg)
+
+        return None, {
+            "ram_reads": ram_reads,
+            "disk_reads": disk_reads,
+            "namespaces_checked": namespaces_checked,
+            "promoted_to_ram": False,
+        }
 
     # -------------------------
     # Semantic retrieval
@@ -247,7 +295,10 @@ class MemoryManager:
         *,
         now: datetime,
         ctx_sig: str,
-    ) -> List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]]:
+    ) -> Tuple[
+        List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]],
+        Dict[str, Any],
+    ]:
         """
         Collect semantic candidates from RAM and DISK after exact retrieval fails.
 
@@ -260,14 +311,25 @@ class MemoryManager:
         candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
         ram_reads = 0
         disk_reads = 0
+        namespaces_checked: List[Dict[str, Any]] = []
 
         for rn in resolve_namespaces(mq, scope_order=pol.scope_order, include_missing=False):
             scope = rn.scope
             ns = rn.namespace
 
+            ns_dbg: Dict[str, Any] = {
+                "scope": scope.value,
+                "namespace": ns,
+                "semantic_ram_scanned": False,
+                "semantic_disk_scanned": False,
+                "semantic_ram_candidates": 0,
+                "semantic_disk_candidates": 0,
+            }
+
             # RAM semantic scan
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
+                ns_dbg["semantic_ram_scanned"] = True
                 for item in self._iter_store_namespace(self._ram, ns):
                     ok, dbg = semantic_candidate_allowed(
                         mq,
@@ -276,11 +338,10 @@ class MemoryManager:
                         now_utc=now,
                         query_context_signature=ctx_sig,
                     )
-                    if not ok:
-                        continue
-                    if item.query_embedding is None:
+                    if not ok or item.query_embedding is None:
                         continue
 
+                    ns_dbg["semantic_ram_candidates"] += 1
                     candidates.append(
                         SemanticCandidate(
                             payload=(SourceTier.RAM, scope, ns, item, dbg),
@@ -291,6 +352,7 @@ class MemoryManager:
             # DISK semantic scan
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
+                ns_dbg["semantic_disk_scanned"] = True
                 for item in self._iter_store_namespace(self._disk, ns):
                     ok, dbg = semantic_candidate_allowed(
                         mq,
@@ -299,11 +361,10 @@ class MemoryManager:
                         now_utc=now,
                         query_context_signature=ctx_sig,
                     )
-                    if not ok:
-                        continue
-                    if item.query_embedding is None:
+                    if not ok or item.query_embedding is None:
                         continue
 
+                    ns_dbg["semantic_disk_candidates"] += 1
                     candidates.append(
                         SemanticCandidate(
                             payload=(SourceTier.DISK, scope, ns, item, dbg),
@@ -311,7 +372,14 @@ class MemoryManager:
                         )
                     )
 
-        return candidates
+            namespaces_checked.append(ns_dbg)
+
+        return candidates, {
+            "ram_reads": ram_reads,
+            "disk_reads": disk_reads,
+            "namespaces_checked": namespaces_checked,
+            "candidate_count": len(candidates),
+        }
 
     def _retrieve_semantic(
         self,
@@ -319,7 +387,7 @@ class MemoryManager:
         *,
         now: datetime,
         ctx_sig: str,
-    ) -> Optional[MemoryHit]:
+    ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
         """
         Attempt semantic retrieval after exact retrieval fails.
 
@@ -332,23 +400,27 @@ class MemoryManager:
         budget = budget_from_query(mq)
 
         if not pol.semantic_enabled:
-            return None
+            return None, {"semantic_enabled": False, "reason": "policy_disabled"}
         if not budget.allow_semantic:
-            return None
+            return None, {"semantic_enabled": False, "reason": "budget_disabled"}
         if self._embedder is None:
-            return None
+            return None, {"semantic_enabled": False, "reason": "missing_embedder"}
 
         query_vec = self._embedder.embed(mq.raw_query)
         if not query_vec:
-            return None
+            return None, {"semantic_enabled": True, "reason": "query_embed_failed"}
 
-        candidates = self._build_semantic_candidates(
+        candidates, scan_dbg = self._build_semantic_candidates(
             mq,
             now=now,
             ctx_sig=ctx_sig,
         )
         if not candidates:
-            return None
+            return None, {
+                "semantic_enabled": True,
+                "reason": "no_candidates",
+                **scan_dbg,
+            }
 
         ranked = self._embed_index.search_candidates(
             query_vector=query_vec,
@@ -357,7 +429,11 @@ class MemoryManager:
             min_score=pol.semantic_threshold_context,
         )
         if not ranked:
-            return None
+            return None, {
+                "semantic_enabled": True,
+                "reason": "below_threshold",
+                **scan_dbg,
+            }
 
         payload, score, rank = ranked[0]
         source_tier, scope, ns, item, filter_dbg = payload
@@ -369,9 +445,16 @@ class MemoryManager:
             query_context_signature=ctx_sig,
         )
         if decision == "ignore":
-            return None
+            return None, {
+                "semantic_enabled": True,
+                "reason": "decision_ignore",
+                "top_score": float(score),
+                "top_rank": rank,
+                **scan_dbg,
+            }
 
         bypass_allowed = decision == "bypass"
+        promoted = False
 
         hit = MemoryHit(
             item=item,
@@ -391,6 +474,7 @@ class MemoryManager:
                     "semantic_bypassed": bypass_allowed,
                     "filter_debug": filter_dbg,
                     **decision_dbg,
+                    **scan_dbg,
                 },
             ),
         )
@@ -399,33 +483,75 @@ class MemoryManager:
         if source_tier == SourceTier.DISK and self._cfg.promote_disk_hits_to_ram:
             try:
                 self._ram.put(ns, item.key, item)
+                promoted = True
             except Exception:
-                pass
+                promoted = False
 
-        return hit
+        return hit, {
+            "semantic_enabled": True,
+            "reason": "hit",
+            "top_score": float(score),
+            "top_rank": rank,
+            "promoted_to_ram": promoted,
+            **scan_dbg,
+        }
 
     # -------------------------
     # Public retrieval API
     # -------------------------
 
-    def retrieve(self, mq: MemoryQuery) -> Optional[MemoryHit]:
+    def retrieve(
+        self,
+        mq: MemoryQuery,
+        return_meta: bool = False,
+    ):
         """
         Retrieval cascade:
           1. exact RAM
           2. exact DISK
           3. semantic RAM/DISK
+
+        By default returns only:
+          - MemoryHit on hit
+          - None on miss
+
+        If return_meta=True, returns:
+          - (MemoryHit | None, debug_dict)
         """
         now = datetime.now(timezone.utc)
         ctx_sig = context_signature(mq.context)
 
-        exact_hit = self._retrieve_exact(mq, now=now, ctx_sig=ctx_sig)
+        retrieval_t0 = time.time()
+        exact_hit, exact_dbg = self._retrieve_exact(mq, now=now, ctx_sig=ctx_sig)
         if exact_hit is not None:
+            meta = {
+                "retrieval_stage": "exact",
+                "memory_lookup_ms": (time.time() - retrieval_t0) * 1000.0,
+                **exact_dbg,
+            }
+            if return_meta:
+                return exact_hit, meta
             return exact_hit
 
-        semantic_hit = self._retrieve_semantic(mq, now=now, ctx_sig=ctx_sig)
+        semantic_hit, semantic_dbg = self._retrieve_semantic(mq, now=now, ctx_sig=ctx_sig)
         if semantic_hit is not None:
+            meta = {
+                "retrieval_stage": "semantic",
+                "memory_lookup_ms": (time.time() - retrieval_t0) * 1000.0,
+                **semantic_dbg,
+            }
+            if return_meta:
+                return semantic_hit, meta
             return semantic_hit
 
+        meta = {
+            "retrieval_stage": "miss",
+            "memory_lookup_ms": (time.time() - retrieval_t0) * 1000.0,
+            **exact_dbg,
+            "semantic": semantic_dbg,
+        }
+        if return_meta:
+            return None, meta
         return None
 
     # -------------------------
@@ -533,7 +659,6 @@ class MemoryManager:
                 embedding_norm=embedding_norm,
             )
 
-            # Disk is the persistent source of truth
             try:
                 self._disk.put(ns, key, item)
                 disk_ok = True
@@ -547,14 +672,12 @@ class MemoryManager:
                     }
                 )
 
-            # RAM is best-effort
             try:
                 self._ram.put(ns, key, item)
                 ram_ok = True
             except Exception:
                 ram_ok = False
 
-            # Best-effort embed cache warmup
             if query_embedding is not None:
                 try:
                     self._embed_index.put(ns, key, query_embedding)
@@ -590,7 +713,8 @@ class MemoryManager:
             * be passed into generator as context
         - miss -> generate and store
         """
-        hit = self.retrieve(mq)
+        hit, retrieval_dbg = self.retrieve(mq, return_meta=True)
+        memory_lookup_ms = float(retrieval_dbg.get("memory_lookup_ms", 0.0) or 0.0)
 
         if (
             hit is not None
@@ -606,11 +730,18 @@ class MemoryManager:
                 "semantic_used": False,
                 "semantic_bypassed": False,
                 "semantic_candidate_rank": None,
-                "hit": {**dict(hit.debug)},
+                "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
+                "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
+                "hit": dict(hit.debug),
                 "stored": False,
                 "stored_scopes": [],
-                "memory_lookup_ms": 0.0,
+                "memory_lookup_ms": memory_lookup_ms,
                 "generation_ms_est": 0.0,
+                "timings_ms": {
+                    "memory_lookup_ms": memory_lookup_ms,
+                    "generation_ms_est": 0.0,
+                    "total_ms": memory_lookup_ms,
+                },
             }
 
         if (
@@ -628,11 +759,18 @@ class MemoryManager:
                 "semantic_used": True,
                 "semantic_bypassed": True,
                 "semantic_candidate_rank": hit.semantic_rank,
-                "hit": {**dict(hit.debug)},
+                "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
+                "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
+                "hit": dict(hit.debug),
                 "stored": False,
                 "stored_scopes": [],
-                "memory_lookup_ms": 0.0,
+                "memory_lookup_ms": memory_lookup_ms,
                 "generation_ms_est": 0.0,
+                "timings_ms": {
+                    "memory_lookup_ms": memory_lookup_ms,
+                    "generation_ms_est": 0.0,
+                    "total_ms": memory_lookup_ms,
+                },
             }
 
         # Either:
@@ -641,10 +779,12 @@ class MemoryManager:
         # - future mode where regeneration despite hit is desired
         retrieved_for_generation = hit if hit is not None and hit.match_type == MatchType.SEMANTIC else None
 
+        gen_t0 = time.time()
         answer_text, provenance, quality = generator.generate(
             mq,
             retrieved=retrieved_for_generation,
         )
+        generation_ms_est = (time.time() - gen_t0) * 1000.0
 
         store_dbg = self.store(
             mq,
@@ -653,11 +793,17 @@ class MemoryManager:
             quality=quality,
             meta={
                 "used_memory_context": retrieved_for_generation is not None,
-                "memory_context_source": retrieved_for_generation.source_tier.value if retrieved_for_generation else None,
-                "memory_context_match_type": retrieved_for_generation.match_type.value if retrieved_for_generation else None,
+                "memory_context_source": (
+                    retrieved_for_generation.source_tier.value if retrieved_for_generation else None
+                ),
+                "memory_context_match_type": (
+                    retrieved_for_generation.match_type.value if retrieved_for_generation else None
+                ),
                 "semantic_score": retrieved_for_generation.score if retrieved_for_generation else None,
             },
         )
+
+        total_ms = memory_lookup_ms + generation_ms_est
 
         return answer_text, {
             "used_memory": False,
@@ -670,6 +816,8 @@ class MemoryManager:
             "semantic_candidate_rank": (
                 retrieved_for_generation.semantic_rank if retrieved_for_generation else None
             ),
+            "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
+            "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
             "hit_before_generate": {
                 "present": hit is not None,
                 "source_tier": hit.source_tier.value if hit else None,
@@ -679,6 +827,28 @@ class MemoryManager:
             "stored": len(store_dbg.get("stored", [])) > 0,
             "stored_scopes": [x["scope"] for x in store_dbg.get("stored", [])],
             "store": store_dbg,
+            "memory_lookup_ms": memory_lookup_ms,
+            "generation_ms_est": generation_ms_est,
+            "timings_ms": {
+                "memory_lookup_ms": memory_lookup_ms,
+                "generation_ms_est": generation_ms_est,
+                "total_ms": total_ms,
+            },
+            "retrieval_stage": retrieval_dbg.get("retrieval_stage"),
+            "retrieval_debug": retrieval_dbg,
+            "semantic_reason": retrieval_dbg.get("reason")
+                or (retrieval_dbg.get("semantic") or {}).get("reason"),
+            "semantic_candidate_count": retrieval_dbg.get("candidate_count")
+                or (retrieval_dbg.get("semantic") or {}).get("candidate_count"),
+            "semantic_top_score": retrieval_dbg.get("top_score")
+                or (retrieval_dbg.get("semantic") or {}).get("top_score"),
+            "semantic_top_rank": retrieval_dbg.get("top_rank")
+                or (retrieval_dbg.get("semantic") or {}).get("top_rank"),
+            "semantic_enabled_debug": (
+                retrieval_dbg.get("semantic_enabled")
+                if "semantic_enabled" in retrieval_dbg
+                else (retrieval_dbg.get("semantic") or {}).get("semantic_enabled")
+            ),
         }
 
     def stats(self) -> Dict[str, Any]:

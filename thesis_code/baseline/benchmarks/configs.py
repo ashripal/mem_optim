@@ -53,8 +53,12 @@ class WorkloadConfig:
     shuffle: bool = False
     seed: int = 0
 
+    total_requests: Optional[int] = None
+    repeat_fraction: float = 0.0
+
     def validate(self) -> None:
-        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure"}
+        # valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure"}
+        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"}
         if self.mode not in valid_modes:
             raise ValueError(
                 f"Invalid workload mode: {self.mode!r}. "
@@ -68,11 +72,22 @@ class WorkloadConfig:
             raise ValueError("replay_k must be > 0")
 
         if self.mode == "replay_once" and self.replay_k != 2:
-            # Keep semantics explicit and less confusing.
             raise ValueError(
                 "For mode='replay_once', replay_k must remain 2. "
                 "Use mode='replay_k' for other repeat counts."
             )
+        
+        if self.mode == "mixed_reuse":
+            if self.total_requests is None or int(self.total_requests) <= 0:
+                raise ValueError("For mode='mixed_reuse', total_requests must be > 0")
+            if not (0.0 <= float(self.repeat_fraction) < 1.0):
+                raise ValueError("repeat_fraction must be in [0.0, 1.0)")
+            if self.max_examples is None or int(self.max_examples) <= 0:
+                raise ValueError("For mode='mixed_reuse', max_examples must be > 0")
+            if int(self.total_requests) < int(self.max_examples):
+                raise ValueError(
+                    "For mode='mixed_reuse', total_requests must be >= max_examples"
+                )
 
 
 # ---------------------------------------------------------------------
@@ -120,6 +135,8 @@ class BenchmarkConfig:
       - max_input_tokens
       - max_new_tokens
       - max_cache_items
+      - device
+      - dtype
       - cpu_fallback_on_long
     are preserved because the current baseline code expects them.
     """
@@ -159,6 +176,8 @@ class BenchmarkConfig:
     # -----------------------------
     # Device behavior
     # -----------------------------
+    device: str = "auto"
+    dtype: str = "auto"
     cpu_fallback_on_long: bool = False
 
     # -----------------------------
@@ -208,6 +227,18 @@ class BenchmarkConfig:
         if int(self.max_cache_items) <= 0:
             raise ValueError("max_cache_items must be > 0")
 
+        valid_devices = {"auto", "cuda", "mps", "cpu"}
+        if str(self.device).strip().lower() not in valid_devices:
+            raise ValueError(
+                f"device must be one of {sorted(valid_devices)}, got {self.device!r}"
+            )
+
+        valid_dtypes = {"auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"}
+        if str(self.dtype).strip().lower() not in valid_dtypes:
+            raise ValueError(
+                f"dtype must be one of {sorted(valid_dtypes)}, got {self.dtype!r}"
+            )
+
         self.workload.validate()
 
     def resolved_out_dir(self) -> str:
@@ -241,6 +272,8 @@ class BenchmarkConfig:
         max_input_tokens: int = 8192,
         max_new_tokens: int = 64,
         max_cache_items: int = 64,
+        device: str = "auto",
+        dtype: str = "auto",
         cpu_fallback_on_long: bool = False,
         out_root: str = "artifacts/benchmark_runs/baseline",
         notes: str = "",
@@ -260,6 +293,8 @@ class BenchmarkConfig:
             max_input_tokens=max_input_tokens,
             max_new_tokens=max_new_tokens,
             max_cache_items=max_cache_items,
+            device=device,
+            dtype=dtype,
             cpu_fallback_on_long=cpu_fallback_on_long,
             workload=WorkloadConfig(
                 task_glob="",

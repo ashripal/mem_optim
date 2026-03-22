@@ -103,6 +103,14 @@ def build_workload_sequence(
     if workload_cfg.mode == "cache_pressure":
         return _build_cache_pressure(base)
 
+    if workload_cfg.mode == "mixed_reuse":
+        return _build_mixed_reuse(
+            base,
+            total_requests=workload_cfg.total_requests,
+            repeat_fraction=workload_cfg.repeat_fraction,
+            seed=workload_cfg.seed,
+        )
+
     raise ValueError(f"Unsupported workload mode: {workload_cfg.mode!r}")
 
 
@@ -229,6 +237,13 @@ def build_workload_manifest(
             "session_id": cfg.namespaces.session_id,
             "cohort_id": cfg.namespaces.cohort_id,
         },
+        "total_requests": cfg.workload.total_requests,
+        "repeat_fraction": cfg.workload.repeat_fraction,
+        "observed_repeat_requests": max(0, len(workload) - len(unique_ids)),
+        "observed_repeat_rate": (
+            max(0, len(workload) - len(unique_ids)) / len(workload)
+            if workload else 0.0
+        ),
     }
 
 
@@ -286,4 +301,53 @@ def _build_cache_pressure(base: List[Example]) -> List[Example]:
     for ex in odds:
         out.append(_clone_example(ex))
 
+    return out
+
+def _build_mixed_reuse(
+    base: List[Example],
+    *,
+    total_requests: int,
+    repeat_fraction: float,
+    seed: int,
+) -> List[Example]:
+    """
+    Build a mixed workload with a controlled repeat ratio.
+
+    Example:
+      total_requests = 100
+      repeat_fraction = 0.30
+      len(base) = 70
+
+    Result:
+      - 70 first-seen requests
+      - 30 repeated requests sampled from those 70
+      - final order shuffled deterministically
+    """
+    if not base:
+        return []
+
+    if total_requests <= 0:
+        raise ValueError("total_requests must be > 0")
+    if not (0.0 <= repeat_fraction < 1.0):
+        raise ValueError("repeat_fraction must be in [0.0, 1.0)")
+
+    rng = random.Random(seed)
+
+    unique_pool = [_clone_example(ex) for ex in base]
+    n_unique = len(unique_pool)
+
+    if total_requests < n_unique:
+        raise ValueError(
+            f"total_requests ({total_requests}) must be >= number of selected base examples ({n_unique})"
+        )
+
+    n_repeats = total_requests - n_unique
+
+    out: List[Example] = [_clone_example(ex) for ex in unique_pool]
+
+    for _ in range(n_repeats):
+        src = rng.choice(base)
+        out.append(_clone_example(src))
+
+    rng.shuffle(out)
     return out

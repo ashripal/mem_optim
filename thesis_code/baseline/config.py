@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
@@ -41,6 +40,8 @@ class Config:
     max_cache_items: int
 
     # Device behavior
+    device: str
+    dtype: str
     cpu_fallback_on_long: bool
 
 
@@ -116,12 +117,26 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # -----------------------------
-    # Device behavior
+    # Device / precision behavior
     # -----------------------------
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cuda", "mps", "cpu"],
+        help="Execution device preference. 'auto' selects cuda -> mps -> cpu.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
+        help="Model dtype policy. 'auto' uses accelerator-friendly defaults.",
+    )
     parser.add_argument(
         "--cpu_fallback_on_long",
         action="store_true",
-        help="Retry generation on CPU if MPS fails for long sequences.",
+        help="Retry generation on CPU if CUDA/MPS fails for long sequences.",
     )
 
     return parser
@@ -140,5 +155,7 @@ def get_config() -> Config:
         max_input_tokens=args.max_input_tokens,
         max_new_tokens=args.max_new_tokens,
         max_cache_items=args.max_cache_items,
+        device=args.device,
+        dtype=args.dtype,
         cpu_fallback_on_long=args.cpu_fallback_on_long,
     )

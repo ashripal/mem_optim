@@ -42,6 +42,8 @@ class _Cfg:
     max_input_tokens: int = 128
     max_new_tokens: int = 16
     max_cache_items: int = 8
+    device: str = "auto"
+    dtype: str = "auto"
     cpu_fallback_on_long: bool = False
 
 
@@ -67,6 +69,7 @@ class FakeComputeEngine:
         return {
             "ok": True,
             "device": "cpu",
+            "dtype": "float32",
             "truncated": False,
             "input_tokens": 10,
             "output_tokens": 5,
@@ -140,6 +143,7 @@ def test_runner_continues_on_evaluator_error(tmp_path: Path, monkeypatch):
             "input_tokens": 10,
             "output_tokens": 5,
             "device": "cpu",
+            "dtype": "float32",
             "truncated": False,
             "tokens_per_second": 10.0,
         }

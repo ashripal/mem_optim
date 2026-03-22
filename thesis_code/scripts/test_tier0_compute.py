@@ -6,24 +6,27 @@ Why this exists:
 - Unit tests should NOT download or run large HF models.
 - This script is a *manual / developer* check to validate Tier0 behavior end-to-end:
   - model/tokenizer loading
-  - device selection (MPS vs CPU)
+  - device selection (CUDA vs MPS vs CPU)
   - input truncation behavior
   - generation works
-  - (optional) CPU fallback flag is wired
+  - optional CPU fallback flag is wired
 
 Recommended usage:
 - Use a small model for quick checks.
-- Run on CPU unless you specifically want to test MPS.
+- Run on CPU unless you specifically want to test CUDA or MPS.
 
 Examples:
 
 # Quick CPU smoke test with a small model
 python scripts/test_tier0_compute.py --model_id gpt2 --device cpu --max_input_tokens 128 --max_new_tokens 32
 
+# Quick CUDA smoke test with a small model
+python scripts/test_tier0_compute.py --model_id gpt2 --device cuda --dtype fp16 --max_input_tokens 128 --max_new_tokens 32
+
 # Test truncation with a long prompt
 python scripts/test_tier0_compute.py --model_id gpt2 --device cpu --long_prompt --max_input_tokens 64 --max_new_tokens 16
 
-# Prefer MPS if available (falls back to CPU if MPS is unavailable)
+# Prefer CUDA if available, else MPS, else CPU
 python scripts/test_tier0_compute.py --model_id gpt2 --device auto
 
 Notes:
@@ -36,7 +39,13 @@ from __future__ import annotations
 import argparse
 import textwrap
 from dataclasses import dataclass
-from typing import Any, Optional
+
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from baseline.tiers.tier0_compute import ComputeEngine
 
@@ -49,11 +58,15 @@ class _Cfg:
       - model_id
       - max_input_tokens
       - max_new_tokens
+      - device
+      - dtype
       - cpu_fallback_on_long
     """
     model_id: str
     max_input_tokens: int
     max_new_tokens: int
+    device: str
+    dtype: str
     cpu_fallback_on_long: bool
 
 
@@ -82,16 +95,23 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--device",
         type=str,
-        choices=["auto", "cpu", "mps"],
+        choices=["auto", "cuda", "cpu", "mps"],
         default="auto",
-        help="Requested device preference. 'auto' uses Tier0 default (prefers MPS if available).",
+        help="Requested device preference. 'auto' uses Tier0 default (prefers CUDA, then MPS, then CPU).",
+    )
+    ap.add_argument(
+        "--dtype",
+        type=str,
+        choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Requested dtype policy. 'auto' uses accelerator-friendly defaults.",
     )
     ap.add_argument("--max_input_tokens", type=int, default=256)
     ap.add_argument("--max_new_tokens", type=int, default=64)
     ap.add_argument(
         "--cpu_fallback_on_long",
         action="store_true",
-        help="Enable CPU fallback on MPS runtime errors (used in Tier0).",
+        help="Enable CPU fallback on CUDA/MPS runtime errors.",
     )
     ap.add_argument(
         "--long_prompt",
@@ -113,6 +133,8 @@ def main() -> None:
         model_id=args.model_id,
         max_input_tokens=args.max_input_tokens,
         max_new_tokens=args.max_new_tokens,
+        device=args.device,
+        dtype=args.dtype,
         cpu_fallback_on_long=args.cpu_fallback_on_long,
     )
 
@@ -120,7 +142,8 @@ def main() -> None:
     print(" Tier0 Compute Smoke Test")
     print("========================================")
     print(f"Model             : {cfg.model_id}")
-    print(f"Requested device  : {args.device}")
+    print(f"Requested device  : {cfg.device}")
+    print(f"Requested dtype   : {cfg.dtype}")
     print(f"Max input tokens  : {cfg.max_input_tokens}")
     print(f"Max new tokens    : {cfg.max_new_tokens}")
     print(f"CPU fallback      : {cfg.cpu_fallback_on_long}")
@@ -132,10 +155,9 @@ def main() -> None:
     # Instantiate Tier0
     engine = ComputeEngine(cfg)
 
-    # Optionally override device preference (manual)
-    if args.device != "auto":
-        # Force preferred device and move the model there.
-        # This keeps behavior explicit for manual testing.
+    # Optionally override device preference manually after init.
+    # Keep this explicit for developer testing.
+    if args.device != "auto" and engine.active_device != args.device:
         engine.preferred_device = args.device
         engine._move_model(args.device)
 
@@ -147,20 +169,23 @@ def main() -> None:
     )
 
     print("\n--- Tier0 Output (metadata) ---")
-    # Print key metadata deterministically
     keys = [
         "ok",
         "device",
+        "dtype",
         "fallback_from",
         "fallback_reason",
         "truncated",
         "input_tokens",
         "output_tokens",
         "gen_time_s",
+        "cuda_device_name",
+        "gpu_mem_allocated_mb",
+        "gpu_mem_reserved_mb",
     ]
     for k in keys:
         if k in out:
-            print(f"{k:>15}: {out.get(k)}")
+            print(f"{k:>20}: {out.get(k)}")
 
     if args.print_prompt_used and "prompt_used" in out:
         print("\n--- Prompt Used (post-truncation) ---")
@@ -172,13 +197,15 @@ def main() -> None:
     text = out.get("output_text", "")
     print(textwrap.fill(text, width=100) if isinstance(text, str) else text)
 
-    # Basic sanity checks (exit code behavior is nice for automation)
     if not out.get("ok", False):
         raise SystemExit(2)
 
     if args.long_prompt and not out.get("truncated", False):
-        print("\n[warn] long_prompt was set but 'truncated' is False. "
-              "This may happen if the tokenizer produced fewer tokens than expected.")
+        print(
+            "\n[warn] long_prompt was set but 'truncated' is False. "
+            "This may happen if the tokenizer produced fewer tokens than expected."
+        )
+
     print("\n[ok] Tier0 smoke test completed.")
 
 

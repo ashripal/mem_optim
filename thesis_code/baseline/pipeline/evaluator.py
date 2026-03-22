@@ -53,25 +53,12 @@ def evaluate_example(
         A structured result dictionary suitable for JSONL logging.
     """
 
-    # ------------------------------
-    # Build prompt
-    # ------------------------------
     prompt = _build_prompt(example)
     cache_key = hash(prompt)
 
-    # ------------------------------
-    # Memory before
-    # ------------------------------
     rss_before = get_rss_mb()
-
-    # ------------------------------
-    # Total timer starts here
-    # ------------------------------
     total_t0 = time.time()
 
-    # ------------------------------
-    # Tier 1 lookup timing
-    # ------------------------------
     lookup_t0 = time.time()
     cached = cache.get(cache_key)
     lookup_latency_s = time.time() - lookup_t0
@@ -88,9 +75,6 @@ def evaluate_example(
         llm_bypassed = True
 
     else:
-        # ------------------------------
-        # Tier 0 compute
-        # ------------------------------
         compute_t0 = time.time()
 
         generation = compute.generate(
@@ -129,20 +113,10 @@ def evaluate_example(
         llm_bypassed = False
 
     total_latency_s = time.time() - total_t0
-
-    # ------------------------------
-    # Memory after
-    # ------------------------------
     rss_after = get_rss_mb()
 
-    # ------------------------------
-    # Quality metrics
-    # ------------------------------
     quality = compute_basic_metrics(output_text, example)
 
-    # ------------------------------
-    # Build result record
-    # ------------------------------
     result: Dict[str, Any] = {
         "type": "example_result",
         "ok": True,
@@ -152,7 +126,7 @@ def evaluate_example(
         # Cache / serving behavior
         "cache_hit": cache_hit,
         "served_from": served_from,
-        "source_tier": served_from,  # kept for compatibility with benchmark executor
+        "source_tier": served_from,
         "tier_path": tier_path,
         "llm_bypassed": llm_bypassed,
 
@@ -161,6 +135,8 @@ def evaluate_example(
         "lookup_latency_s": lookup_latency_s,
         "compute_latency_s": compute_latency_s,
         "gen_time_s": meta.get("gen_time_s"),
+        "tokenize_time_s": meta.get("tokenize_time_s"),
+        "decode_time_s": meta.get("decode_time_s"),
 
         # Memory
         "rss_before_mb": rss_before,
@@ -171,10 +147,17 @@ def evaluate_example(
         "input_tokens": meta.get("input_tokens"),
         "output_tokens": meta.get("output_tokens"),
         "device": meta.get("device"),
+        "dtype": meta.get("dtype"),
+        "generation_backend": meta.get("generation_backend"),
         "truncated": meta.get("truncated"),
         "fallback_from": meta.get("fallback_from"),
         "fallback_reason": meta.get("fallback_reason"),
         "device_switch_persisted": meta.get("device_switch_persisted"),
+
+        # Optional CUDA telemetry
+        "cuda_device_name": meta.get("cuda_device_name"),
+        "gpu_mem_allocated_mb": meta.get("gpu_mem_allocated_mb"),
+        "gpu_mem_reserved_mb": meta.get("gpu_mem_reserved_mb"),
 
         # Output / scoring
         "output_text": output_text,

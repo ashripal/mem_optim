@@ -8,6 +8,8 @@ Goals:
 - Make runs easy to serialize, compare, and reproduce
 - Preserve familiar top-level fields like:
     tier2_repo, out_dir, model_id, max_input_tokens, max_new_tokens
+- Add explicit runtime controls needed for Jetson / edge deployment:
+    device, dtype, local_files_only
 
 This module does NOT:
 - Parse CLI arguments
@@ -47,8 +49,11 @@ class WorkloadConfig:
     shuffle: bool = False
     seed: int = 0
 
+    total_requests: Optional[int] = None
+    repeat_fraction: float = 0.0
+
     def validate(self) -> None:
-        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure"}
+        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"}
         if self.mode not in valid_modes:
             raise ValueError(
                 f"Invalid workload mode: {self.mode!r}. "
@@ -66,6 +71,18 @@ class WorkloadConfig:
                 "For mode='replay_once', replay_k must remain 2. "
                 "Use mode='replay_k' for other repeat counts."
             )
+        
+        if self.mode == "mixed_reuse":
+            if self.total_requests is None or int(self.total_requests) <= 0:
+                raise ValueError("For mode='mixed_reuse', total_requests must be > 0")
+            if not (0.0 <= float(self.repeat_fraction) < 1.0):
+                raise ValueError("repeat_fraction must be in [0.0, 1.0)")
+            if self.max_examples is None or int(self.max_examples) <= 0:
+                raise ValueError("For mode='mixed_reuse', max_examples must be > 0")
+            if int(self.total_requests) < int(self.max_examples):
+                raise ValueError(
+                    "For mode='mixed_reuse', total_requests must be >= max_examples"
+                )
 
 
 # ---------------------------------------------------------------------
@@ -121,7 +138,7 @@ class MemoryConfig:
     """
     Memarch-specific memory and retrieval controls.
 
-    This config now supports explicit benchmark modes for:
+    This config supports explicit benchmark modes for:
     - exact-only retrieval
     - semantic retrieval used as generation context
     - semantic retrieval with direct bypass
@@ -192,6 +209,12 @@ class MemoryConfig:
         if not str(self.embedding_model_id).strip():
             raise ValueError("embedding_model_id must be non-empty")
 
+        valid_embed_devices = {"auto", "cuda", "mps", "cpu"}
+        if str(self.embedding_device).strip().lower() not in valid_embed_devices:
+            raise ValueError(
+                f"embedding_device must be one of {sorted(valid_embed_devices)}"
+            )
+
     def effective_semantic_enabled(self) -> bool:
         return self.retrieval_mode in {"semantic_context", "semantic_bypass"} and self.semantic_enabled
 
@@ -241,8 +264,11 @@ class BenchmarkConfig:
     max_new_tokens: int = 64
 
     # -----------------------------
-    # Device behavior
+    # Runtime / device behavior
     # -----------------------------
+    device: str = "auto"
+    dtype: str = "auto"
+    local_files_only: bool = False
     cpu_fallback_on_long: bool = False
 
     # -----------------------------
@@ -278,6 +304,18 @@ class BenchmarkConfig:
         if int(self.max_new_tokens) < 0:
             raise ValueError("max_new_tokens must be >= 0")
 
+        valid_devices = {"auto", "cuda", "mps", "cpu"}
+        if str(self.device).strip().lower() not in valid_devices:
+            raise ValueError(
+                f"device must be one of {sorted(valid_devices)}, got {self.device!r}"
+            )
+
+        valid_dtypes = {"auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"}
+        if str(self.dtype).strip().lower() not in valid_dtypes:
+            raise ValueError(
+                f"dtype must be one of {sorted(valid_dtypes)}, got {self.dtype!r}"
+            )
+
         self.workload.validate()
         self.output.validate()
         self.namespaces.validate()
@@ -307,6 +345,9 @@ class BenchmarkConfig:
         model_id: str = "microsoft/Phi-3-mini-128k-instruct",
         max_input_tokens: int = 8192,
         max_new_tokens: int = 64,
+        device: str = "auto",
+        dtype: str = "auto",
+        local_files_only: bool = False,
         ram_capacity_items: int = 64,
         disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
         clear_disk_store_before_run: bool = False,
@@ -338,6 +379,9 @@ class BenchmarkConfig:
             model_id=model_id,
             max_input_tokens=max_input_tokens,
             max_new_tokens=max_new_tokens,
+            device=device,
+            dtype=dtype,
+            local_files_only=local_files_only,
             cpu_fallback_on_long=cpu_fallback_on_long,
             workload=WorkloadConfig(
                 task_glob="",

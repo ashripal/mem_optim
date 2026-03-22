@@ -1,0 +1,29 @@
+{
+  "benchmark_name": "baseline_cache_pressure_qwen05b",
+  "notes": "",
+  "tier2_repo": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data",
+  "workload_mode": "mixed_reuse",
+  "task_glob": "trec",
+  "base_max_examples": 40,
+  "total_workload_examples": 120,
+  "unique_base_examples": 40,
+  "tasks": [
+    "trec"
+  ],
+  "source_files": [
+    "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data/trec.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 42,
+  "replay_k": 2,
+  "max_cache_items": 4,
+  "max_input_tokens": 64,
+  "max_new_tokens": 8,
+  "model_id": "Qwen/Qwen2.5-0.5B-Instruct",
+  "device": "cpu",
+  "dtype": "auto",
+  "total_requests": 120,
+  "repeat_fraction": 0.5,
+  "observed_repeat_requests": 80,
+  "observed_repeat_rate": 0.6666666666666666
+}

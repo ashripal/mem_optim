@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         type=str,
         default="cold",
-        choices=["cold", "replay_once", "replay_k", "cache_pressure"],
+        choices=["cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"],
         help="Workload mode controlling reuse behavior.",
     )
     parser.add_argument(
@@ -103,9 +103,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum new tokens to generate.",
     )
     parser.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda", "mps"],
+        help="Generation device preference.",
+    )
+    parser.add_argument(
+        "--dtype",
+        type=str,
+        default="auto",
+        choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
+        help="Generation dtype policy.",
+    )
+    parser.add_argument(
+        "--local_files_only",
+        action="store_true",
+        help="Load generator model only from local files.",
+    )
+    parser.add_argument(
         "--cpu_fallback_on_long",
         action="store_true",
         help="Enable CPU fallback when long inputs exceed device constraints.",
+    )
+    parser.add_argument(
+        "--jetson_safe_mode",
+        action="store_true",
+        help="Clamp input length to a Jetson-safe budget for embedded testing.",
     )
 
     # Namespace / identity knobs
@@ -281,6 +305,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional freeform notes stored in the run config.",
     )
 
+    parser.add_argument(
+        "--total_requests",
+        type=int,
+        default=None,
+        help="Total number of workload requests when mode=mixed_reuse.",
+    )
+    parser.add_argument(
+        "--repeat_fraction",
+        type=float,
+        default=0.0,
+        help="Fraction of requests that should be repeats when mode=mixed_reuse.",
+    )
+
     return parser
 
 
@@ -292,6 +329,10 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
     store_in_ram = not args.no_store_in_ram
     store_on_disk = not args.no_store_on_disk
 
+    max_input_tokens = int(args.max_input_tokens)
+    if args.jetson_safe_mode:
+        max_input_tokens = min(max_input_tokens, 2048)
+
     workload = WorkloadConfig(
         task_glob=args.task_glob,
         max_examples=args.max_examples,
@@ -299,6 +340,8 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         replay_k=args.replay_k,
         shuffle=args.shuffle,
         seed=args.seed,
+        total_requests=args.total_requests,
+        repeat_fraction=args.repeat_fraction,
     )
 
     output = OutputConfig(
@@ -338,8 +381,11 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         tier2_repo=args.tier2_repo,
         out_dir=args.out_root,
         model_id=args.model_id,
-        max_input_tokens=args.max_input_tokens,
+        max_input_tokens=max_input_tokens,
         max_new_tokens=args.max_new_tokens,
+        device=args.device,
+        dtype=args.dtype,
+        local_files_only=args.local_files_only,
         cpu_fallback_on_long=args.cpu_fallback_on_long,
         workload=workload,
         output=output,

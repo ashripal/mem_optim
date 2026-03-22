@@ -25,6 +25,7 @@ Notes:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from math import sqrt
 from typing import Dict, List, Optional, Sequence
@@ -42,7 +43,10 @@ def _mps_available() -> bool:
 
 
 def _cuda_available() -> bool:
-    return torch.cuda.is_available()
+    try:
+        return torch.cuda.is_available()
+    except Exception:
+        return False
 
 
 def _select_device(device: str = "auto") -> str:
@@ -102,8 +106,12 @@ class EmbedderConfig:
     # Output behavior
     normalize: bool = True
 
-    # Useful for offline / pre-downloaded environments
+    # Loading behavior
     local_files_only: bool = False
+    use_fast_tokenizer: bool = False
+
+    # Runtime behavior
+    cpu_fallback_on_failure: bool = True
 
 
 class HFEmbedder:
@@ -125,7 +133,7 @@ class HFEmbedder:
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             self.cfg.model_id,
-            use_fast=True,
+            use_fast=self.cfg.use_fast_tokenizer,
             local_files_only=self.cfg.local_files_only,
         )
 
@@ -135,6 +143,8 @@ class HFEmbedder:
         )
         self.model.eval()
         self.model.to(self.device)
+
+        self.last_batch_meta: Optional[Dict[str, object]] = None
 
     @staticmethod
     def _sanitize_text(text: Optional[str]) -> str:
@@ -166,6 +176,80 @@ class HFEmbedder:
         counts = mask.sum(dim=1).clamp(min=1e-9)
         return summed / counts
 
+    def _record_batch_meta(
+        self,
+        *,
+        batch_size: int,
+        truncated_count: int,
+        tokenize_time_s: float,
+        embed_time_s: float,
+        backend_used: str,
+    ) -> None:
+        meta: Dict[str, object] = {
+            "device": self.device,
+            "batch_size": batch_size,
+            "truncated_count": truncated_count,
+            "tokenize_time_s": tokenize_time_s,
+            "embed_time_s": embed_time_s,
+            "normalize": self.cfg.normalize,
+            "embedding_dim": self.embedding_dim(),
+            "backend_used": backend_used,
+        }
+
+        if self.device == "cuda":
+            try:
+                meta["cuda_device_name"] = torch.cuda.get_device_name(0)
+                meta["gpu_mem_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024 ** 2), 3)
+                meta["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024 ** 2), 3)
+            except Exception:
+                pass
+
+        self.last_batch_meta = meta
+
+    def _embed_batch_once(self, texts: Sequence[str]) -> List[Vector]:
+        cleaned_texts = [self._sanitize_text(t) for t in texts]
+
+        tok_t0 = time.time()
+        enc = self.tokenizer(
+            cleaned_texts,
+            padding=True,
+            truncation=True,
+            max_length=self.cfg.max_length,
+            return_tensors="pt",
+        )
+        tokenize_time_s = time.time() - tok_t0
+
+        input_ids = enc["input_ids"].to(self.device)
+        attention_mask = enc["attention_mask"].to(self.device)
+
+        truncated_count = int((attention_mask.sum(dim=1) >= self.cfg.max_length).sum().item())
+
+        embed_t0 = time.time()
+        with torch.inference_mode():
+            outputs = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            )
+
+            last_hidden_state = outputs.last_hidden_state
+            pooled = self._mean_pool(last_hidden_state, attention_mask)
+
+            if self.cfg.normalize:
+                pooled = F.normalize(pooled, p=2, dim=1)
+
+            batch_vectors = pooled.detach().cpu().tolist()
+        embed_time_s = time.time() - embed_t0
+
+        self._record_batch_meta(
+            batch_size=len(cleaned_texts),
+            truncated_count=truncated_count,
+            tokenize_time_s=tokenize_time_s,
+            embed_time_s=embed_time_s,
+            backend_used="hf_forward",
+        )
+
+        return batch_vectors
+
     def embed(self, text: str) -> Vector:
         """
         Embed a single text into one vector.
@@ -191,31 +275,19 @@ class HFEmbedder:
         for start in range(0, len(cleaned_texts), self.cfg.batch_size):
             batch = cleaned_texts[start : start + self.cfg.batch_size]
 
-            enc = self.tokenizer(
-                batch,
-                padding=True,
-                truncation=True,
-                max_length=self.cfg.max_length,
-                return_tensors="pt",
-            )
+            try:
+                batch_vectors = self._embed_batch_once(batch)
+            except RuntimeError as e:
+                if self.device in {"cuda", "mps"} and self.cfg.cpu_fallback_on_failure:
+                    self.model.to("cpu")
+                    self.device = "cpu"
+                    batch_vectors = self._embed_batch_once(batch)
+                else:
+                    raise RuntimeError(
+                        f"HFEmbedder failed on device={self.device}: {type(e).__name__}: {e}"
+                    ) from e
 
-            input_ids = enc["input_ids"].to(self.device)
-            attention_mask = enc["attention_mask"].to(self.device)
-
-            with torch.inference_mode():
-                outputs = self.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                )
-
-                last_hidden_state = outputs.last_hidden_state
-                pooled = self._mean_pool(last_hidden_state, attention_mask)
-
-                if self.cfg.normalize:
-                    pooled = F.normalize(pooled, p=2, dim=1)
-
-                batch_vectors = pooled.detach().cpu().tolist()
-                all_vectors.extend(batch_vectors)
+            all_vectors.extend(batch_vectors)
 
         return all_vectors
 
@@ -261,6 +333,9 @@ class HFEmbedder:
             "batch_size": self.cfg.batch_size,
             "normalize": self.cfg.normalize,
             "embedding_dim": self.embedding_dim(),
+            "use_fast_tokenizer": self.cfg.use_fast_tokenizer,
+            "cpu_fallback_on_failure": self.cfg.cpu_fallback_on_failure,
+            "last_batch_meta": self.last_batch_meta,
         }
 
 

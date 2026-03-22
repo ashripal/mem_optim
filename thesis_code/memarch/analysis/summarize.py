@@ -187,7 +187,37 @@ def summarize_run(log_path: str) -> RunSummary:
         if _is_number(e.get("semantic_candidate_rank"))
     ]
 
+    rows = ok_events
+    latency_values = [e.get("latency_s") for e in rows]
+    latency_stats = _numeric_stats(latency_values)
+
+    n_examples = len(rows)
+    n_generated = sum(1 for r in rows if bool(r.get("generated", False)))
+    n_memory_hits = sum(1 for r in rows if bool(r.get("used_memory", False)))
+    n_exact_hits = sum(1 for r in rows if r.get("match_type") == "exact")
+    n_semantic_hits = sum(
+        1 for r in rows
+        if (r.get("hit_before_generate") or {}).get("match_type") == "semantic"
+        or r.get("match_type") == "semantic"
+    )
+    n_semantic_context_used = sum(1 for r in rows if bool(r.get("semantic_used", False)))
+    n_semantic_bypass = sum(1 for r in rows if bool(r.get("semantic_bypassed", False)))
+    memory_hit_rate = n_memory_hits / len(rows) if rows else 0.0
+    llm_calls_saved = len(rows) - n_generated
+
     metrics: Dict[str, Any] = {
+        "n_examples": n_examples,
+        "mean_latency_s": latency_stats["mean"],
+        "p50_latency_s": latency_stats["median"],
+        "p95_latency_s": latency_stats["p95"],
+        "n_generated": n_generated,
+        "n_memory_hits": n_memory_hits,
+        "memory_hit_rate": memory_hit_rate,
+        "n_exact_hits": n_exact_hits,
+        "n_semantic_hits": n_semantic_hits,
+        "n_semantic_context_used": n_semantic_context_used,
+        "n_semantic_bypass": n_semantic_bypass,
+        "llm_calls_saved": llm_calls_saved,
         "counts": {
             "total": len(example_events),
             "ok": total_ok,
@@ -220,7 +250,7 @@ def summarize_run(log_path: str) -> RunSummary:
             "semantic_candidate_rank": _numeric_stats(semantic_ranks),
         },
         "latency": {
-            "total_s": _numeric_stats([e.get("latency_s") for e in ok_events]),
+            "total_s": latency_stats,
             "memory_lookup_ms": _numeric_stats([e.get("memory_lookup_ms") for e in ok_events]),
             "generation_ms_est": _numeric_stats([e.get("generation_ms_est") for e in ok_events]),
         },

@@ -9,8 +9,9 @@ Responsibilities:
 - Emit JSONL logs via memarch.pipeline.logging.JsonlLogger
 
 Design goals:
-- Works on Mac (Apple silicon) and Jetson Orin Nano with no code changes
+- Works on Mac (Apple silicon) and Jetson Orin with no code changes
 - Unit-test friendly: you can pass fake generator/manager and a temp logger
+- Preserve resolved runtime metadata so baseline and memarch runs are comparable
 
 Notes:
 - We use time.perf_counter() for timing.
@@ -58,6 +59,7 @@ class MemoryManagerLike(Protocol):
 
 class GeneratorLike(Protocol):
     def generate(self, mq: MemoryQuery, retrieved: Optional[Any] = None) -> Tuple[str, Any, Any]: ...
+    def info(self) -> Dict[str, Any]: ...
 
 
 # -------------------------
@@ -113,9 +115,18 @@ class Evaluator:
         """
         # 1) time retrieval separately (for breakdown + debugging)
         t0 = time.perf_counter()
-        hit = self._manager.retrieve(mq)
+        retrieve_result = self._manager.retrieve(mq)
         t1 = time.perf_counter()
-        memory_lookup_ms = (t1 - t0) * 1000.0
+        retrieval_probe_ms = (t1 - t0) * 1000.0
+
+        # manager.retrieve() now returns (hit, debug)
+        if isinstance(retrieve_result, tuple) and len(retrieve_result) == 2:
+            hit, retrieve_dbg = retrieve_result
+        else:
+            hit, retrieve_dbg = retrieve_result, {}
+
+        retrieve_dbg = dict(retrieve_dbg or {})
+        memory_lookup_ms = float(retrieve_dbg.get("memory_lookup_ms", retrieval_probe_ms) or retrieval_probe_ms)
 
         # 2) time full answer path
         t2 = time.perf_counter()
@@ -136,7 +147,7 @@ class Evaluator:
         if hit is not None and used_memory:
             generation_ms = 0.0
         else:
-            generation_ms = max(0.0, total_ms - memory_lookup_ms)
+            generation_ms = float(meta.get("generation_ms_est", max(0.0, total_ms - memory_lookup_ms)))
 
         timings_ms = {
             "memory_lookup_ms": float(memory_lookup_ms),
@@ -155,12 +166,28 @@ class Evaluator:
         except Exception:
             pass
 
+        # Add generator info if available
+        try:
+            resources["generator_info"] = self._generator.info()
+        except Exception:
+            pass
+
+        # Capture generator-side runtime metadata if available
+        generator_meta = dict(getattr(self._generator, "last_generation_meta", {}) or {})
+
         # Add normalized evaluator-side helper fields for easier downstream analysis
         eval_meta: Dict[str, Any] = {
             **meta,
+
+            # retrieval probe metadata
             "retrieval_hit_present": hit is not None,
             "retrieval_hit_match_type": getattr(hit, "match_type", None).value if hit is not None else None,
             "retrieval_hit_source_tier": getattr(hit, "source_tier", None).value if hit is not None else None,
+            "retrieval_probe_memory_lookup_ms": float(retrieval_probe_ms),
+            "retrieval_stage": retrieve_dbg.get("retrieval_stage"),
+            "namespaces_checked": meta.get("namespaces_checked", retrieve_dbg.get("namespaces_checked", [])),
+
+            # normalized serving fields
             "used_memory": used_memory,
             "generated": generated,
             "source_tier": source_tier,
@@ -169,6 +196,24 @@ class Evaluator:
             "semantic_bypassed": semantic_bypassed,
             "semantic_candidate_rank": meta.get("semantic_candidate_rank"),
             "score": meta.get("score"),
+
+            # generator/runtime metadata
+            "device": generator_meta.get("device"),
+            "dtype": generator_meta.get("dtype"),
+            "generation_backend": generator_meta.get("generation_backend"),
+            "input_tokens": generator_meta.get("input_tokens"),
+            "output_tokens": generator_meta.get("output_tokens"),
+            "truncated": generator_meta.get("truncated"),
+            "tokenize_time_s": generator_meta.get("tokenize_time_s"),
+            "gen_time_s": generator_meta.get("gen_time_s"),
+            "decode_time_s": generator_meta.get("decode_time_s"),
+            "cuda_device_name": generator_meta.get("cuda_device_name"),
+            "gpu_mem_allocated_mb": generator_meta.get("gpu_mem_allocated_mb"),
+            "gpu_mem_reserved_mb": generator_meta.get("gpu_mem_reserved_mb"),
+            "used_retrieved_context": generator_meta.get("used_retrieved_context"),
+            "retrieved_match_type": generator_meta.get("retrieved_match_type"),
+            "retrieved_source_tier": generator_meta.get("retrieved_source_tier"),
+            "retrieved_score": generator_meta.get("retrieved_score"),
         }
 
         result = EvalResult(

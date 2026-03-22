@@ -45,6 +45,8 @@ def run_experiment(cfg: Any) -> str:
             - max_new_tokens: int
             - max_cache_items: int
             - max_input_tokens: int
+            - device: str
+            - dtype: str
             - cpu_fallback_on_long: bool
 
     Returns:

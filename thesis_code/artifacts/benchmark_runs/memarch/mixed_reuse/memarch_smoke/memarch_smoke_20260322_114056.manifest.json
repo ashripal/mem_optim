@@ -1,0 +1,44 @@
+{
+  "benchmark_name": "memarch_smoke",
+  "notes": "",
+  "tier2_repo": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data",
+  "workload_mode": "mixed_reuse",
+  "task_glob": "trec",
+  "base_max_examples": 5,
+  "total_workload_examples": 10,
+  "unique_base_examples": 5,
+  "tasks": [
+    "trec"
+  ],
+  "source_files": [
+    "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/longbench_repo/data/trec.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 42,
+  "replay_k": 2,
+  "ram_capacity_items": 8,
+  "disk_store_path": "/Users/ashripal/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/memory/memarch_smoke.sqlite",
+  "retrieval_mode": "exact_only",
+  "semantic_enabled": false,
+  "semantic_threshold_context": 0.85,
+  "semantic_threshold_bypass": 1.01,
+  "max_semantic_candidates": 5,
+  "embedding_model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "promote_disk_hits_to_ram": true,
+  "return_memory_directly": true,
+  "enable_storage": true,
+  "store_in_ram": true,
+  "store_on_disk": true,
+  "max_input_tokens": 256,
+  "max_new_tokens": 32,
+  "model_id": "Qwen/Qwen2.5-1.5B-Instruct",
+  "namespaces": {
+    "user_id": "user_a",
+    "session_id": "session_a",
+    "cohort_id": null
+  },
+  "total_requests": 10,
+  "repeat_fraction": 0.3,
+  "observed_repeat_requests": 5,
+  "observed_repeat_rate": 0.5
+}
