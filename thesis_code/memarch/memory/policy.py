@@ -8,6 +8,11 @@ Phase 1 focus:
 - Personalization-first scope ordering
 - Safety gating: freshness (TTL) + context match + version scoping
 
+Evidence-guided extension:
+- Prefer same-document semantic candidates before broader semantic matches
+- Keep semantic retrieval context-only (no semantic direct bypass)
+- Surface cheap document-local signals for manager-side ranking/selection
+
 This module contains decision rules, not storage or model calls.
 Keep it pure and unit-testable.
 """
@@ -58,9 +63,9 @@ class RetrievalPolicy:
     # Semantic retrieval policy
     semantic_enabled: bool = False
 
-    # Phase 1 default:
-    # - allow semantic retrieval to assist generation if score >= threshold_context
-    # - bypass is typically disabled initially by setting threshold_bypass > 1.0
+    # Evidence-guided spec:
+    # - semantic retrieval may assist generation if score >= threshold_context
+    # - semantic direct bypass is disabled
     semantic_threshold_context: float = 0.85
     semantic_threshold_bypass: float = 1.01
 
@@ -71,7 +76,17 @@ class RetrievalPolicy:
     require_same_task_for_semantic: bool = True
     require_same_model_for_semantic: bool = True
     require_same_prompt_version_for_semantic: bool = True
+
+    # Exact same-context requirement remains relevant only for exact hits.
+    # Semantic bypass is disabled in this spec, so this stays for compatibility.
     require_same_context_for_bypass: bool = True
+
+    # Evidence-guided preference:
+    # do not require same document, but prefer it when available.
+    prefer_same_document_for_semantic: bool = True
+
+    # Semantic retrieval should remain assistive/context-only.
+    allow_semantic_bypass: bool = False
 
     def __post_init__(self) -> None:
         if not self.scope_order:
@@ -118,7 +133,12 @@ def is_fresh(item: MemoryItem, now_utc: Optional[datetime] = None) -> bool:
     return now < item.expires_at_utc
 
 
-def context_matches(mq: MemoryQuery, item: MemoryItem, *, query_context_signature: Optional[str] = None) -> bool:
+def context_matches(
+    mq: MemoryQuery,
+    item: MemoryItem,
+    *,
+    query_context_signature: Optional[str] = None,
+) -> bool:
     """
     Exact/context safety check.
 
@@ -157,22 +177,64 @@ def task_matches(mq: MemoryQuery, item: MemoryItem) -> bool:
     return item_task == mq.task
 
 
+def _query_doc_signature(mq: MemoryQuery) -> Optional[str]:
+    if mq.doc_signature is not None:
+        return mq.doc_signature
+    value = mq.context.get("doc_signature")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _item_doc_signature(item: MemoryItem) -> Optional[str]:
+    if item.doc_signature is not None:
+        return item.doc_signature
+    value = item.meta.get("doc_signature")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
 def same_document(
     mq: MemoryQuery,
     item: MemoryItem,
 ) -> bool:
     """
-    Stronger semantic safety check when document signatures are available.
-    Returns True if:
-    - both doc signatures exist and match, or
-    - document signature is unavailable on one or both sides
+    Return True only when both sides have document signatures and they match.
+
+    This is intentionally stricter than the old behavior because we now use it
+    as a preference/ranking signal rather than an eligibility gate.
     """
-    mq_doc = mq.context.get("doc_signature")
-    item_doc = item.meta.get("doc_signature")
+    mq_doc = _query_doc_signature(mq)
+    item_doc = _item_doc_signature(item)
 
     if mq_doc is None or item_doc is None:
-        return True
+        return False
     return mq_doc == item_doc
+
+
+def document_relation(
+    mq: MemoryQuery,
+    item: MemoryItem,
+) -> str:
+    """
+    Classify semantic candidate document relation.
+
+    Returns:
+      - "same_document" when both signatures exist and match
+      - "different_document" when both signatures exist and differ
+      - "unknown_document" when one or both signatures are unavailable
+    """
+    mq_doc = _query_doc_signature(mq)
+    item_doc = _item_doc_signature(item)
+
+    if mq_doc is None or item_doc is None:
+        return "unknown_document"
+    if mq_doc == item_doc:
+        return "same_document"
+    return "different_document"
 
 
 def semantic_candidate_allowed(
@@ -187,6 +249,10 @@ def semantic_candidate_allowed(
     Decide whether a MemoryItem is eligible to participate in semantic retrieval.
 
     This is candidate filtering before similarity thresholds are applied.
+
+    Evidence-guided behavior:
+    - document mismatch does NOT reject a candidate
+    - document relation is surfaced in debug so manager can prefer same-document
     """
     dbg: Dict[str, Any] = {"reason": "accepted"}
 
@@ -219,13 +285,11 @@ def semantic_candidate_allowed(
         dbg["reason"] = "missing_embedding"
         return False, dbg
 
-    if not same_document(mq, item):
-        dbg["reason"] = "document_mismatch"
-        dbg["item_doc_signature"] = item.meta.get("doc_signature")
-        dbg["query_doc_signature"] = mq.context.get("doc_signature")
-        return False, dbg
-
     dbg["query_context_signature"] = query_context_signature
+    dbg["document_relation"] = document_relation(mq, item)
+    dbg["same_document"] = same_document(mq, item)
+    dbg["item_doc_signature"] = _item_doc_signature(item)
+    dbg["query_doc_signature"] = _query_doc_signature(mq)
     return True, dbg
 
 
@@ -240,30 +304,22 @@ def semantic_decision(
     Decide what to do with a semantic candidate after similarity is computed.
 
     Returns:
-      ("ignore" | "context" | "bypass", debug_info)
+      ("ignore" | "context", debug_info)
 
-    Phase 1 recommendation:
-    - context assistance can be enabled
-    - bypass is usually disabled by setting threshold_bypass > 1.0
+    Evidence-guided spec:
+    - semantic retrieval is assistive/context-only
+    - semantic direct bypass is disabled
     """
     dbg: Dict[str, Any] = {
         "score": score,
         "semantic_threshold_context": policy.semantic_threshold_context,
         "semantic_threshold_bypass": policy.semantic_threshold_bypass,
+        "semantic_bypass_allowed": bool(policy.allow_semantic_bypass),
     }
 
     if score < policy.semantic_threshold_context:
         dbg["reason"] = "below_context_threshold"
         return "ignore", dbg
-
-    same_context = True
-    if policy.require_same_context_for_bypass and query_context_signature is not None:
-        same_context = item.context_signature == query_context_signature
-        dbg["same_context_for_bypass"] = same_context
-
-    if score >= policy.semantic_threshold_bypass and same_context:
-        dbg["reason"] = "semantic_bypass"
-        return "bypass", dbg
 
     dbg["reason"] = "semantic_context"
     return "context", dbg

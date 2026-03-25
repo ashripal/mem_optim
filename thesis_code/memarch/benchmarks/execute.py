@@ -19,6 +19,11 @@ multi-tier behavior:
 - whether disk hits were promoted to RAM
 - storage decisions
 - timing breakdowns
+
+Evidence-guided extension:
+- build MemoryQuery objects with cheap document/source metadata
+- derive a compact evidence snippet from dataset context
+- preserve low latency by using only lexical heuristics here
 """
 
 from __future__ import annotations
@@ -27,12 +32,13 @@ import hashlib
 import json
 import os
 import platform
+import re
 import time
 from contextlib import AbstractContextManager
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 
@@ -56,6 +62,12 @@ except Exception:
 # ---------------------------------------------------------------------
 # Small local utilities
 # ---------------------------------------------------------------------
+
+
+_WS_RE = re.compile(r"\s+")
+_WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
+
+_TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
 
 
 def _utc_now_iso() -> str:
@@ -143,7 +155,6 @@ def _extract_semantic_debug(meta: Dict[str, Any]) -> Dict[str, Any]:
 
     retrieval_stage = meta.get("retrieval_stage", retrieval_debug.get("retrieval_stage"))
 
-    # Prefer explicit top-level fields if present, otherwise fall back to nested debug.
     semantic_reason = meta.get("semantic_reason")
     if semantic_reason is None:
         semantic_reason = retrieval_debug.get("reason", semantic_block.get("reason"))
@@ -244,6 +255,18 @@ def _disk_stats(disk: Any) -> Any:
 # ---------------------------------------------------------------------
 
 
+def _normalize_ws(text: str) -> str:
+    return _WS_RE.sub(" ", (text or "").strip())
+
+
+def _normalize_for_matching(text: str) -> str:
+    return _normalize_ws(text).lower()
+
+
+def _extract_word_tokens(text: str) -> List[str]:
+    return _WORD_RE.findall(_normalize_for_matching(text))
+
+
 def _extract_query_text(example: Dict[str, Any]) -> str:
     candidates = [
         example.get("question"),
@@ -259,6 +282,7 @@ def _extract_query_text(example: Dict[str, Any]) -> str:
 
 def _extract_context_text(example: Dict[str, Any]) -> str:
     candidates = [
+        example.get("dataset_context"),
         example.get("context"),
         example.get("passage"),
         example.get("document"),
@@ -268,6 +292,144 @@ def _extract_context_text(example: Dict[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
+
+
+def _extract_doc_signature(example: Dict[str, Any], *, context_text: str) -> str:
+    existing = example.get("doc_signature")
+    if isinstance(existing, str) and existing.strip():
+        return existing.strip()
+
+    return _sha256_text(
+        f"{example.get('task', '')}||{example.get('source_file', '')}||{context_text}"
+    )
+
+
+def _extract_chunk_index(example: Dict[str, Any]) -> Optional[int]:
+    candidates = [
+        example.get("chunk_index"),
+        example.get("chunk_id_numeric"),
+        example.get("source_record_index"),
+    ]
+    for value in candidates:
+        if value is None:
+            continue
+        try:
+            idx = int(value)
+            if idx >= 0:
+                return idx
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _extract_chunk_id(example: Dict[str, Any]) -> Optional[str]:
+    candidates = [
+        example.get("chunk_id"),
+        example.get("passage_id"),
+        example.get("doc_chunk_id"),
+    ]
+    for value in candidates:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _infer_question_type(example: Dict[str, Any], query_text: str) -> str:
+    task = str(example.get("task") or "").strip().lower()
+    q = _normalize_for_matching(query_text)
+
+    if task == "trec":
+        return "classification"
+
+    if q.startswith(("who ", "what ", "when ", "where ", "why ", "how ")):
+        return "qa"
+
+    if q.startswith(("is ", "are ", "was ", "were ", "do ", "does ", "did ", "can ", "could ")):
+        return "boolean_qa"
+
+    if "classify" in q or "label" in q:
+        return "classification"
+
+    if "summarize" in q or "summary" in q:
+        return "summarization"
+
+    return "unknown"
+
+
+def _build_answer_canonical(example: Dict[str, Any]) -> Optional[str]:
+    """
+    Cheap task-specific answer normalization from reference labels when available.
+
+    This is optional metadata for future storage/reuse logic.
+    """
+    task = str(example.get("task") or "").strip().lower()
+
+    if task == "trec":
+        answers = example.get("answers")
+        if isinstance(answers, list) and answers:
+            first = str(answers[0]).strip().upper()
+            if first in _TREC_LABELS:
+                return first
+
+        target = example.get("target")
+        if isinstance(target, str) and target.strip().upper() in _TREC_LABELS:
+            return target.strip().upper()
+
+    return None
+
+
+def _pick_best_overlap_window(query_text: str, context_text: str, *, window_chars: int = 320) -> str:
+    """
+    Cheap lexical evidence extraction.
+
+    Strategy:
+    - split context into simple lines if possible
+    - score lines/windows by overlap with query tokens
+    - return the best compact snippet
+    - fall back to the first window if no overlap exists
+
+    This stays deterministic and low-cost.
+    """
+    ctx = _normalize_ws(context_text)
+    if not ctx:
+        return ""
+
+    q_tokens = set(_extract_word_tokens(query_text))
+    if not q_tokens:
+        return ctx[:window_chars].strip()
+
+    raw_lines = [line.strip() for line in context_text.splitlines() if line.strip()]
+    if len(raw_lines) >= 2:
+        best_line = ""
+        best_score = -1
+        for line in raw_lines:
+            ltoks = set(_extract_word_tokens(line))
+            score = len(q_tokens & ltoks)
+            if score > best_score:
+                best_score = score
+                best_line = line
+        best_line = _normalize_ws(best_line)
+        if best_score > 0 and best_line:
+            return best_line[:window_chars].strip()
+
+    best_start = 0
+    best_score = -1
+    stride = max(64, window_chars // 2)
+    for start in range(0, len(ctx), stride):
+        window = ctx[start:start + window_chars]
+        if not window:
+            continue
+        wtoks = set(_extract_word_tokens(window))
+        score = len(q_tokens & wtoks)
+        if score > best_score:
+            best_score = score
+            best_start = start
+
+    snippet = ctx[best_start:best_start + window_chars].strip()
+    if snippet:
+        return snippet
+
+    return ctx[:window_chars].strip()
 
 
 def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> MemoryQuery:
@@ -280,9 +442,13 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
             f"example_id={example.get('example_id')}. Keys={sorted(example.keys())}"
         )
 
-    doc_signature = _sha256_text(
-        f"{example.get('task', '')}||{example.get('source_file', '')}||{context_text}"
-    )
+    doc_signature = _extract_doc_signature(example, context_text=context_text)
+    source_file = example.get("source_file")
+    chunk_index = _extract_chunk_index(example)
+    chunk_id = _extract_chunk_id(example)
+    question_type = _infer_question_type(example, query_text)
+    evidence_text = _pick_best_overlap_window(query_text, context_text)
+    answer_canonical = _build_answer_canonical(example)
 
     allow_semantic = bool(cfg.memory.semantic_enabled) and cfg.memory.retrieval_mode in {
         "semantic_context",
@@ -298,12 +464,24 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
         model_id=cfg.model_id,
         prompt_version="longbench_v1",
         allow_semantic=allow_semantic,
+        doc_signature=doc_signature,
+        source_file=source_file,
+        chunk_index=chunk_index,
+        chunk_id=chunk_id,
+        question_type=question_type,
+        evidence_text=evidence_text or None,
+        answer_canonical=answer_canonical,
         context={
             "dataset_context": context_text,
             "doc_signature": doc_signature,
-            "source_file": example.get("source_file"),
+            "source_file": source_file,
             "task": example.get("task"),
             "example_id": example.get("example_id"),
+            "chunk_index": chunk_index,
+            "chunk_id": chunk_id,
+            "question_type": question_type,
+            "evidence_text": evidence_text or None,
+            "answer_canonical": answer_canonical,
         },
     )
 
@@ -338,7 +516,11 @@ def _init_generator(cfg: BenchmarkConfig) -> HFGenerator:
         device=getattr(cfg, "device", "auto"),
         max_input_length=int(getattr(cfg, "max_input_tokens", 2048)),
         max_new_tokens=int(getattr(cfg, "max_new_tokens", 64)),
-        do_sample=False,
+        decoding_mode=str(getattr(cfg, "decoding_mode", "greedy")),
+        num_beams=int(getattr(cfg, "num_beams", 1)),
+        temperature=float(getattr(cfg, "temperature", 0.2)),
+        top_p=float(getattr(cfg, "top_p", 0.95)),
+        do_sample=bool(getattr(cfg, "do_sample", False)),
         local_files_only=bool(getattr(cfg, "local_files_only", False)),
         torch_dtype=str(getattr(cfg, "dtype", "auto")),
     )
@@ -430,6 +612,11 @@ def _build_ok_record(
             "device": None,
             "dtype": None,
             "generation_backend": None,
+            "decoding_mode": None,
+            "num_beams": None,
+            "do_sample": None,
+            "temperature": None,
+            "top_p": None,
             "input_tokens": None,
             "output_tokens": None,
             "truncated": None,
@@ -443,6 +630,11 @@ def _build_ok_record(
             "retrieved_match_type": None,
             "retrieved_source_tier": None,
             "retrieved_score": None,
+            "retrieved_doc_signature_match": None,
+            "retrieved_evidence_chars": None,
+            "reduced_context_used": None,
+            "full_context_chars": None,
+            "final_context_chars": None,
         }
 
     semantic_debug = _extract_semantic_debug(meta)
@@ -478,6 +670,22 @@ def _build_ok_record(
         "promoted_to_ram": bool(meta.get("promoted_to_ram", False)),
         "stored": meta.get("stored"),
         "stored_scopes": meta.get("stored_scopes", []),
+
+        # evidence-guided metadata
+        "doc_signature": example.get("doc_signature") or meta.get("doc_signature"),
+        "query_question_type": meta.get("question_type") or example.get("question_type"),
+        "query_chunk_index": meta.get("chunk_index"),
+        "query_chunk_id": meta.get("chunk_id"),
+        "query_evidence_chars": (
+            len(str(meta.get("query_evidence_text", "")))
+            if meta.get("query_evidence_text") is not None
+            else None
+        ),
+        "stored_evidence_chars": (
+            len(str(meta.get("stored_evidence_text", "")))
+            if meta.get("stored_evidence_text") is not None
+            else None
+        ),
 
         # semantic retrieval metadata
         "semantic_used": bool(meta.get("semantic_used", False)),
@@ -517,6 +725,11 @@ def _build_ok_record(
         "device": gen_meta.get("device"),
         "dtype": gen_meta.get("dtype"),
         "generation_backend": gen_meta.get("generation_backend"),
+        "decoding_mode": gen_meta.get("decoding_mode"),
+        "num_beams": gen_meta.get("num_beams"),
+        "do_sample": gen_meta.get("do_sample"),
+        "temperature": gen_meta.get("temperature"),
+        "top_p": gen_meta.get("top_p"),
         "input_tokens": gen_meta.get("input_tokens"),
         "output_tokens": gen_meta.get("output_tokens"),
         "truncated": gen_meta.get("truncated"),
@@ -530,6 +743,11 @@ def _build_ok_record(
         "retrieved_match_type": gen_meta.get("retrieved_match_type"),
         "retrieved_source_tier": gen_meta.get("retrieved_source_tier"),
         "retrieved_score": gen_meta.get("retrieved_score"),
+        "retrieved_doc_signature_match": gen_meta.get("retrieved_doc_signature_match"),
+        "retrieved_evidence_chars": gen_meta.get("retrieved_evidence_chars"),
+        "reduced_context_used": gen_meta.get("reduced_context_used"),
+        "full_context_chars": gen_meta.get("full_context_chars"),
+        "final_context_chars": gen_meta.get("final_context_chars"),
 
         # answer + quality
         "answer": answer,
@@ -550,6 +768,8 @@ def _build_ok_record(
         # live store stats
         "ram_stats_after": _ram_stats(ram),
         "disk_stats_after": _disk_stats(disk),
+
+        "store_skipped": meta.get("store_skipped"),
     }
 
 
@@ -630,7 +850,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
     workload = prepare_workload(cfg)
     workload_manifest = build_workload_manifest(cfg, workload)
 
-    # Initialize memarch runtime
     ram = _init_ram_store(cfg)
     disk = DiskStoreSQLite(cfg.resolved_disk_store_path())
     embedder = _init_embedder(cfg)
@@ -705,6 +924,13 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                 meta = dict(meta or {})
                 timings_ms = dict(meta.get("timings_ms") or {})
                 gen_meta_after = dict(getattr(generator, "last_generation_meta", {}) or {})
+
+                meta.setdefault("doc_signature", mq.doc_signature)
+                meta.setdefault("source_file", mq.source_file)
+                meta.setdefault("chunk_index", mq.chunk_index)
+                meta.setdefault("chunk_id", mq.chunk_id)
+                meta.setdefault("question_type", mq.question_type)
+                meta.setdefault("query_evidence_text", mq.evidence_text)
 
                 generation_happened = bool(meta.get("generated", False))
                 if not generation_happened:

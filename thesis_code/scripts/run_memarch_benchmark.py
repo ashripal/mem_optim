@@ -22,303 +22,119 @@ from memarch.benchmarks.execute import run_benchmark
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a memarch LongBench benchmark with configurable workload and multi-tier memory settings."
+        description="Run a memarch LongBench benchmark with configurable workload and evidence-guided multi-tier memory settings."
     )
 
-    # Required / core paths
-    parser.add_argument(
-        "--tier2_repo",
-        type=str,
-        required=True,
-        help="Path to the directory containing LongBench task .jsonl files.",
-    )
-    parser.add_argument(
-        "--benchmark_name",
-        type=str,
-        default="memarch_longbench_benchmark",
-        help="Logical name for this benchmark run.",
-    )
-    parser.add_argument(
-        "--out_root",
-        type=str,
-        default="artifacts/benchmark_runs/memarch",
-        help="Root directory for benchmark outputs.",
-    )
+    parser.add_argument("--tier2_repo", type=str, required=True)
+    parser.add_argument("--benchmark_name", type=str, default="memarch_longbench_benchmark")
+    parser.add_argument("--out_root", type=str, default="artifacts/benchmark_runs/memarch")
 
-    # Workload selection / shaping
-    parser.add_argument(
-        "--task_glob",
-        type=str,
-        default="",
-        help="Substring filter for LongBench task filenames. Empty means all tasks.",
-    )
-    parser.add_argument(
-        "--max_examples",
-        type=int,
-        default=25,
-        help="Maximum number of base examples to load before replay expansion.",
-    )
+    parser.add_argument("--task_glob", type=str, default="")
+    parser.add_argument("--max_examples", type=int, default=25)
     parser.add_argument(
         "--mode",
         type=str,
         default="cold",
         choices=["cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"],
-        help="Workload mode controlling reuse behavior.",
     )
-    parser.add_argument(
-        "--replay_k",
-        type=int,
-        default=2,
-        help="Total number of passes when mode=replay_k.",
-    )
-    parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        help="Shuffle the base example list before workload expansion.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed used when --shuffle is enabled.",
-    )
+    parser.add_argument("--replay_k", type=int, default=2)
+    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--total_requests", type=int, default=None)
+    parser.add_argument("--repeat_fraction", type=float, default=0.0)
 
-    # Model / generation knobs
+    parser.add_argument("--model_id", type=str, default="microsoft/Phi-3-mini-128k-instruct")
+    parser.add_argument("--max_input_tokens", type=int, default=8192)
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+
+    # Greedy rollback defaults
     parser.add_argument(
-        "--model_id",
+        "--decoding_mode",
         type=str,
-        default="microsoft/Phi-3-mini-128k-instruct",
-        help="Hugging Face model id for generation.",
+        default="greedy",
+        choices=["greedy", "beam"],
+        help="Generation decoding mode.",
     )
     parser.add_argument(
-        "--max_input_tokens",
+        "--num_beams",
         type=int,
-        default=8192,
-        help="Maximum input tokens sent to the model.",
+        default=1,
+        help="Beam count. Keep this at 1 for greedy decoding.",
     )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=64,
-        help="Maximum new tokens to generate.",
-    )
-    parser.add_argument(
-        "--device",
-        type=str,
-        default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
-        help="Generation device preference.",
-    )
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--do_sample", action="store_true")
+
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
     parser.add_argument(
         "--dtype",
         type=str,
         default="auto",
         choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
-        help="Generation dtype policy.",
     )
-    parser.add_argument(
-        "--local_files_only",
-        action="store_true",
-        help="Load generator model only from local files.",
-    )
-    parser.add_argument(
-        "--cpu_fallback_on_long",
-        action="store_true",
-        help="Enable CPU fallback when long inputs exceed device constraints.",
-    )
-    parser.add_argument(
-        "--jetson_safe_mode",
-        action="store_true",
-        help="Clamp input length to a Jetson-safe budget for embedded testing.",
-    )
+    parser.add_argument("--local_files_only", action="store_true")
+    parser.add_argument("--cpu_fallback_on_long", action="store_true")
+    parser.add_argument("--jetson_safe_mode", action="store_true")
 
-    # Namespace / identity knobs
-    parser.add_argument(
-        "--user_id",
-        type=str,
-        default="user_a",
-        help="User namespace id for memarch retrieval/storage.",
-    )
-    parser.add_argument(
-        "--session_id",
-        type=str,
-        default="session_a",
-        help="Session namespace id for memarch retrieval/storage.",
-    )
-    parser.add_argument(
-        "--cohort_id",
-        type=str,
-        default=None,
-        help="Optional cohort namespace id.",
-    )
+    parser.add_argument("--user_id", type=str, default="user_a")
+    parser.add_argument("--session_id", type=str, default="session_a")
+    parser.add_argument("--cohort_id", type=str, default=None)
 
-    # Memory knobs
-    parser.add_argument(
-        "--ram_capacity_items",
-        type=int,
-        default=64,
-        help="RAM memory capacity for memarch.",
-    )
+    parser.add_argument("--ram_capacity_items", type=int, default=64)
     parser.add_argument(
         "--disk_store_path",
         type=str,
         default="artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
-        help="SQLite path for persistent memarch disk store.",
     )
-    parser.add_argument(
-        "--clear_disk_store_before_run",
-        action="store_true",
-        help="Delete the existing persistent memarch disk store before this run to force a cold start.",
-    )
+    parser.add_argument("--clear_disk_store_before_run", action="store_true")
 
-    # Retrieval mode / semantic knobs
     parser.add_argument(
         "--retrieval_mode",
         type=str,
         default="exact_only",
-        choices=["exact_only", "semantic_context", "semantic_bypass"],
-        help="Retrieval mode for the benchmark run.",
+        choices=["exact_only", "semantic_context"],
     )
-    parser.add_argument(
-        "--semantic_enabled",
-        action="store_true",
-        help="Enable semantic retrieval support.",
-    )
-    parser.add_argument(
-        "--semantic_threshold_context",
-        type=float,
-        default=0.85,
-        help="Minimum similarity score required to use a semantic hit as generation context.",
-    )
-    parser.add_argument(
-        "--semantic_threshold_bypass",
-        type=float,
-        default=1.01,
-        help="Minimum similarity score required to bypass generation and return a semantic hit directly.",
-    )
-    parser.add_argument(
-        "--max_semantic_candidates",
-        type=int,
-        default=5,
-        help="Maximum number of semantic candidates to rank after filtering.",
-    )
+    parser.add_argument("--semantic_enabled", action="store_true")
+    parser.add_argument("--semantic_threshold_context", type=float, default=0.85)
+    parser.add_argument("--semantic_threshold_bypass", type=float, default=1.01)
+    parser.add_argument("--max_semantic_candidates", type=int, default=5)
 
-    # Embedder knobs
     parser.add_argument(
         "--embedding_model_id",
         type=str,
         default="sentence-transformers/all-MiniLM-L6-v2",
-        help="Embedding model id used for semantic retrieval.",
     )
-    parser.add_argument(
-        "--embedding_device",
-        type=str,
-        default="auto",
-        choices=["auto", "cpu", "cuda", "mps"],
-        help="Device used for embedding generation.",
-    )
-    parser.add_argument(
-        "--embedding_local_files_only",
-        action="store_true",
-        help="Load embedding model only from local files.",
-    )
+    parser.add_argument("--embedding_device", type=str, default="auto", choices=["auto", "cpu", "cuda", "mps"])
+    parser.add_argument("--embedding_local_files_only", action="store_true")
 
-    parser.add_argument(
-        "--promote_disk_hits_to_ram",
-        action="store_true",
-        default=True,
-        help="Promote disk hits into RAM after retrieval.",
-    )
-    parser.add_argument(
-        "--no_promote_disk_hits_to_ram",
-        action="store_true",
-        help="Disable promotion of disk hits into RAM.",
-    )
-    parser.add_argument(
-        "--return_memory_directly",
-        action="store_true",
-        default=True,
-        help="Return reusable memory hits directly when policy allows.",
-    )
-    parser.add_argument(
-        "--no_return_memory_directly",
-        action="store_true",
-        help="Disable direct return of memory hits.",
-    )
-    parser.add_argument(
-        "--enable_storage",
-        action="store_true",
-        default=True,
-        help="Enable storing generated outputs into memory.",
-    )
-    parser.add_argument(
-        "--no_enable_storage",
-        action="store_true",
-        help="Disable storing generated outputs into memory.",
-    )
-    parser.add_argument(
-        "--store_in_ram",
-        action="store_true",
-        default=True,
-        help="Store admitted entries in RAM.",
-    )
-    parser.add_argument(
-        "--no_store_in_ram",
-        action="store_true",
-        help="Disable RAM storage.",
-    )
-    parser.add_argument(
-        "--store_on_disk",
-        action="store_true",
-        default=True,
-        help="Store admitted entries on disk.",
-    )
-    parser.add_argument(
-        "--no_store_on_disk",
-        action="store_true",
-        help="Disable disk storage.",
-    )
+    parser.add_argument("--promote_disk_hits_to_ram", action="store_true", default=True)
+    parser.add_argument("--no_promote_disk_hits_to_ram", action="store_true")
+    parser.add_argument("--return_memory_directly", action="store_true", default=True)
+    parser.add_argument("--no_return_memory_directly", action="store_true")
+    parser.add_argument("--enable_storage", action="store_true", default=True)
+    parser.add_argument("--no_enable_storage", action="store_true")
+    parser.add_argument("--store_in_ram", action="store_true", default=True)
+    parser.add_argument("--no_store_in_ram", action="store_true")
+    parser.add_argument("--store_on_disk", action="store_true", default=True)
+    parser.add_argument("--no_store_on_disk", action="store_true")
 
-    # Output behavior
-    parser.add_argument(
-        "--write_workload_manifest",
-        action="store_true",
-        default=True,
-        help="Write a workload manifest JSON next to the run JSONL.",
-    )
-    parser.add_argument(
-        "--no_write_workload_manifest",
-        action="store_true",
-        help="Disable workload manifest writing.",
-    )
-    parser.add_argument(
-        "--write_summary_json",
-        action="store_true",
-        help="Also write a summary JSON after the run completes.",
-    )
+    parser.add_argument("--write_workload_manifest", action="store_true", default=True)
+    parser.add_argument("--no_write_workload_manifest", action="store_true")
+    parser.add_argument("--write_summary_json", action="store_true")
 
-    # Provenance
-    parser.add_argument(
-        "--notes",
-        type=str,
-        default="",
-        help="Optional freeform notes stored in the run config.",
-    )
-
-    parser.add_argument(
-        "--total_requests",
-        type=int,
-        default=None,
-        help="Total number of workload requests when mode=mixed_reuse.",
-    )
-    parser.add_argument(
-        "--repeat_fraction",
-        type=float,
-        default=0.0,
-        help="Fraction of requests that should be repeats when mode=mixed_reuse.",
-    )
+    parser.add_argument("--notes", type=str, default="")
 
     return parser
+
+
+def _normalize_dtype(dtype: str) -> str:
+    d = (dtype or "auto").lower().strip()
+    mapping = {
+        "fp16": "float16",
+        "bf16": "bfloat16",
+        "fp32": "float32",
+    }
+    return mapping.get(d, d)
 
 
 def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
@@ -332,6 +148,13 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
     max_input_tokens = int(args.max_input_tokens)
     if args.jetson_safe_mode:
         max_input_tokens = min(max_input_tokens, 2048)
+
+    retrieval_mode = str(args.retrieval_mode).strip()
+    semantic_enabled = retrieval_mode == "semantic_context" or bool(args.semantic_enabled)
+
+    semantic_threshold_bypass = 1.01
+    if retrieval_mode == "exact_only":
+        semantic_enabled = False
 
     workload = WorkloadConfig(
         task_glob=args.task_glob,
@@ -360,10 +183,10 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         ram_capacity_items=args.ram_capacity_items,
         disk_store_path=args.disk_store_path,
         clear_disk_store_before_run=args.clear_disk_store_before_run,
-        retrieval_mode=args.retrieval_mode,
-        semantic_enabled=args.semantic_enabled,
+        retrieval_mode=retrieval_mode,
+        semantic_enabled=semantic_enabled,
         semantic_threshold_context=args.semantic_threshold_context,
-        semantic_threshold_bypass=args.semantic_threshold_bypass,
+        semantic_threshold_bypass=semantic_threshold_bypass,
         max_semantic_candidates=args.max_semantic_candidates,
         embedding_model_id=args.embedding_model_id,
         embedding_device=args.embedding_device,
@@ -383,8 +206,13 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         model_id=args.model_id,
         max_input_tokens=max_input_tokens,
         max_new_tokens=args.max_new_tokens,
+        decoding_mode=args.decoding_mode,
+        num_beams=args.num_beams,
+        temperature=args.temperature,
+        top_p=args.top_p,
+        do_sample=bool(args.do_sample),
         device=args.device,
-        dtype=args.dtype,
+        dtype=_normalize_dtype(args.dtype),
         local_files_only=args.local_files_only,
         cpu_fallback_on_long=args.cpu_fallback_on_long,
         workload=workload,

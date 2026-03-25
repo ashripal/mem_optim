@@ -21,6 +21,8 @@ Notes:
 - This is not designed for multi-process concurrent writers. Single-process usage is assumed.
 - SQLite WAL mode is enabled for better write performance.
 - Semantic retrieval fields are stored as part of the serialized MemoryItem payload.
+- Evidence-guided fields are also stored explicitly so disk-restored items behave
+  the same as RAM-resident items.
 """
 
 from __future__ import annotations
@@ -40,7 +42,7 @@ from memarch.memory.schema import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _dt_to_str(dt: Optional[datetime]) -> Optional[str]:
@@ -95,6 +97,16 @@ def _serialize_item(item: MemoryItem) -> str:
             "last_access_utc": _dt_to_str(item.stats.last_access_utc),
         },
         "meta": item.meta,
+
+        # Evidence-guided fields
+        "evidence_text": item.evidence_text,
+        "doc_signature": item.doc_signature,
+        "source_file": item.source_file,
+        "chunk_index": item.chunk_index,
+        "chunk_id": item.chunk_id,
+        "question_type": item.question_type,
+        "answer_canonical": item.answer_canonical,
+
         # Semantic retrieval fields
         "query_embedding": item.query_embedding,
         "embedding_model_id": item.embedding_model_id,
@@ -107,9 +119,9 @@ def _deserialize_item(payload: str) -> MemoryItem:
     d = json.loads(payload)
     sv = int(d.get("schema_version", 1))
 
-    if sv not in (1, 2):
+    if sv not in (1, 2, 3):
         raise ValueError(
-            f"Unsupported schema_version: {sv} (expected one of 1, 2)"
+            f"Unsupported schema_version: {sv} (expected one of 1, 2, 3)"
         )
 
     prov_d = d["provenance"]
@@ -144,6 +156,10 @@ def _deserialize_item(payload: str) -> MemoryItem:
     if embedding_norm is not None:
         embedding_norm = float(embedding_norm)
 
+    chunk_index = d.get("chunk_index")
+    if chunk_index is not None:
+        chunk_index = int(chunk_index)
+
     item = MemoryItem(
         key=d["key"],
         scope=Scope(d["scope"]),
@@ -158,6 +174,17 @@ def _deserialize_item(payload: str) -> MemoryItem:
         expires_at_utc=_dt_from_str(d.get("expires_at_utc")),
         stats=stats,
         meta=dict(d.get("meta") or {}),
+
+        # Evidence-guided fields
+        evidence_text=d.get("evidence_text"),
+        doc_signature=d.get("doc_signature"),
+        source_file=d.get("source_file"),
+        chunk_index=chunk_index,
+        chunk_id=d.get("chunk_id"),
+        question_type=d.get("question_type"),
+        answer_canonical=d.get("answer_canonical"),
+
+        # Semantic retrieval fields
         query_embedding=query_embedding,
         embedding_model_id=embedding_model_id,
         embedding_norm=embedding_norm,

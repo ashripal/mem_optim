@@ -14,8 +14,15 @@ Phase 1 behavior:
     Tier 1: RAM (RamStoreLRU)
     Tier 2: DISK (DiskStoreSQLite)
 - On DISK exact hit, promote to RAM
-- On semantic hit in Phase 1, use as context for generation by default
+- On semantic hit, use as context for generation by default
 - On miss, call generator, then store according to admission policy
+
+Evidence-guided extension:
+- Store grounded evidence with each memory item
+- Prefer same-document semantic matches before broader matches
+- Keep semantic retrieval context-only (no semantic direct bypass)
+- Pass retrieved evidence forward for reduced-context prompting
+- Normalize task-specific outputs before admission/storage when safe
 
 Design principles:
 - Single entry point for memory decisions
@@ -26,6 +33,7 @@ Design principles:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -45,10 +53,12 @@ from memarch.memory.policy import (
     accept_item,
     budget_from_query,
     default_retrieval_policy,
+    document_relation,
     make_hit_debug,
     score_exact_hit,
     semantic_candidate_allowed,
     semantic_decision,
+    same_document,
 )
 from memarch.memory.schema import (
     MatchType,
@@ -85,7 +95,7 @@ class Generator(Protocol):
 
     Phase 1:
     - exact hit may return directly
-    - semantic hit is typically passed into generator as retrieved context
+    - semantic hit is passed into generator as retrieved context
     """
     def generate(
         self,
@@ -108,7 +118,7 @@ class MemoryManagerConfig:
     promote_disk_hits_to_ram: bool = True
 
     # If True, return exact hits directly.
-    # Semantic hits may still be routed through generator depending on policy.
+    # Semantic hits remain context-only in the evidence-guided design.
     return_memory_directly: bool = True
 
     # Semantic components
@@ -121,6 +131,8 @@ class MemoryManagerConfig:
 # -------------------------
 
 class MemoryManager:
+    _TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
+
     def __init__(
         self,
         *,
@@ -133,6 +145,237 @@ class MemoryManager:
         self._cfg = cfg or MemoryManagerConfig()
         self._embedder = self._cfg.embedder
         self._embed_index = self._cfg.embed_index or EmbedIndexLRU(max_entries=10_000)
+
+    # -------------------------
+    # Small helpers
+    # -------------------------
+
+    def _query_doc_signature(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "doc_signature", None) is not None:
+            return mq.doc_signature
+        value = (mq.context or {}).get("doc_signature")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _query_source_file(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "source_file", None) is not None:
+            return mq.source_file
+        value = (mq.context or {}).get("source_file")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _query_evidence_text(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "evidence_text", None) is not None:
+            text = str(mq.evidence_text).strip()
+            return text or None
+        value = (mq.context or {}).get("evidence_text")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _query_chunk_index(self, mq: MemoryQuery) -> Optional[int]:
+        if getattr(mq, "chunk_index", None) is not None:
+            return mq.chunk_index
+        value = (mq.context or {}).get("chunk_index")
+        if value is None:
+            return None
+        try:
+            idx = int(value)
+            return idx if idx >= 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def _query_chunk_id(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "chunk_id", None) is not None:
+            text = str(mq.chunk_id).strip()
+            return text or None
+        value = (mq.context or {}).get("chunk_id")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _query_question_type(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "question_type", None) is not None:
+            text = str(mq.question_type).strip()
+            return text or None
+        value = (mq.context or {}).get("question_type")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _query_answer_canonical(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "answer_canonical", None) is not None:
+            text = str(mq.answer_canonical).strip()
+            return text or None
+        value = (mq.context or {}).get("answer_canonical")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _merged_store_meta(
+        self,
+        mq: MemoryQuery,
+        *,
+        answer_text: str,
+        incoming_meta: Optional[Dict[str, Any]] = None,
+        raw_generated_answer: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Merge caller-provided metadata with stable evidence/source fields.
+
+        We keep these in meta for backward compatibility, even though the
+        primary fields are now also stored explicitly on MemoryItem.
+        """
+        meta = dict(incoming_meta or {})
+        meta.setdefault("task", mq.task)
+        meta.setdefault("doc_signature", self._query_doc_signature(mq))
+        meta.setdefault("source_file", self._query_source_file(mq))
+        meta.setdefault("chunk_index", self._query_chunk_index(mq))
+        meta.setdefault("chunk_id", self._query_chunk_id(mq))
+        meta.setdefault("question_type", self._query_question_type(mq))
+        meta.setdefault("evidence_text", self._query_evidence_text(mq))
+        meta.setdefault("answer_canonical", self._query_answer_canonical(mq))
+        meta.setdefault("answer_length_chars", len(answer_text or ""))
+        if raw_generated_answer is not None:
+            meta.setdefault("raw_generated_answer", raw_generated_answer)
+        return meta
+
+    def _hit_debug_summary(self, hit: Optional[MemoryHit]) -> Optional[Dict[str, Any]]:
+        if hit is None:
+            return None
+        item = hit.item
+        evidence_text = getattr(item, "evidence_text", None) or item.meta.get("evidence_text")
+        return {
+            "source_tier": hit.source_tier.value,
+            "match_type": hit.match_type.value,
+            "score": hit.score,
+            "semantic_rank": hit.semantic_rank,
+            "doc_signature": getattr(item, "doc_signature", None) or item.meta.get("doc_signature"),
+            "source_file": getattr(item, "source_file", None) or item.meta.get("source_file"),
+            "chunk_index": (
+                item.chunk_index if getattr(item, "chunk_index", None) is not None
+                else item.meta.get("chunk_index")
+            ),
+            "chunk_id": getattr(item, "chunk_id", None) or item.meta.get("chunk_id"),
+            "question_type": getattr(item, "question_type", None) or item.meta.get("question_type"),
+            "evidence_text": evidence_text,
+            "evidence_chars": len(str(evidence_text)) if evidence_text is not None else None,
+            "same_document": bool(hit.debug.get("same_document", False)) if isinstance(hit.debug, dict) else None,
+            "document_relation": (
+                hit.debug.get("document_relation") if isinstance(hit.debug, dict) else None
+            ),
+        }
+
+    def _normalize_answer_for_storage(self, mq: MemoryQuery, answer_text: str) -> str:
+        """
+        Normalize generated output before admission/storage.
+
+        The main goal is to convert instruction-model TREC continuations like:
+          - "Type: Location"
+          - "OUTPUT: Invention"
+          - "Reason"
+        into valid coarse labels:
+          LOC / ENTY / DESC / ...
+
+        If normalization is not confident, return the original answer unchanged.
+        """
+        text = str(answer_text or "").strip()
+        if not text:
+            return text
+
+        task = str(getattr(mq, "task", "") or "").strip().lower()
+        question_type = str(self._query_question_type(mq) or "").strip().lower()
+
+        if task == "trec" or question_type == "classification":
+            norm = self._normalize_trec_label(text)
+            if norm is not None:
+                return norm
+
+        return text
+
+    def _normalize_trec_label(self, text: str) -> Optional[str]:
+        raw = str(text or "").strip()
+        if not raw:
+            return None
+
+        upper_raw = raw.upper().strip()
+        if upper_raw in self._TREC_LABELS:
+            return upper_raw
+
+        cleaned = upper_raw.replace("\r", "\n")
+        cleaned = re.sub(r"[`*_>#\[\]\(\)\{\}]", " ", cleaned)
+        cleaned = cleaned.replace("-", " ")
+        cleaned = cleaned.replace(":", " ")
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        tokens = cleaned.split()
+        for tok in tokens:
+            if tok in self._TREC_LABELS:
+                return tok
+
+        phrase = cleaned
+
+        # Strong label/synonym cues
+        if any(x in phrase for x in ("ABBREVIATION", "ABBREVIATED", "ACRONYM", "SHORT FORM", "EXPRESSION ABBREVIATED")):
+            return "ABBR"
+
+        if any(x in phrase for x in ("DATE", "TIME", "YEAR", "AGE", "NUMBER", "COUNT", "QUANTITY", "PERCENT", "MONEY", "PRICE", "DISTANCE")):
+            return "NUM"
+
+        if any(x in phrase for x in ("LOCATION", "PLACE", "CITY", "COUNTRY", "STATE", "OTHER LOCATION")):
+            return "LOC"
+
+        if any(x in phrase for x in ("HUMAN", "PERSON", "INDIVIDUAL", "WHO ")) or phrase.startswith("WHO"):
+            return "HUM"
+
+        if any(
+            x in phrase
+            for x in (
+                "DESCRIPTION",
+                "DEFINITION",
+                "EXPLANATION",
+                "REASON",
+                "MANNER",
+                "DESC",
+                "DESCRIPTION OF SOMETHING",
+            )
+        ):
+            return "DESC"
+
+        if any(
+            x in phrase
+            for x in (
+                "ENTITY",
+                "OBJECT",
+                "ANIMAL",
+                "COLOR",
+                "FOOD",
+                "INSTRUMENT",
+                "LANGUAGE",
+                "LETTER",
+                "RELIGION",
+                "SPORT",
+                "SUBSTANCE",
+                "SYMBOL",
+                "TECHNIQUE",
+                "TERM",
+                "VEHICLE",
+                "WORD",
+                "INVENTION",
+                "OTHER ENTITY",
+            )
+        ):
+            return "ENTY"
+
+        return None
 
     # -------------------------
     # Exact retrieval
@@ -182,7 +425,6 @@ class MemoryManager:
                 "disk_hit": False,
             }
 
-            # 1) RAM exact
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
                 ns_dbg["ram_checked"] = True
@@ -213,6 +455,8 @@ class MemoryManager:
                                     "ram_reads": ram_reads,
                                     "disk_reads": disk_reads,
                                     "namespaces_checked": hit_namespaces_checked,
+                                    "same_document": same_document(mq, item),
+                                    "document_relation": document_relation(mq, item),
                                 },
                             ),
                         ), {
@@ -222,7 +466,6 @@ class MemoryManager:
                             "promoted_to_ram": False,
                         }
 
-            # 2) DISK exact
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
                 ns_dbg["disk_checked"] = True
@@ -254,6 +497,8 @@ class MemoryManager:
                                     "ram_reads": ram_reads,
                                     "disk_reads": disk_reads,
                                     "namespaces_checked": hit_namespaces_checked,
+                                    "same_document": same_document(mq, item),
+                                    "document_relation": document_relation(mq, item),
                                 },
                             ),
                         )
@@ -324,9 +569,10 @@ class MemoryManager:
                 "semantic_disk_scanned": False,
                 "semantic_ram_candidates": 0,
                 "semantic_disk_candidates": 0,
+                "semantic_same_document_candidates": 0,
+                "semantic_broader_candidates": 0,
             }
 
-            # RAM semantic scan
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
                 ns_dbg["semantic_ram_scanned"] = True
@@ -342,6 +588,11 @@ class MemoryManager:
                         continue
 
                     ns_dbg["semantic_ram_candidates"] += 1
+                    if bool(dbg.get("same_document", False)):
+                        ns_dbg["semantic_same_document_candidates"] += 1
+                    else:
+                        ns_dbg["semantic_broader_candidates"] += 1
+
                     candidates.append(
                         SemanticCandidate(
                             payload=(SourceTier.RAM, scope, ns, item, dbg),
@@ -349,7 +600,6 @@ class MemoryManager:
                         )
                     )
 
-            # DISK semantic scan
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
                 ns_dbg["semantic_disk_scanned"] = True
@@ -365,6 +615,11 @@ class MemoryManager:
                         continue
 
                     ns_dbg["semantic_disk_candidates"] += 1
+                    if bool(dbg.get("same_document", False)):
+                        ns_dbg["semantic_same_document_candidates"] += 1
+                    else:
+                        ns_dbg["semantic_broader_candidates"] += 1
+
                     candidates.append(
                         SemanticCandidate(
                             payload=(SourceTier.DISK, scope, ns, item, dbg),
@@ -379,7 +634,78 @@ class MemoryManager:
             "disk_reads": disk_reads,
             "namespaces_checked": namespaces_checked,
             "candidate_count": len(candidates),
+            "same_document_candidate_count": sum(
+                1 for c in candidates if bool(c.payload[4].get("same_document", False))
+            ),
+            "broader_candidate_count": sum(
+                1 for c in candidates if not bool(c.payload[4].get("same_document", False))
+            ),
         }
+
+    def _rank_semantic_candidates(
+        self,
+        *,
+        query_vec: List[float],
+        candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]],
+        policy: RetrievalPolicy,
+    ) -> Tuple[
+        List[Tuple[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]], float, int]],
+        Dict[str, Any],
+    ]:
+        """
+        Rank semantic candidates while preferring same-document items first.
+
+        Strategy:
+        - split candidates into same-document vs broader groups
+        - score same-document group first
+        - only fall back to broader group when no same-document candidate survives threshold
+        """
+        same_doc_candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
+        broader_candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
+
+        for cand in candidates:
+            filter_dbg = cand.payload[4]
+            if bool(filter_dbg.get("same_document", False)):
+                same_doc_candidates.append(cand)
+            else:
+                broader_candidates.append(cand)
+
+        dbg: Dict[str, Any] = {
+            "prefer_same_document": bool(policy.prefer_same_document_for_semantic),
+            "same_document_pool_size": len(same_doc_candidates),
+            "broader_pool_size": len(broader_candidates),
+        }
+
+        if policy.prefer_same_document_for_semantic and same_doc_candidates:
+            ranked_same = self._embed_index.search_candidates(
+                query_vector=query_vec,
+                candidates=same_doc_candidates,
+                top_k=policy.max_semantic_candidates,
+                min_score=policy.semantic_threshold_context,
+            )
+            if ranked_same:
+                dbg["selected_pool"] = "same_document"
+                dbg["selected_pool_size"] = len(same_doc_candidates)
+                return ranked_same, dbg
+
+        ranked_broader = self._embed_index.search_candidates(
+            query_vector=query_vec,
+            candidates=broader_candidates if policy.prefer_same_document_for_semantic else candidates,
+            top_k=policy.max_semantic_candidates,
+            min_score=policy.semantic_threshold_context,
+        )
+        if ranked_broader:
+            dbg["selected_pool"] = (
+                "broader" if policy.prefer_same_document_for_semantic else "combined"
+            )
+            dbg["selected_pool_size"] = (
+                len(broader_candidates) if policy.prefer_same_document_for_semantic else len(candidates)
+            )
+            return ranked_broader, dbg
+
+        dbg["selected_pool"] = None
+        dbg["selected_pool_size"] = 0
+        return [], dbg
 
     def _retrieve_semantic(
         self,
@@ -391,10 +717,10 @@ class MemoryManager:
         """
         Attempt semantic retrieval after exact retrieval fails.
 
-        Phase 1 behavior:
+        Evidence-guided behavior:
         - only enabled if query + policy allow it
-        - usually used for generator context assistance
-        - direct bypass only if policy explicitly allows it
+        - semantic hits are used for generator context assistance
+        - direct semantic bypass is disabled
         """
         pol = self._cfg.retrieval_policy
         budget = budget_from_query(mq)
@@ -422,17 +748,17 @@ class MemoryManager:
                 **scan_dbg,
             }
 
-        ranked = self._embed_index.search_candidates(
-            query_vector=query_vec,
+        ranked, rank_dbg = self._rank_semantic_candidates(
+            query_vec=list(query_vec),
             candidates=candidates,
-            top_k=pol.max_semantic_candidates,
-            min_score=pol.semantic_threshold_context,
+            policy=pol,
         )
         if not ranked:
             return None, {
                 "semantic_enabled": True,
                 "reason": "below_threshold",
                 **scan_dbg,
+                **rank_dbg,
             }
 
         payload, score, rank = ranked[0]
@@ -451,9 +777,10 @@ class MemoryManager:
                 "top_score": float(score),
                 "top_rank": rank,
                 **scan_dbg,
+                **rank_dbg,
             }
 
-        bypass_allowed = decision == "bypass"
+        bypass_allowed = False
         promoted = False
 
         hit = MemoryHit(
@@ -471,15 +798,17 @@ class MemoryManager:
                 extra={
                     "semantic_candidate_rank": rank,
                     "semantic_score": float(score),
-                    "semantic_bypassed": bypass_allowed,
+                    "semantic_bypassed": False,
+                    "same_document": bool(filter_dbg.get("same_document", False)),
+                    "document_relation": filter_dbg.get("document_relation"),
                     "filter_debug": filter_dbg,
                     **decision_dbg,
                     **scan_dbg,
+                    **rank_dbg,
                 },
             ),
         )
 
-        # Promote semantic disk hit to RAM as a best-effort cache warmup.
         if source_tier == SourceTier.DISK and self._cfg.promote_disk_hits_to_ram:
             try:
                 self._ram.put(ns, item.key, item)
@@ -493,7 +822,10 @@ class MemoryManager:
             "top_score": float(score),
             "top_rank": rank,
             "promoted_to_ram": promoted,
+            "same_document": bool(filter_dbg.get("same_document", False)),
+            "document_relation": filter_dbg.get("document_relation"),
             **scan_dbg,
+            **rank_dbg,
         }
 
     # -------------------------
@@ -600,15 +932,18 @@ class MemoryManager:
           debug dict describing what was stored (or why not).
         """
         ap = self._cfg.admission_policy
-        meta = dict(meta or {})
         q_can = canonicalize(mq.raw_query)
         ctx_sig = context_signature(mq.context)
         now = datetime.now(timezone.utc)
 
-        # Semantic metadata for safer filtering later
-        meta.setdefault("task", mq.task)
-        if "doc_signature" in mq.context:
-            meta.setdefault("doc_signature", mq.context.get("doc_signature"))
+        normalized_answer_text = self._normalize_answer_for_storage(mq, answer_text)
+
+        merged_meta = self._merged_store_meta(
+            mq,
+            answer_text=normalized_answer_text,
+            incoming_meta=meta,
+            raw_generated_answer=answer_text,
+        )
 
         query_embedding, embedding_model_id, embedding_norm = self._make_embedding_fields(mq)
 
@@ -626,9 +961,22 @@ class MemoryManager:
                 stored["skipped"].append({"scope": scope.value, "reason": "missing_namespace"})
                 continue
 
-            ok, dbg = should_store(mq, answer_text, quality, scope=scope, policy=ap)
+            ok, dbg = should_store(
+                mq,
+                normalized_answer_text,
+                quality,
+                scope=scope,
+                policy=ap,
+            )
             if not ok:
-                stored["skipped"].append({"scope": scope.value, **dbg})
+                stored["skipped"].append(
+                    {
+                        "scope": scope.value,
+                        "normalized_answer_text": normalized_answer_text,
+                        "raw_generated_answer": answer_text,
+                        **dbg,
+                    }
+                )
                 continue
 
             ttl_s = choose_ttl_seconds(scope, ap)
@@ -648,12 +996,19 @@ class MemoryManager:
                 namespace=ns,
                 query_canonical=q_can,
                 context_signature=ctx_sig,
-                answer_text=answer_text,
+                answer_text=normalized_answer_text,
                 provenance=provenance,
                 quality=quality,
                 created_at_utc=now,
                 ttl_seconds=ttl_s,
-                meta=meta,
+                meta=merged_meta,
+                evidence_text=self._query_evidence_text(mq),
+                doc_signature=self._query_doc_signature(mq),
+                source_file=self._query_source_file(mq),
+                chunk_index=self._query_chunk_index(mq),
+                chunk_id=self._query_chunk_id(mq),
+                question_type=self._query_question_type(mq),
+                answer_canonical=self._query_answer_canonical(mq),
                 query_embedding=query_embedding,
                 embedding_model_id=embedding_model_id,
                 embedding_norm=embedding_norm,
@@ -694,6 +1049,15 @@ class MemoryManager:
                     "disk": disk_ok,
                     "has_embedding": query_embedding is not None,
                     "embedding_model_id": embedding_model_id,
+                    "doc_signature": item.doc_signature,
+                    "source_file": item.source_file,
+                    "chunk_index": item.chunk_index,
+                    "chunk_id": item.chunk_id,
+                    "question_type": item.question_type,
+                    "evidence_chars": len(item.evidence_text) if item.evidence_text else None,
+                    "answer_canonical": item.answer_canonical,
+                    "stored_answer_text": normalized_answer_text,
+                    "raw_generated_answer": answer_text,
                 }
             )
 
@@ -708,9 +1072,7 @@ class MemoryManager:
         Primary entrypoint used by pipeline:
         - retrieve from memory
         - exact hit may return directly
-        - semantic hit may either:
-            * return directly if policy allows bypass
-            * be passed into generator as context
+        - semantic hit is passed into generator as context
         - miss -> generate and store
         """
         hit, retrieval_dbg = self.retrieve(mq, return_meta=True)
@@ -721,7 +1083,9 @@ class MemoryManager:
             and hit.match_type == MatchType.EXACT
             and self._cfg.return_memory_directly
         ):
-            return hit.item.answer_text, {
+            exact_item = hit.item
+            exact_evidence_text = getattr(exact_item, "evidence_text", None) or exact_item.meta.get("evidence_text")
+            return exact_item.answer_text, {
                 "used_memory": True,
                 "generated": False,
                 "source_tier": hit.source_tier.value,
@@ -737,6 +1101,18 @@ class MemoryManager:
                 "stored_scopes": [],
                 "memory_lookup_ms": memory_lookup_ms,
                 "generation_ms_est": 0.0,
+                "doc_signature": getattr(exact_item, "doc_signature", None) or exact_item.meta.get("doc_signature"),
+                "source_file": getattr(exact_item, "source_file", None) or exact_item.meta.get("source_file"),
+                "chunk_index": (
+                    exact_item.chunk_index
+                    if getattr(exact_item, "chunk_index", None) is not None
+                    else exact_item.meta.get("chunk_index")
+                ),
+                "chunk_id": getattr(exact_item, "chunk_id", None) or exact_item.meta.get("chunk_id"),
+                "question_type": getattr(exact_item, "question_type", None) or exact_item.meta.get("question_type"),
+                "stored_evidence_text": exact_evidence_text,
+                "stored_evidence_chars": len(str(exact_evidence_text)) if exact_evidence_text is not None else None,
+                "query_evidence_text": self._query_evidence_text(mq),
                 "timings_ms": {
                     "memory_lookup_ms": memory_lookup_ms,
                     "generation_ms_est": 0.0,
@@ -744,39 +1120,6 @@ class MemoryManager:
                 },
             }
 
-        if (
-            hit is not None
-            and hit.match_type == MatchType.SEMANTIC
-            and self._cfg.return_memory_directly
-            and hit.bypass_allowed
-        ):
-            return hit.item.answer_text, {
-                "used_memory": True,
-                "generated": False,
-                "source_tier": hit.source_tier.value,
-                "match_type": hit.match_type.value,
-                "score": hit.score,
-                "semantic_used": True,
-                "semantic_bypassed": True,
-                "semantic_candidate_rank": hit.semantic_rank,
-                "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
-                "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
-                "hit": dict(hit.debug),
-                "stored": False,
-                "stored_scopes": [],
-                "memory_lookup_ms": memory_lookup_ms,
-                "generation_ms_est": 0.0,
-                "timings_ms": {
-                    "memory_lookup_ms": memory_lookup_ms,
-                    "generation_ms_est": 0.0,
-                    "total_ms": memory_lookup_ms,
-                },
-            }
-
-        # Either:
-        # - no hit
-        # - semantic context hit (Phase 1 default)
-        # - future mode where regeneration despite hit is desired
         retrieved_for_generation = hit if hit is not None and hit.match_type == MatchType.SEMANTIC else None
 
         gen_t0 = time.time()
@@ -785,6 +1128,8 @@ class MemoryManager:
             retrieved=retrieved_for_generation,
         )
         generation_ms_est = (time.time() - gen_t0) * 1000.0
+
+        retrieved_summary = self._hit_debug_summary(retrieved_for_generation)
 
         store_dbg = self.store(
             mq,
@@ -800,10 +1145,38 @@ class MemoryManager:
                     retrieved_for_generation.match_type.value if retrieved_for_generation else None
                 ),
                 "semantic_score": retrieved_for_generation.score if retrieved_for_generation else None,
+                "memory_context_doc_signature": (
+                    retrieved_summary.get("doc_signature") if retrieved_summary else None
+                ),
+                "memory_context_source_file": (
+                    retrieved_summary.get("source_file") if retrieved_summary else None
+                ),
+                "memory_context_chunk_index": (
+                    retrieved_summary.get("chunk_index") if retrieved_summary else None
+                ),
+                "memory_context_chunk_id": (
+                    retrieved_summary.get("chunk_id") if retrieved_summary else None
+                ),
+                "memory_context_question_type": (
+                    retrieved_summary.get("question_type") if retrieved_summary else None
+                ),
+                "memory_context_evidence_text": (
+                    retrieved_summary.get("evidence_text") if retrieved_summary else None
+                ),
+                "memory_context_evidence_chars": (
+                    retrieved_summary.get("evidence_chars") if retrieved_summary else None
+                ),
+                "memory_context_same_document": (
+                    retrieved_summary.get("same_document") if retrieved_summary else None
+                ),
+                "memory_context_document_relation": (
+                    retrieved_summary.get("document_relation") if retrieved_summary else None
+                ),
             },
         )
 
         total_ms = memory_lookup_ms + generation_ms_est
+        normalized_answer_text = self._normalize_answer_for_storage(mq, answer_text)
 
         return answer_text, {
             "used_memory": False,
@@ -827,6 +1200,7 @@ class MemoryManager:
             "stored": len(store_dbg.get("stored", [])) > 0,
             "stored_scopes": [x["scope"] for x in store_dbg.get("stored", [])],
             "store": store_dbg,
+            "store_skipped": store_dbg.get("skipped", []),
             "memory_lookup_ms": memory_lookup_ms,
             "generation_ms_est": generation_ms_est,
             "timings_ms": {
@@ -849,6 +1223,21 @@ class MemoryManager:
                 if "semantic_enabled" in retrieval_dbg
                 else (retrieval_dbg.get("semantic") or {}).get("semantic_enabled")
             ),
+            "doc_signature": self._query_doc_signature(mq),
+            "source_file": self._query_source_file(mq),
+            "chunk_index": self._query_chunk_index(mq),
+            "chunk_id": self._query_chunk_id(mq),
+            "question_type": self._query_question_type(mq),
+            "query_evidence_text": self._query_evidence_text(mq),
+            "query_evidence_chars": (
+                len(str(self._query_evidence_text(mq))) if self._query_evidence_text(mq) is not None else None
+            ),
+            "retrieved_memory": retrieved_summary,
+            "stored_evidence_text": self._query_evidence_text(mq),
+            "stored_evidence_chars": (
+                len(str(self._query_evidence_text(mq))) if self._query_evidence_text(mq) is not None else None
+            ),
+            "normalized_answer_for_storage": normalized_answer_text,
         }
 
     def stats(self) -> Dict[str, Any]:

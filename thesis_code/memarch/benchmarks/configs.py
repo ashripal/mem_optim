@@ -10,12 +10,6 @@ Goals:
     tier2_repo, out_dir, model_id, max_input_tokens, max_new_tokens
 - Add explicit runtime controls needed for Jetson / edge deployment:
     device, dtype, local_files_only
-
-This module does NOT:
-- Parse CLI arguments
-- Load dataset examples
-- Execute benchmarks
-- Create plots or summaries
 """
 
 from __future__ import annotations
@@ -25,20 +19,10 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
-# ---------------------------------------------------------------------
-# Workload configuration
-# ---------------------------------------------------------------------
-
 @dataclass
 class WorkloadConfig:
     """
     Controls how raw LongBench examples are selected and replayed.
-
-    Supported modes:
-      - "cold": each selected example appears once
-      - "replay_once": selected examples are replayed one additional time
-      - "replay_k": selected examples are repeated replay_k total times
-      - "cache_pressure": delayed reuse pattern intended to stress memory tiers
     """
     task_glob: str = ""
     max_examples: Optional[int] = 25
@@ -71,7 +55,7 @@ class WorkloadConfig:
                 "For mode='replay_once', replay_k must remain 2. "
                 "Use mode='replay_k' for other repeat counts."
             )
-        
+
         if self.mode == "mixed_reuse":
             if self.total_requests is None or int(self.total_requests) <= 0:
                 raise ValueError("For mode='mixed_reuse', total_requests must be > 0")
@@ -84,10 +68,6 @@ class WorkloadConfig:
                     "For mode='mixed_reuse', total_requests must be >= max_examples"
                 )
 
-
-# ---------------------------------------------------------------------
-# Output configuration
-# ---------------------------------------------------------------------
 
 @dataclass
 class OutputConfig:
@@ -106,17 +86,10 @@ class OutputConfig:
         return Path(self.root_dir).expanduser().resolve() / workload_mode / benchmark_name
 
 
-# ---------------------------------------------------------------------
-# Namespace / identity configuration
-# ---------------------------------------------------------------------
-
 @dataclass
 class NamespaceConfig:
     """
     Controls identity scoping for memarch retrieval/storage.
-
-    These fields are intentionally simple strings so benchmark scripts can
-    assign stable identities for controlled experiments.
     """
     user_id: str = "user_a"
     session_id: str = "session_a"
@@ -129,51 +102,29 @@ class NamespaceConfig:
             raise ValueError("session_id must be non-empty")
 
 
-# ---------------------------------------------------------------------
-# Memory configuration
-# ---------------------------------------------------------------------
-
 @dataclass
 class MemoryConfig:
     """
     Memarch-specific memory and retrieval controls.
-
-    This config supports explicit benchmark modes for:
-    - exact-only retrieval
-    - semantic retrieval used as generation context
-    - semantic retrieval with direct bypass
     """
     ram_capacity_items: int = 64
-
-    # Disk-backed persistent store for memarch benchmark runs
     disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite"
-
-    # When True, delete any existing persistent disk store before the run starts.
     clear_disk_store_before_run: bool = False
 
-    # Retrieval mode for benchmark comparison
     retrieval_mode: str = "exact_only"
-    # Allowed:
-    #   - "exact_only"
-    #   - "semantic_context"
-    #   - "semantic_bypass"
 
-    # Exact / direct-return behavior
     promote_disk_hits_to_ram: bool = True
     return_memory_directly: bool = True
 
-    # Semantic retrieval controls
     semantic_enabled: bool = False
     semantic_threshold_context: float = 0.85
     semantic_threshold_bypass: float = 1.01
     max_semantic_candidates: int = 5
 
-    # Embedder controls
     embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_device: str = "auto"
     embedding_local_files_only: bool = False
 
-    # Storage / admission toggles
     enable_storage: bool = True
     store_in_ram: bool = True
     store_on_disk: bool = True
@@ -222,58 +173,34 @@ class MemoryConfig:
         return self.retrieval_mode == "semantic_bypass" and self.semantic_enabled
 
 
-# ---------------------------------------------------------------------
-# Full benchmark configuration
-# ---------------------------------------------------------------------
-
 @dataclass
 class BenchmarkConfig:
     """
     Full configuration for one memarch benchmark run.
-
-    Compatibility goal:
-    Keep the most important baseline-style top-level fields available so
-    benchmark orchestration can remain parallel across baseline and memarch.
     """
-
-    # -----------------------------
-    # Provenance / naming
-    # -----------------------------
     benchmark_name: str = "memarch_longbench_benchmark"
     notes: str = ""
 
-    # -----------------------------
-    # Tier 2 (dataset / disk repo)
-    # -----------------------------
     tier2_repo: str = ""
-
-    # -----------------------------
-    # Output
-    # -----------------------------
     out_dir: str = "artifacts/benchmark_runs/memarch"
 
-    # -----------------------------
-    # Model
-    # -----------------------------
     model_id: str = "microsoft/Phi-3-mini-128k-instruct"
 
-    # -----------------------------
-    # Run / generation parameters
-    # -----------------------------
     max_input_tokens: int = 8192
     max_new_tokens: int = 64
 
-    # -----------------------------
-    # Runtime / device behavior
-    # -----------------------------
+    # Greedy rollback defaults
+    decoding_mode: str = "greedy"   # "greedy" | "beam"
+    num_beams: int = 1
+    temperature: float = 0.2
+    top_p: float = 0.95
+    do_sample: bool = False
+
     device: str = "auto"
     dtype: str = "auto"
     local_files_only: bool = False
     cpu_fallback_on_long: bool = False
 
-    # -----------------------------
-    # Benchmark-specific structure
-    # -----------------------------
     workload: WorkloadConfig = field(default_factory=WorkloadConfig)
     output: OutputConfig = field(default_factory=OutputConfig)
     namespaces: NamespaceConfig = field(default_factory=NamespaceConfig)
@@ -289,9 +216,6 @@ class BenchmarkConfig:
 
     @property
     def max_cache_items(self) -> int:
-        """
-        Baseline-compatibility alias for RAM capacity.
-        """
         return self.memory.ram_capacity_items
 
     def validate(self) -> None:
@@ -303,6 +227,12 @@ class BenchmarkConfig:
 
         if int(self.max_new_tokens) < 0:
             raise ValueError("max_new_tokens must be >= 0")
+
+        if self.decoding_mode not in {"greedy", "beam"}:
+            raise ValueError("decoding_mode must be 'greedy' or 'beam'")
+
+        if int(self.num_beams) <= 0:
+            raise ValueError("num_beams must be > 0")
 
         valid_devices = {"auto", "cuda", "mps", "cpu"}
         if str(self.device).strip().lower() not in valid_devices:
@@ -345,6 +275,11 @@ class BenchmarkConfig:
         model_id: str = "microsoft/Phi-3-mini-128k-instruct",
         max_input_tokens: int = 8192,
         max_new_tokens: int = 64,
+        decoding_mode: str = "greedy",
+        num_beams: int = 1,
+        temperature: float = 0.2,
+        top_p: float = 0.95,
+        do_sample: bool = False,
         device: str = "auto",
         dtype: str = "auto",
         local_files_only: bool = False,
@@ -379,6 +314,11 @@ class BenchmarkConfig:
             model_id=model_id,
             max_input_tokens=max_input_tokens,
             max_new_tokens=max_new_tokens,
+            decoding_mode=decoding_mode,
+            num_beams=num_beams,
+            temperature=temperature,
+            top_p=top_p,
+            do_sample=do_sample,
             device=device,
             dtype=dtype,
             local_files_only=local_files_only,

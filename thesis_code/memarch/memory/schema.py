@@ -7,6 +7,11 @@ Phase 1 focus:
 - Exact-match retrieval remains primary
 - Semantic retrieval is optional and assistive/context-only
 - Personalization via scopes (SESSION / USER / COHORT / GLOBAL)
+
+Evidence-guided memory extension:
+- Memory can store compact grounding evidence alongside answers
+- Queries can carry document/source metadata for document-local retrieval
+- Semantic retrieval remains context-only; exact-match remains direct bypass
 """
 
 from __future__ import annotations
@@ -129,11 +134,43 @@ class MemoryQuery:
     max_disk_reads: int = 16
     max_ram_reads: int = 64
 
+    # -------------------------
+    # Evidence / source metadata
+    # -------------------------
+    # These are optional so older call sites remain valid.
+    doc_signature: Optional[str] = None
+    source_file: Optional[str] = None
+    chunk_index: Optional[int] = None
+    chunk_id: Optional[str] = None
+    question_type: Optional[str] = None
+
+    # Optional compact local evidence derived upstream.
+    evidence_text: Optional[str] = None
+
+    # Optional task-normalized answer form for cheap exact-like comparisons.
+    answer_canonical: Optional[str] = None
+
     def __post_init__(self) -> None:
         if not self.raw_query or not self.raw_query.strip():
             raise ValueError("MemoryQuery.raw_query must be non-empty")
         if self.max_disk_reads < 0 or self.max_ram_reads < 0:
             raise ValueError("max_disk_reads/max_ram_reads must be >= 0")
+
+        if self.chunk_index is not None and self.chunk_index < 0:
+            raise ValueError("MemoryQuery.chunk_index must be >= 0 when provided")
+
+        if self.doc_signature is not None and not str(self.doc_signature).strip():
+            raise ValueError("MemoryQuery.doc_signature must be non-empty when provided")
+        if self.source_file is not None and not str(self.source_file).strip():
+            raise ValueError("MemoryQuery.source_file must be non-empty when provided")
+        if self.chunk_id is not None and not str(self.chunk_id).strip():
+            raise ValueError("MemoryQuery.chunk_id must be non-empty when provided")
+        if self.question_type is not None and not str(self.question_type).strip():
+            raise ValueError("MemoryQuery.question_type must be non-empty when provided")
+        if self.evidence_text is not None and not str(self.evidence_text).strip():
+            raise ValueError("MemoryQuery.evidence_text must be non-empty when provided")
+        if self.answer_canonical is not None and not str(self.answer_canonical).strip():
+            raise ValueError("MemoryQuery.answer_canonical must be non-empty when provided")
 
 
 @dataclass
@@ -144,6 +181,11 @@ class MemoryItem:
     Phase 1:
     - exact-match retrieval remains primary
     - semantic fields are optional and may be absent for older records
+
+    Evidence-guided extension:
+    - answer_text remains the reusable answer payload
+    - evidence_text stores compact grounding support for reduced-context prompting
+    - doc/source fields enable cheap same-document preference
     """
     # Stable key (derived from canonical query + scope + namespace +
     # context signature + versioning)
@@ -174,6 +216,17 @@ class MemoryItem:
 
     # Free-form metadata (must remain JSON-serializable if logged/stored)
     meta: Dict[str, Any] = field(default_factory=dict)
+
+    # -------------------------
+    # Evidence / source fields
+    # -------------------------
+    evidence_text: Optional[str] = None
+    doc_signature: Optional[str] = None
+    source_file: Optional[str] = None
+    chunk_index: Optional[int] = None
+    chunk_id: Optional[str] = None
+    question_type: Optional[str] = None
+    answer_canonical: Optional[str] = None
 
     # -------------------------
     # Semantic retrieval fields
@@ -220,6 +273,22 @@ class MemoryItem:
             raise ValueError("COHORT scope requires namespace starting with 'cohort:'")
         if self.scope == Scope.GLOBAL and not self.namespace.startswith("global:"):
             raise ValueError("GLOBAL scope requires namespace starting with 'global:'")
+
+        # Evidence/source field sanity
+        if self.doc_signature is not None and not str(self.doc_signature).strip():
+            raise ValueError("MemoryItem.doc_signature must be non-empty when provided")
+        if self.source_file is not None and not str(self.source_file).strip():
+            raise ValueError("MemoryItem.source_file must be non-empty when provided")
+        if self.chunk_index is not None and self.chunk_index < 0:
+            raise ValueError("MemoryItem.chunk_index must be >= 0 when provided")
+        if self.chunk_id is not None and not str(self.chunk_id).strip():
+            raise ValueError("MemoryItem.chunk_id must be non-empty when provided")
+        if self.question_type is not None and not str(self.question_type).strip():
+            raise ValueError("MemoryItem.question_type must be non-empty when provided")
+        if self.answer_canonical is not None and not str(self.answer_canonical).strip():
+            raise ValueError("MemoryItem.answer_canonical must be non-empty when provided")
+        if self.evidence_text is not None and not str(self.evidence_text).strip():
+            raise ValueError("MemoryItem.evidence_text must be non-empty when provided")
 
         # Semantic field sanity
         if self.query_embedding is not None:

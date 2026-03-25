@@ -9,6 +9,7 @@
 #   - Delete + iter_namespace behavior
 #   - Basic stats counters
 #   - Semantic retrieval fields persist cleanly
+#   - Evidence-guided fields persist cleanly
 
 from __future__ import annotations
 
@@ -35,6 +36,13 @@ def _mk_item(
     query_embedding: list[float] | None = None,
     embedding_model_id: str | None = None,
     embedding_norm: float | None = None,
+    evidence_text: str | None = None,
+    doc_signature: str | None = None,
+    source_file: str | None = None,
+    chunk_index: int | None = None,
+    chunk_id: str | None = None,
+    question_type: str | None = None,
+    answer_canonical: str | None = None,
 ) -> MemoryItem:
     """
     Helper to create a valid MemoryItem with deterministic keying.
@@ -61,6 +69,8 @@ def _mk_item(
         context_window=4096,
     )
 
+    resolved_doc_signature = doc_signature if doc_signature is not None else ctx.get("doc_signature")
+
     return MemoryItem(
         key=key,
         scope=scope,
@@ -72,7 +82,24 @@ def _mk_item(
         quality=QualitySignals(score=1.0, success=True, metrics={"em": 1.0}),
         ttl_seconds=ttl_seconds,
         expires_at_utc=expires_at_utc,
-        meta={"unit_test": True, "task": "trec", "doc_signature": ctx.get("doc_signature")},
+        meta={
+            "unit_test": True,
+            "task": "trec",
+            "doc_signature": resolved_doc_signature,
+            "source_file": source_file,
+            "chunk_index": chunk_index,
+            "chunk_id": chunk_id,
+            "question_type": question_type,
+            "evidence_text": evidence_text,
+            "answer_canonical": answer_canonical,
+        },
+        evidence_text=evidence_text,
+        doc_signature=resolved_doc_signature,
+        source_file=source_file,
+        chunk_index=chunk_index,
+        chunk_id=chunk_id,
+        question_type=question_type,
+        answer_canonical=answer_canonical,
         query_embedding=query_embedding,
         embedding_model_id=embedding_model_id,
         embedding_norm=embedding_norm,
@@ -340,5 +367,144 @@ def test_disk_store_allows_items_without_semantic_fields(tmp_path):
     assert got.query_embedding is None
     assert got.embedding_model_id is None
     assert got.embedding_norm is None
+
+    store.close()
+
+
+def test_disk_store_roundtrip_preserves_evidence_guided_fields(tmp_path):
+    """
+    Evidence-guided retrieval depends on these fields surviving disk persistence.
+    """
+    db_path = tmp_path / "mem.sqlite"
+    store = DiskStoreSQLite(str(db_path))
+
+    ns = "user:u1"
+    item = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="who founded the company",
+        ctx={"dataset_context": "The company was founded in 1998 by Alice Doe.", "doc_signature": "doc-evidence-1"},
+        evidence_text="The company was founded in 1998 by Alice Doe.",
+        doc_signature="doc-evidence-1",
+        source_file="trec_train.jsonl",
+        chunk_index=7,
+        chunk_id="chunk-7",
+        question_type="qa",
+        answer_canonical="Alice Doe",
+    )
+    store.put(ns, item.key, item)
+
+    got = store.get(ns, item.key)
+    assert got is not None
+    assert got.evidence_text == "The company was founded in 1998 by Alice Doe."
+    assert got.doc_signature == "doc-evidence-1"
+    assert got.source_file == "trec_train.jsonl"
+    assert got.chunk_index == 7
+    assert got.chunk_id == "chunk-7"
+    assert got.question_type == "qa"
+    assert got.answer_canonical == "Alice Doe"
+
+    # Backward-compatibility mirror in meta should also survive.
+    assert got.meta.get("doc_signature") == "doc-evidence-1"
+    assert got.meta.get("source_file") == "trec_train.jsonl"
+    assert got.meta.get("chunk_index") == 7
+    assert got.meta.get("chunk_id") == "chunk-7"
+    assert got.meta.get("question_type") == "qa"
+    assert got.meta.get("evidence_text") == "The company was founded in 1998 by Alice Doe."
+    assert got.meta.get("answer_canonical") == "Alice Doe"
+
+    store.close()
+
+
+def test_disk_store_evidence_guided_fields_persist_across_reopen(tmp_path):
+    db_path = tmp_path / "mem.sqlite"
+    ns = "user:u1"
+
+    item = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="where is the capital located",
+        ctx={"dataset_context": "The capital city is located on the northern coast.", "doc_signature": "doc-evidence-2"},
+        evidence_text="The capital city is located on the northern coast.",
+        doc_signature="doc-evidence-2",
+        source_file="geo_eval.jsonl",
+        chunk_index=3,
+        chunk_id="geo-3",
+        question_type="qa",
+        answer_canonical="northern coast",
+    )
+
+    store1 = DiskStoreSQLite(str(db_path))
+    store1.put(ns, item.key, item)
+    store1.close()
+
+    store2 = DiskStoreSQLite(str(db_path))
+    got = store2.get(ns, item.key)
+
+    assert got is not None
+    assert got.evidence_text == "The capital city is located on the northern coast."
+    assert got.doc_signature == "doc-evidence-2"
+    assert got.source_file == "geo_eval.jsonl"
+    assert got.chunk_index == 3
+    assert got.chunk_id == "geo-3"
+    assert got.question_type == "qa"
+    assert got.answer_canonical == "northern coast"
+
+    store2.close()
+
+
+def test_disk_store_iter_namespace_preserves_evidence_guided_fields(tmp_path):
+    db_path = tmp_path / "mem.sqlite"
+    store = DiskStoreSQLite(str(db_path))
+
+    ns = "user:u1"
+    i1 = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="q1",
+        ctx={"dataset_context": "ctx1", "doc_signature": "doc-a"},
+        evidence_text="evidence one",
+        doc_signature="doc-a",
+        source_file="a.jsonl",
+        chunk_index=1,
+        chunk_id="a-1",
+        question_type="qa",
+        answer_canonical="ans1",
+    )
+    i2 = _mk_item(
+        scope=Scope.USER,
+        namespace=ns,
+        raw_query="q2",
+        ctx={"dataset_context": "ctx2", "doc_signature": "doc-b"},
+        evidence_text="evidence two",
+        doc_signature="doc-b",
+        source_file="b.jsonl",
+        chunk_index=2,
+        chunk_id="b-2",
+        question_type="classification",
+        answer_canonical="DESC",
+    )
+
+    store.put(ns, i1.key, i1)
+    store.put(ns, i2.key, i2)
+
+    items = list(store.iter_namespace(ns))
+    by_key = {it.key: it for it in items}
+
+    assert by_key[i1.key].evidence_text == "evidence one"
+    assert by_key[i1.key].doc_signature == "doc-a"
+    assert by_key[i1.key].source_file == "a.jsonl"
+    assert by_key[i1.key].chunk_index == 1
+    assert by_key[i1.key].chunk_id == "a-1"
+    assert by_key[i1.key].question_type == "qa"
+    assert by_key[i1.key].answer_canonical == "ans1"
+
+    assert by_key[i2.key].evidence_text == "evidence two"
+    assert by_key[i2.key].doc_signature == "doc-b"
+    assert by_key[i2.key].source_file == "b.jsonl"
+    assert by_key[i2.key].chunk_index == 2
+    assert by_key[i2.key].chunk_id == "b-2"
+    assert by_key[i2.key].question_type == "classification"
+    assert by_key[i2.key].answer_canonical == "DESC"
 
     store.close()

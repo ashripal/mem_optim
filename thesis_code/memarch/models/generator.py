@@ -10,10 +10,11 @@ Purpose:
     2) optional retrieved memory can be injected
     3) behavior is portable across Mac / Jetson / other constrained devices
 
-Phase 1 design:
+Evidence-guided design:
 - Exact hits may return directly from MemoryManager
-- Semantic hits are typically used as context assistance only
-- Local text generation with transformers
+- Semantic hits are context assistance only
+- Retrieved evidence is preferred over full long context when available
+- Full context is still available when no memory support exists
 - Returns:
     (answer_text, Provenance, QualitySignals)
 
@@ -24,6 +25,7 @@ Important:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -99,6 +101,10 @@ class GeneratorConfig:
     top_p: float = 0.95
     do_sample: bool = False
 
+    # Decoding behavior
+    decoding_mode: str = "greedy"   # "greedy" | "beam"
+    num_beams: int = 1
+
     # Loading behavior
     local_files_only: bool = False
     torch_dtype: str = "auto"   # "auto" | "float16" | "bfloat16" | "float32"
@@ -113,6 +119,16 @@ class GeneratorConfig:
     include_dataset_context: bool = True
     include_doc_signature: bool = True
 
+    # Evidence-guided prompt behavior
+    prefer_retrieved_evidence_context: bool = True
+    reduce_context_on_semantic_hit: bool = True
+    max_evidence_chars: int = 400
+    max_local_context_chars: int = 220
+    max_full_context_chars: int = 4000
+
+    # TREC prompt behavior
+    trec_use_few_shot: bool = False
+
     # Cleanup
     skip_special_tokens: bool = True
 
@@ -126,6 +142,33 @@ class HFGenerator:
 
     This matches what MemoryManager expects.
     """
+
+    _TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
+
+    _TREC_ALIAS_MAP = {
+        "ABBREVIATION": "ABBR",
+        "ABBR": "ABBR",
+
+        "DESCRIPTION": "DESC",
+        "DEFINITION": "DESC",
+        "DESC": "DESC",
+
+        "ENTITY": "ENTY",
+        "ENTY": "ENTY",
+
+        "HUMAN": "HUM",
+        "PERSON": "HUM",
+        "INDIVIDUAL": "HUM",
+        "HUM": "HUM",
+
+        "LOCATION": "LOC",
+        "PLACE": "LOC",
+        "LOC": "LOC",
+
+        "NUMBER": "NUM",
+        "NUMERIC": "NUM",
+        "NUM": "NUM",
+    }
 
     def __init__(self, cfg: Optional[GeneratorConfig] = None) -> None:
         self.cfg = cfg or GeneratorConfig()
@@ -145,7 +188,7 @@ class HFGenerator:
         self.model = AutoModelForCausalLM.from_pretrained(
             self.cfg.model_id,
             local_files_only=self.cfg.local_files_only,
-            dtype=self.model_dtype,
+            torch_dtype=self.model_dtype,
         )
         self.model.eval()
         self.model.to(self.device)
@@ -179,90 +222,374 @@ class HFGenerator:
             return ""
         return str(value).strip()
 
+    def _normalize_trec_output(self, text: str) -> str:
+        """
+        Convert noisy model output into a single coarse TREC label when possible.
+        """
+        raw = self._safe_text(text)
+        if not raw:
+            return raw
+
+        upper = raw.upper()
+
+        coarse_patterns = [
+            r"\b(ABBR|DESC|ENTY|HUM|LOC|NUM)\b",
+            r"^(ABBR|DESC|ENTY|HUM|LOC|NUM)[\.\:\-\s_]",
+        ]
+        for pat in coarse_patterns:
+            m = re.search(pat, upper)
+            if m:
+                return m.group(1)
+
+        alias_patterns = [
+            r"\bTYPE\s*:\s*([A-Z]+)\b",
+            r"\bOUTPUT\s*:\s*([A-Z]+)\b",
+            r"^([A-Z]+)\b",
+        ]
+        for pat in alias_patterns:
+            m = re.search(pat, upper)
+            if m:
+                token = m.group(1)
+                mapped = self._TREC_ALIAS_MAP.get(token)
+                if mapped in self._TREC_LABELS:
+                    return mapped
+
+        for token in re.findall(r"[A-Z]+", upper):
+            mapped = self._TREC_ALIAS_MAP.get(token)
+            if mapped in self._TREC_LABELS:
+                return mapped
+
+        return raw
+
+    @staticmethod
+    def _truncate_chars(text: str, max_chars: int) -> str:
+        text = str(text or "").strip()
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        return text[:max_chars].rstrip()
+
+    def _model_max_positions(self) -> int:
+        """
+        Best-effort detection of the model's usable position window.
+
+        Must remain robust for unit-test doubles that may not expose `.config`.
+        """
+        model_config = getattr(self.model, "config", None)
+        if model_config is None:
+            return int(self.cfg.max_input_length)
+
+        candidates = [
+            getattr(model_config, "max_position_embeddings", None),
+            getattr(model_config, "n_positions", None),
+            getattr(model_config, "max_sequence_length", None),
+            getattr(model_config, "seq_length", None),
+        ]
+        for value in candidates:
+            try:
+                if value is not None and int(value) > 0:
+                    return int(value)
+            except Exception:
+                pass
+        return int(self.cfg.max_input_length)
+
+    def _effective_prompt_token_budget(self) -> int:
+        """
+        Reserve space for generation so we never overflow the model's
+        positional embedding window.
+        """
+        model_limit = self._model_max_positions()
+        requested_input = int(self.cfg.max_input_length)
+        requested_new = max(1, int(self.cfg.max_new_tokens))
+
+        safe_budget = min(requested_input, max(1, model_limit - requested_new))
+        return max(1, safe_budget)
+
+    def _allowed_new_tokens(self, input_tokens: int) -> int:
+        """
+        Cap generation so input_tokens + new_tokens never exceeds the model limit.
+        """
+        model_limit = self._model_max_positions()
+        remaining = max(0, int(model_limit) - int(input_tokens))
+        return max(0, min(int(self.cfg.max_new_tokens), remaining))
+
     def _select_generation_backend(self) -> str:
         if self.cfg.generation_backend != "auto":
             return self.cfg.generation_backend
 
-        # The local Mac environment was unstable with transformers.generate().
-        # Use manual greedy on CPU/MPS, and keep hf_generate for CUDA by default.
         if self.device in {"cpu", "mps"}:
             return "manual_greedy"
         return "hf_generate"
 
-    def _retrieved_section(self, retrieved: MemoryHit) -> str:
-        """
-        Build a safe retrieved-memory section.
+    def _query_dataset_context(self, mq: MemoryQuery) -> str:
+        return self._safe_text((mq.context or {}).get("dataset_context", ""))
 
-        Phase 1 policy:
-        - retrieved semantic memory is assistive, not authoritative
-        - the model should use it only if consistent with the current document context
-        """
+    def _query_doc_signature(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "doc_signature", None):
+            return self._safe_text(mq.doc_signature)
+        return self._safe_text((mq.context or {}).get("doc_signature", ""))
+
+    def _query_question_type(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "question_type", None):
+            return self._safe_text(mq.question_type)
+        return self._safe_text((mq.context or {}).get("question_type", ""))
+
+    def _query_evidence_text(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "evidence_text", None):
+            return self._safe_text(mq.evidence_text)
+        return self._safe_text((mq.context or {}).get("evidence_text", ""))
+
+    def _retrieved_evidence_text(self, retrieved: MemoryHit) -> str:
+        item = retrieved.item
+        direct = getattr(item, "evidence_text", None)
+        if direct:
+            return self._safe_text(direct)
+        return self._safe_text(item.meta.get("evidence_text", ""))
+
+    def _retrieved_doc_signature(self, retrieved: MemoryHit) -> str:
+        item = retrieved.item
+        direct = getattr(item, "doc_signature", None)
+        if direct:
+            return self._safe_text(direct)
+        return self._safe_text(item.meta.get("doc_signature", ""))
+
+    def _retrieved_same_document(self, mq: MemoryQuery, retrieved: Optional[MemoryHit]) -> bool:
+        if retrieved is None:
+            return False
+
+        dbg = getattr(retrieved, "debug", {}) or {}
+        if "same_document" in dbg:
+            try:
+                return bool(dbg.get("same_document"))
+            except Exception:
+                pass
+
+        query_doc = self._query_doc_signature(mq)
+        item_doc = self._retrieved_doc_signature(retrieved)
+        return bool(query_doc and item_doc and query_doc == item_doc)
+
+    def _retrieved_section(self, mq: MemoryQuery, retrieved: MemoryHit) -> str:
+        evidence_text = self._truncate_chars(
+            self._retrieved_evidence_text(retrieved),
+            int(self.cfg.max_evidence_chars),
+        )
         answer_text = self._safe_text(retrieved.item.answer_text)
-        if not answer_text:
-            return ""
+        answer_text = self._truncate_chars(answer_text, 300)
 
-        lines = [
-            "RETRIEVED ANSWER FOR A SIMILAR EARLIER QUESTION:",
-            answer_text,
-        ]
+        same_doc = self._retrieved_same_document(mq, retrieved)
 
         meta_parts = [
             f"match_type={retrieved.match_type.value}",
             f"source_tier={retrieved.source_tier.value}",
             f"score={retrieved.score:.4f}",
+            f"same_document={str(bool(same_doc)).lower()}",
         ]
-
         if retrieved.semantic_rank is not None:
             meta_parts.append(f"semantic_rank={retrieved.semantic_rank}")
 
-        lines.append("")
-        lines.append("RETRIEVAL METADATA:")
-        lines.append(", ".join(meta_parts))
+        lines = [
+            "RETRIEVED MEMORY SUPPORT:",
+            ", ".join(meta_parts),
+        ]
 
-        if retrieved.match_type == MatchType.SEMANTIC:
+        if evidence_text:
             lines.append("")
-            lines.append(
-                "Use the retrieved answer only if it is consistent with the document context "
-                "and the current question."
-            )
+            lines.append("RETRIEVED EVIDENCE SNIPPET:")
+            lines.append(evidence_text)
+
+        if answer_text:
+            lines.append("")
+            lines.append("PRIOR RELATED ANSWER:")
+            lines.append(answer_text)
+
+        lines.append("")
+        lines.append(
+            "Use the retrieved material only if it is consistent with the current question "
+            "and the current context."
+        )
 
         return "\n".join(lines)
 
+    def _task_instruction(self, mq: MemoryQuery) -> str:
+        task = self._safe_text(getattr(mq, "task", "")).lower()
+        question_type = self._query_question_type(mq).lower()
+
+        if task == "trec" or question_type == "classification":
+            return (
+                "You are performing TREC coarse question classification.\n"
+                "Valid labels are exactly: ABBR, DESC, ENTY, HUM, LOC, NUM.\n"
+                "Return exactly one label from that set.\n"
+                "Do not output any other words, punctuation, explanation, prefix, or suffix."
+            )
+
+        return (
+            "Answer the current question only. Be concise. "
+            "Do not repeat the question. Do not mention retrieval metadata."
+        )
+
+    def _build_trec_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
+        question = self._safe_text(mq.raw_query)
+
+        parts = [
+            "You are a classifier for TREC coarse question types.",
+            "Valid labels: ABBR, DESC, ENTY, HUM, LOC, NUM.",
+            "Return exactly one label and nothing else.",
+        ]
+
+        if (
+            retrieved is not None
+            and self.cfg.include_retrieved_memory_context
+            and retrieved.match_type == MatchType.SEMANTIC
+        ):
+            retrieved_answer = self._safe_text(retrieved.item.answer_text)
+            if retrieved_answer:
+                parts.append(
+                    f"Related prior label or answer (use only if helpful): {self._truncate_chars(retrieved_answer, 80)}"
+                )
+
+        if self.cfg.trec_use_few_shot:
+            parts.extend(
+                [
+                    "Examples:",
+                    "Question: What does CIA stand for?",
+                    "Label: ABBR",
+                    "Question: Why do airplanes leave contrails?",
+                    "Label: DESC",
+                    "Question: What city is the Eiffel Tower in?",
+                    "Label: LOC",
+                ]
+            )
+
+        parts.append(f"Question: {question}")
+        parts.append("Label:")
+
+        prompt = "\n".join(parts)
+        self.last_prompt = prompt
+
+        if self.last_generation_meta is None:
+            self.last_generation_meta = {}
+        self.last_generation_meta = dict(self.last_generation_meta or {})
+
+        is_semantic_reduced = (
+            retrieved is not None
+            and retrieved.match_type == MatchType.SEMANTIC
+            and self.cfg.include_retrieved_memory_context
+            and self.cfg.prefer_retrieved_evidence_context
+            and self.cfg.reduce_context_on_semantic_hit
+        )
+
+        self.last_generation_meta["reduced_context_used"] = is_semantic_reduced
+        self.last_generation_meta["full_context_chars"] = len(self._query_dataset_context(mq))
+        self.last_generation_meta["final_context_chars"] = 0
+        self.last_generation_meta["retrieved_evidence_chars"] = None
+        self.last_generation_meta["retrieved_doc_signature_match"] = (
+            self._retrieved_same_document(mq, retrieved) if retrieved is not None else None
+        )
+
+        return prompt
+
+    def _select_context_block(
+        self,
+        mq: MemoryQuery,
+        retrieved: Optional[MemoryHit],
+    ) -> Tuple[str, Dict[str, object]]:
+        dataset_ctx = self._query_dataset_context(mq)
+        query_evidence = self._truncate_chars(
+            self._query_evidence_text(mq),
+            self._effective_char_budget(int(self.cfg.max_local_context_chars)),
+        )
+
+        full_context_chars = len(dataset_ctx) if dataset_ctx else 0
+
+        if (
+            retrieved is not None
+            and retrieved.match_type == MatchType.SEMANTIC
+            and self.cfg.include_retrieved_memory_context
+            and self.cfg.prefer_retrieved_evidence_context
+            and self.cfg.reduce_context_on_semantic_hit
+        ):
+            retrieved_evidence = self._truncate_chars(
+                self._retrieved_evidence_text(retrieved),
+                self._effective_char_budget(int(self.cfg.max_evidence_chars)),
+            )
+            same_document = self._retrieved_same_document(mq, retrieved)
+
+            parts = []
+            if retrieved_evidence:
+                parts.append("RETRIEVED EVIDENCE:\n" + retrieved_evidence)
+            if query_evidence:
+                parts.append("CURRENT LOCAL CONTEXT:\n" + query_evidence)
+
+            context_block = "\n\n".join(parts)
+
+            return context_block, {
+                "reduced_context_used": bool(context_block),
+                "full_context_chars": full_context_chars,
+                "final_context_chars": len(context_block),
+                "retrieved_evidence_chars": len(retrieved_evidence) if retrieved_evidence else None,
+                "retrieved_doc_signature_match": same_document,
+            }
+
+        trimmed_full_ctx = self._truncate_chars(
+            dataset_ctx,
+            int(self.cfg.max_full_context_chars),
+        )
+
+        return trimmed_full_ctx, {
+            "reduced_context_used": False,
+            "full_context_chars": full_context_chars,
+            "final_context_chars": len(trimmed_full_ctx),
+            "retrieved_evidence_chars": None,
+            "retrieved_doc_signature_match": None,
+        }
+
     def build_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
-        """
-        Build the final prompt passed to the model.
-        """
+        task = self._safe_text(getattr(mq, "task", "")).lower()
+        question_type = self._query_question_type(mq).lower()
+
+        if task == "trec" or question_type == "classification":
+            return self._build_trec_prompt(mq, retrieved=retrieved)
+
         parts = []
 
         parts.append(
-            "You are a helpful assistant. Answer the current question using the provided "
-            "document context. If a retrieved prior answer is provided, use it only when "
-            "it is consistent with the document context and current question."
+            "You are a helpful assistant. Use the provided grounded context to answer "
+            "the current question. If retrieved prior memory is provided, treat it as "
+            "supportive evidence only and use it only when consistent with the current question."
         )
 
-        if self.cfg.include_dataset_context:
-            dataset_ctx = self._safe_text((mq.context or {}).get("dataset_context", ""))
-            if dataset_ctx:
-                parts.append(f"DOCUMENT CONTEXT:\n{dataset_ctx}")
+        task_instruction = self._task_instruction(mq)
+        if task_instruction:
+            parts.append(f"OUTPUT RULES:\n{task_instruction}")
+
+        context_block, prompt_stats = self._select_context_block(mq, retrieved=retrieved)
+        if self.cfg.include_dataset_context and context_block:
+            parts.append(f"CONTEXT:\n{context_block}")
 
         if self.cfg.include_doc_signature:
-            doc_sig = (mq.context or {}).get("doc_signature")
+            doc_sig = self._query_doc_signature(mq)
             if doc_sig:
                 parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
 
         if self.cfg.include_retrieved_memory_context and retrieved is not None:
-            retrieved_block = self._retrieved_section(retrieved)
+            retrieved_block = self._retrieved_section(mq, retrieved)
             if retrieved_block:
                 parts.append(retrieved_block)
 
         parts.append(f"CURRENT QUESTION:\n{self._safe_text(mq.raw_query)}")
-        parts.append(
-            "ANSWER THE CURRENT QUESTION ONLY. Do not mention retrieval metadata unless it is directly relevant."
-        )
-        parts.append("ANSWER:")
+        parts.append("FINAL ANSWER:")
 
         prompt = "\n\n".join(parts)
         self.last_prompt = prompt
+
+        if self.last_generation_meta is None:
+            self.last_generation_meta = {}
+        self.last_generation_meta = dict(self.last_generation_meta or {})
+        self.last_generation_meta["reduced_context_used"] = prompt_stats["reduced_context_used"]
+        self.last_generation_meta["full_context_chars"] = prompt_stats["full_context_chars"]
+        self.last_generation_meta["final_context_chars"] = prompt_stats["final_context_chars"]
+        self.last_generation_meta["retrieved_evidence_chars"] = prompt_stats["retrieved_evidence_chars"]
+        self.last_generation_meta["retrieved_doc_signature_match"] = prompt_stats["retrieved_doc_signature_match"]
+
         return prompt
 
     def _manual_greedy_decode(
@@ -270,13 +597,17 @@ class HFGenerator:
         *,
         input_ids: torch.Tensor,
         attention_mask: Optional[torch.Tensor],
+        allowed_new_tokens: int,
     ) -> torch.Tensor:
         generated_ids = input_ids
         generated_mask = attention_mask
         eos_token_id = self.tokenizer.eos_token_id
 
+        if allowed_new_tokens <= 0:
+            return generated_ids
+
         with torch.inference_mode():
-            for _ in range(int(self.cfg.max_new_tokens)):
+            for _ in range(int(allowed_new_tokens)):
                 outputs = self.model(
                     input_ids=generated_ids,
                     attention_mask=generated_mask,
@@ -301,29 +632,6 @@ class HFGenerator:
 
         return generated_ids
 
-    def _hf_generate(
-        self,
-        *,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor],
-    ) -> torch.Tensor:
-        generate_kwargs: Dict[str, object] = {
-            "input_ids": input_ids,
-            "attention_mask": attention_mask,
-            "max_new_tokens": self.cfg.max_new_tokens,
-            "do_sample": self.cfg.do_sample,
-            "use_cache": True,
-            "pad_token_id": self.tokenizer.pad_token_id,
-            "eos_token_id": self.tokenizer.eos_token_id,
-        }
-
-        if self.cfg.do_sample:
-            generate_kwargs["temperature"] = self.cfg.temperature
-            generate_kwargs["top_p"] = self.cfg.top_p
-
-        with torch.inference_mode():
-            return self.model.generate(**generate_kwargs)
-
     def _move_model(self, device: str) -> None:
         self.model.to(device)
         self.device = device
@@ -341,10 +649,17 @@ class HFGenerator:
         backend_used: str,
         retrieved: Optional[MemoryHit],
     ) -> None:
+        prior_meta = dict(self.last_generation_meta or {})
+
         meta: Dict[str, object] = {
             "device": self.device,
             "dtype": str(self.model_dtype).replace("torch.", "") if self.model_dtype is not None else "none",
             "generation_backend": backend_used,
+            "decoding_mode": self.cfg.decoding_mode,
+            "num_beams": self.cfg.num_beams,
+            "do_sample": self.cfg.do_sample,
+            "temperature": self.cfg.temperature,
+            "top_p": self.cfg.top_p,
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "truncated": truncated,
@@ -355,6 +670,11 @@ class HFGenerator:
             "retrieved_match_type": retrieved.match_type.value if retrieved is not None else None,
             "retrieved_source_tier": retrieved.source_tier.value if retrieved is not None else None,
             "retrieved_score": float(retrieved.score) if retrieved is not None else None,
+            "retrieved_doc_signature_match": prior_meta.get("retrieved_doc_signature_match"),
+            "retrieved_evidence_chars": prior_meta.get("retrieved_evidence_chars"),
+            "reduced_context_used": prior_meta.get("reduced_context_used"),
+            "full_context_chars": prior_meta.get("full_context_chars"),
+            "final_context_chars": prior_meta.get("final_context_chars"),
         }
 
         if self.device == "cuda":
@@ -367,191 +687,60 @@ class HFGenerator:
 
         self.last_generation_meta = meta
 
-    # def generate(
-    #     self,
-    #     mq: MemoryQuery,
-    #     retrieved: Optional[MemoryHit] = None,
-    # ) -> Tuple[str, Provenance, QualitySignals]:
-    #     """
-    #     Generate an answer for the given MemoryQuery.
-    #     """
-    #     prompt = self.build_prompt(mq, retrieved=retrieved)
+    def _effective_char_budget(self, requested_chars: int) -> int:
+        """
+        Scale character-level context budgets to the configured token budget.
 
-    #     tok_t0 = time.time()
-    #     enc = self.tokenizer(
-    #         prompt,
-    #         return_tensors="pt",
-    #         truncation=True,
-    #         max_length=self.cfg.max_input_length,
-    #         padding=False,
-    #     )
-    #     tokenize_time_s = time.time() - tok_t0
+        This avoids building huge prompt strings that will just be token-truncated.
+        Cheap heuristic:
+        ~4 chars/token, with a conservative fraction reserved for instructions/question.
+        """
+        requested_chars = max(0, int(requested_chars))
+        token_budget = max(1, int(self.cfg.max_input_length))
 
-    #     input_ids = enc["input_ids"]
-    #     attention_mask = enc.get("attention_mask")
+        context_token_budget = max(16, int(token_budget * 0.5))
+        approx_char_budget = context_token_budget * 4
 
-    #     input_tokens = int(input_ids.shape[-1])
+        return min(requested_chars, approx_char_budget)
 
-    #     full_prompt_token_count = None
-    #     if hasattr(self.tokenizer, "encode") and callable(getattr(self.tokenizer, "encode")):
-    #         try:
-    #             full_prompt_token_count = len(
-    #                 self.tokenizer.encode(prompt, add_special_tokens=True)
-    #             )
-    #         except Exception:
-    #             full_prompt_token_count = None
+    def _generate_with_hf(
+        self,
+        *,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        allowed_new_tokens: int,
+    ) -> torch.Tensor:
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "max_new_tokens": allowed_new_tokens,
+            "do_sample": bool(self.cfg.do_sample),
+            "num_beams": max(1, int(self.cfg.num_beams)),
+            "pad_token_id": self.tokenizer.pad_token_id,
+            "eos_token_id": self.tokenizer.eos_token_id,
+        }
 
-    #     truncated = bool(
-    #         full_prompt_token_count is not None and full_prompt_token_count > input_tokens
-    #     )
+        if self.cfg.do_sample:
+            kwargs["temperature"] = float(self.cfg.temperature)
+            kwargs["top_p"] = float(self.cfg.top_p)
 
-    #     input_ids = input_ids.to(self.device)
-    #     if attention_mask is not None:
-    #         attention_mask = attention_mask.to(self.device)
-
-    #     backend_used = self._select_generation_backend()
-
-    #     try:
-    #         gen_t0 = time.time()
-
-    #         if hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
-    #             output_ids = self.model.generate(
-    #                 input_ids=input_ids,
-    #                 attention_mask=attention_mask,
-    #                 max_new_tokens=self.cfg.max_new_tokens,
-    #                 do_sample=self.cfg.do_sample,
-    #                 temperature=(self.cfg.temperature if self.cfg.do_sample else None),
-    #                 top_p=(self.cfg.top_p if self.cfg.do_sample else None),
-    #                 pad_token_id=self.tokenizer.pad_token_id,
-    #                 eos_token_id=self.tokenizer.eos_token_id,
-    #             )
-    #             backend_used = "hf_generate"
-    #         else:
-    #             output_ids = self._manual_greedy_decode(
-    #                 input_ids=input_ids,
-    #                 attention_mask=attention_mask,
-    #             )
-    #             backend_used = "manual_greedy"
-
-    #         gen_time_s = time.time() - gen_t0
-    #     except RuntimeError as e:
-    #         if self.device in {"cuda", "mps"} and self.cfg.cpu_fallback_on_failure:
-    #             self._move_model("cpu")
-    #             self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, "cpu")
-
-    #             input_ids = input_ids.detach().to("cpu")
-    #             attention_mask = attention_mask.detach().to("cpu") if attention_mask is not None else None
-
-    #             gen_t0 = time.time()
-    #             if hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
-    #                 output_ids = self.model.generate(
-    #                     input_ids=input_ids,
-    #                     attention_mask=attention_mask,
-    #                     max_new_tokens=self.cfg.max_new_tokens,
-    #                     do_sample=self.cfg.do_sample,
-    #                     temperature=(self.cfg.temperature if self.cfg.do_sample else None),
-    #                     top_p=(self.cfg.top_p if self.cfg.do_sample else None),
-    #                     pad_token_id=self.tokenizer.pad_token_id,
-    #                     eos_token_id=self.tokenizer.eos_token_id,
-    #                 )
-    #                 backend_used = "hf_generate"
-    #             else:
-    #                 output_ids = self._manual_greedy_decode(
-    #                     input_ids=input_ids,
-    #                     attention_mask=attention_mask,
-    #                 )
-    #                 backend_used = "manual_greedy"
-    #             gen_time_s = time.time() - gen_t0
-    #         else:
-    #             raise RuntimeError(f"HFGenerator failed on device={self.device}: {type(e).__name__}: {e}") from e
-
-    #     decode_t0 = time.time()
-    #     if backend_used == "hf_generate":
-    #         generated_ids = output_ids[0][input_ids.shape[1]:]
-    #         output_tokens = int(generated_ids.shape[-1])
-    #         answer_text = self.tokenizer.decode(
-    #             generated_ids.detach().to("cpu"),
-    #             skip_special_tokens=self.cfg.skip_special_tokens,
-    #         ).strip()
-    #     else:
-    #         output_tokens = max(0, int(output_ids.shape[-1]) - input_tokens)
-    #         output_ids_cpu = output_ids.detach().to("cpu")
-    #         input_ids_cpu = input_ids.detach().to("cpu")
-
-    #         full_text = self.tokenizer.decode(
-    #             output_ids_cpu[0],
-    #             skip_special_tokens=self.cfg.skip_special_tokens,
-    #         )
-    #         prompt_used = self.tokenizer.decode(
-    #             input_ids_cpu[0],
-    #             skip_special_tokens=self.cfg.skip_special_tokens,
-    #         )
-
-    #         if full_text.startswith(prompt_used):
-    #             answer_text = full_text[len(prompt_used):].lstrip()
-    #         else:
-    #             answer_text = full_text.strip()
-
-    #     decode_time_s = time.time() - decode_t0
-
-    #     if not answer_text:
-    #         answer_text = "(No answer generated.)"
-
-    #     self._record_meta(
-    #         prompt=prompt,
-    #         input_tokens=input_tokens,
-    #         output_tokens=output_tokens,
-    #         truncated=truncated,
-    #         tokenize_time_s=tokenize_time_s,
-    #         gen_time_s=gen_time_s,
-    #         decode_time_s=decode_time_s,
-    #         backend_used=backend_used,
-    #         retrieved=retrieved,
-    #     )
-
-    #     provenance = Provenance(
-    #         model_id=mq.model_id,
-    #         prompt_version=mq.prompt_version,
-    #         generated_at_utc=datetime.now(timezone.utc),
-    #         generator_backend="transformers",
-    #         quantization=None,
-    #         context_window=self.cfg.max_input_length,
-    #     )
-
-    #     quality_metrics: Dict[str, float] = {}
-    #     if retrieved is not None and retrieved.match_type == MatchType.SEMANTIC:
-    #         quality_metrics["semantic_retrieval_score"] = float(retrieved.score)
-    #     elif retrieved is not None and retrieved.match_type == MatchType.EXACT:
-    #         quality_metrics["retrieval_score"] = float(retrieved.score)
-
-    #     quality_metrics["input_tokens"] = float(input_tokens)
-    #     quality_metrics["output_tokens"] = float(output_tokens)
-    #     quality_metrics["gen_time_s"] = float(gen_time_s)
-
-    #     quality = QualitySignals(
-    #         score=None,
-    #         success=bool(answer_text and answer_text != "(No answer generated.)"),
-    #         metrics=quality_metrics,
-    #     )
-
-    #     return answer_text, provenance, quality
+        return self.model.generate(**kwargs)
 
     def generate(
         self,
         mq: MemoryQuery,
         retrieved: Optional[MemoryHit] = None,
     ) -> Tuple[str, Provenance, QualitySignals]:
-        """
-        Generate an answer for the given MemoryQuery.
-        """
         prompt = self.build_prompt(mq, retrieved=retrieved)
+
+        prompt_token_budget = self._effective_prompt_token_budget()
 
         tok_t0 = time.time()
         enc = self.tokenizer(
             prompt,
             return_tensors="pt",
             truncation=True,
-            max_length=self.cfg.max_input_length,
+            max_length=prompt_token_budget,
             padding=False,
         )
         tokenize_time_s = time.time() - tok_t0
@@ -560,7 +749,9 @@ class HFGenerator:
         attention_mask = enc.get("attention_mask")
 
         input_tokens = int(input_ids.shape[-1])
-        truncated = input_tokens >= int(self.cfg.max_input_length)
+        truncated = input_tokens >= int(prompt_token_budget)
+
+        allowed_new_tokens = self._allowed_new_tokens(input_tokens)
 
         input_ids = input_ids.to(self.device)
         if attention_mask is not None:
@@ -571,23 +762,20 @@ class HFGenerator:
         try:
             gen_t0 = time.time()
 
-            if backend_used == "manual_greedy":
+            if allowed_new_tokens <= 0:
+                output_ids = input_ids
+            elif backend_used == "manual_greedy":
                 if callable(self.model):
                     output_ids = self._manual_greedy_decode(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        allowed_new_tokens=allowed_new_tokens,
                     )
                 elif hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
-                    # Unit-test fallback for FakeModel, which is not callable but has .generate()
-                    output_ids = self.model.generate(
+                    output_ids = self._generate_with_hf(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        max_new_tokens=self.cfg.max_new_tokens,
-                        do_sample=self.cfg.do_sample,
-                        temperature=(self.cfg.temperature if self.cfg.do_sample else None),
-                        top_p=(self.cfg.top_p if self.cfg.do_sample else None),
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
+                        allowed_new_tokens=allowed_new_tokens,
                     )
                     backend_used = "hf_generate"
                 else:
@@ -595,20 +783,16 @@ class HFGenerator:
 
             elif backend_used == "hf_generate":
                 if hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
-                    output_ids = self.model.generate(
+                    output_ids = self._generate_with_hf(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        max_new_tokens=self.cfg.max_new_tokens,
-                        do_sample=self.cfg.do_sample,
-                        temperature=(self.cfg.temperature if self.cfg.do_sample else None),
-                        top_p=(self.cfg.top_p if self.cfg.do_sample else None),
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
+                        allowed_new_tokens=allowed_new_tokens,
                     )
                 else:
                     output_ids = self._manual_greedy_decode(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        allowed_new_tokens=allowed_new_tokens,
                     )
                     backend_used = "manual_greedy"
             else:
@@ -625,22 +809,20 @@ class HFGenerator:
                 attention_mask = attention_mask.detach().to("cpu") if attention_mask is not None else None
 
                 gen_t0 = time.time()
-                if callable(self.model):
+                if allowed_new_tokens <= 0:
+                    output_ids = input_ids
+                elif callable(self.model):
                     output_ids = self._manual_greedy_decode(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
+                        allowed_new_tokens=allowed_new_tokens,
                     )
                     backend_used = "manual_greedy"
                 elif hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
-                    output_ids = self.model.generate(
+                    output_ids = self._generate_with_hf(
                         input_ids=input_ids,
                         attention_mask=attention_mask,
-                        max_new_tokens=self.cfg.max_new_tokens,
-                        do_sample=self.cfg.do_sample,
-                        temperature=(self.cfg.temperature if self.cfg.do_sample else None),
-                        top_p=(self.cfg.top_p if self.cfg.do_sample else None),
-                        pad_token_id=self.tokenizer.pad_token_id,
-                        eos_token_id=self.tokenizer.eos_token_id,
+                        allowed_new_tokens=allowed_new_tokens,
                     )
                     backend_used = "hf_generate"
                 else:
@@ -683,6 +865,12 @@ class HFGenerator:
         if not answer_text:
             answer_text = "(No answer generated.)"
 
+        task_name = self._safe_text(getattr(mq, "task", "")).lower()
+        question_type = self._query_question_type(mq).lower()
+
+        if task_name == "trec" or question_type == "classification":
+            answer_text = self._normalize_trec_output(answer_text)
+
         self._record_meta(
             prompt=prompt,
             input_tokens=input_tokens,
@@ -701,7 +889,7 @@ class HFGenerator:
             generated_at_utc=datetime.now(timezone.utc),
             generator_backend="transformers",
             quantization=None,
-            context_window=self.cfg.max_input_length,
+            context_window=min(self.cfg.max_input_length, self._model_max_positions()),
         )
 
         quality_metrics: Dict[str, float] = {}
@@ -714,6 +902,44 @@ class HFGenerator:
         quality_metrics["output_tokens"] = float(output_tokens)
         quality_metrics["gen_time_s"] = float(gen_time_s)
 
+        reduced_context_used = (
+            bool(self.last_generation_meta.get("reduced_context_used"))
+            if isinstance(self.last_generation_meta, dict)
+            else False
+        )
+        if reduced_context_used:
+            quality_metrics["reduced_context_used"] = 1.0
+
+        full_context_chars = (
+            self.last_generation_meta.get("full_context_chars")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        final_context_chars = (
+            self.last_generation_meta.get("final_context_chars")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        retrieved_evidence_chars = (
+            self.last_generation_meta.get("retrieved_evidence_chars")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        same_doc = (
+            self.last_generation_meta.get("retrieved_doc_signature_match")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+
+        if isinstance(full_context_chars, (int, float)):
+            quality_metrics["full_context_chars"] = float(full_context_chars)
+        if isinstance(final_context_chars, (int, float)):
+            quality_metrics["final_context_chars"] = float(final_context_chars)
+        if isinstance(retrieved_evidence_chars, (int, float)):
+            quality_metrics["retrieved_evidence_chars"] = float(retrieved_evidence_chars)
+        if isinstance(same_doc, bool):
+            quality_metrics["retrieved_same_document"] = 1.0 if same_doc else 0.0
+
         quality = QualitySignals(
             score=None,
             success=bool(answer_text and answer_text != "(No answer generated.)"),
@@ -723,15 +949,14 @@ class HFGenerator:
         return answer_text, provenance, quality
 
     def info(self) -> dict:
-        """
-        Lightweight metadata for logging/debugging.
-        """
         return {
             "model_id": self.cfg.model_id,
             "device": self.device,
             "dtype": str(self.model_dtype).replace("torch.", "") if self.model_dtype is not None else "none",
             "max_input_length": self.cfg.max_input_length,
             "max_new_tokens": self.cfg.max_new_tokens,
+            "decoding_mode": self.cfg.decoding_mode,
+            "num_beams": self.cfg.num_beams,
             "temperature": self.cfg.temperature,
             "top_p": self.cfg.top_p,
             "do_sample": self.cfg.do_sample,
@@ -739,6 +964,13 @@ class HFGenerator:
             "include_retrieved_memory_context": self.cfg.include_retrieved_memory_context,
             "include_dataset_context": self.cfg.include_dataset_context,
             "include_doc_signature": self.cfg.include_doc_signature,
+            "prefer_retrieved_evidence_context": self.cfg.prefer_retrieved_evidence_context,
+            "reduce_context_on_semantic_hit": self.cfg.reduce_context_on_semantic_hit,
+            "max_evidence_chars": self.cfg.max_evidence_chars,
+            "max_local_context_chars": self.cfg.max_local_context_chars,
+            "max_full_context_chars": self.cfg.max_full_context_chars,
+            "trec_use_few_shot": self.cfg.trec_use_few_shot,
+            "model_max_positions": self._model_max_positions(),
         }
 
 
