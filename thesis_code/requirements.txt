@@ -1,0 +1,20 @@
+# requirements.txt
+
+# Core ML
+torch
+transformers
+accelerate
+safetensors
+
+# System / utilities
+psutil
+
+# Analysis / plotting
+matplotlib
+
+# Demo app
+streamlit
+PyPDF2
+
+# Testing
+pytest
