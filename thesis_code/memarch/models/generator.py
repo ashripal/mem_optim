@@ -102,7 +102,7 @@ class GeneratorConfig:
     do_sample: bool = False
 
     # Decoding behavior
-    decoding_mode: str = "greedy"   # "greedy" | "beam"
+    decoding_mode: str = "greedy"   # "greedy" | "beam" | "sample"
     num_beams: int = 1
 
     # Loading behavior
@@ -172,6 +172,8 @@ class HFGenerator:
 
     def __init__(self, cfg: Optional[GeneratorConfig] = None) -> None:
         self.cfg = cfg or GeneratorConfig()
+        self._validate_config()
+
         self.device = _select_device(self.cfg.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
@@ -195,6 +197,27 @@ class HFGenerator:
 
         self.last_prompt: Optional[str] = None
         self.last_generation_meta: Optional[Dict[str, object]] = None
+
+    def _validate_config(self) -> None:
+        mode = (self.cfg.decoding_mode or "greedy").lower().strip()
+
+        if mode not in {"greedy", "beam", "sample"}:
+            raise ValueError("decoding_mode must be one of: greedy, beam, sample")
+
+        if mode == "beam" and int(self.cfg.num_beams) <= 1:
+            raise ValueError("Beam mode requires num_beams > 1")
+
+        if mode != "sample" and bool(self.cfg.do_sample):
+            raise ValueError("do_sample=True is only valid when decoding_mode='sample'")
+
+        if mode == "sample" and int(self.cfg.num_beams) != 1:
+            raise ValueError("Sample mode requires num_beams == 1")
+
+        if int(self.cfg.max_input_length) <= 0:
+            raise ValueError("max_input_length must be > 0")
+
+        if int(self.cfg.max_new_tokens) < 0:
+            raise ValueError("max_new_tokens must be >= 0")
 
     @staticmethod
     def _resolve_torch_dtype(dtype_name: str, device: str):
@@ -315,6 +338,12 @@ class HFGenerator:
     def _select_generation_backend(self) -> str:
         if self.cfg.generation_backend != "auto":
             return self.cfg.generation_backend
+
+        mode = (self.cfg.decoding_mode or "greedy").lower().strip()
+
+        # Beam search and sampling rely on HF generate().
+        if mode in {"beam", "sample"}:
+            return "hf_generate"
 
         if self.device in {"cpu", "mps"}:
             return "manual_greedy"
@@ -710,19 +739,28 @@ class HFGenerator:
         attention_mask: Optional[torch.Tensor],
         allowed_new_tokens: int,
     ) -> torch.Tensor:
+        mode = (self.cfg.decoding_mode or "greedy").lower().strip()
+
         kwargs = {
             "input_ids": input_ids,
             "attention_mask": attention_mask,
             "max_new_tokens": allowed_new_tokens,
-            "do_sample": bool(self.cfg.do_sample),
-            "num_beams": max(1, int(self.cfg.num_beams)),
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
         }
 
-        if self.cfg.do_sample:
+        if mode == "beam":
+            kwargs["do_sample"] = False
+            kwargs["num_beams"] = int(self.cfg.num_beams)
+            kwargs["early_stopping"] = True
+        elif mode == "sample":
+            kwargs["do_sample"] = True
+            kwargs["num_beams"] = 1
             kwargs["temperature"] = float(self.cfg.temperature)
             kwargs["top_p"] = float(self.cfg.top_p)
+        else:
+            kwargs["do_sample"] = False
+            kwargs["num_beams"] = 1
 
         return self.model.generate(**kwargs)
 
@@ -897,6 +935,8 @@ class HFGenerator:
             quality_metrics["semantic_retrieval_score"] = float(retrieved.score)
         elif retrieved is not None and retrieved.match_type == MatchType.EXACT:
             quality_metrics["retrieval_score"] = float(retrieved.score)
+        elif retrieved is not None and retrieved.match_type == MatchType.LEXICAL:
+            quality_metrics["lexical_retrieval_score"] = float(retrieved.score)
 
         quality_metrics["input_tokens"] = float(input_tokens)
         quality_metrics["output_tokens"] = float(output_tokens)

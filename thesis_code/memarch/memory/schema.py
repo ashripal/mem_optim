@@ -2,16 +2,18 @@
 """
 Core, shared data structures for memarch.
 
-Phase 1 focus:
+Current focus:
 - Deterministic routing (no LLM-based policy)
 - Exact-match retrieval remains primary
+- Lexical retrieval is optional and occurs after exact-match miss
 - Semantic retrieval is optional and assistive/context-only
 - Personalization via scopes (SESSION / USER / COHORT / GLOBAL)
 
 Evidence-guided memory extension:
 - Memory can store compact grounding evidence alongside answers
 - Queries can carry document/source metadata for document-local retrieval
-- Semantic retrieval remains context-only; exact-match remains direct bypass
+- Lexical retrieval may be direct-reuse only for explicitly safe tasks
+- Semantic retrieval remains context-only by default
 """
 
 from __future__ import annotations
@@ -43,6 +45,7 @@ class SourceTier(str, Enum):
 class MatchType(str, Enum):
     """How we matched."""
     EXACT = "exact"
+    LEXICAL = "lexical"
     SEMANTIC = "semantic"
 
 
@@ -68,7 +71,9 @@ class QualitySignals:
     """
     Quality metadata for gating admission/reuse.
 
-    Phase 1: keep simple. You can attach offline eval scores later.
+    Current version:
+    - keep simple
+    - offline eval scores can be attached later
     """
     # A generic normalized score in [0, 1] if you have one; else None.
     score: Optional[float] = None
@@ -178,14 +183,15 @@ class MemoryItem:
     """
     A stored memory record.
 
-    Phase 1:
+    Current behavior:
     - exact-match retrieval remains primary
+    - lexical fields reuse query_canonical plus evidence/source metadata
     - semantic fields are optional and may be absent for older records
 
     Evidence-guided extension:
     - answer_text remains the reusable answer payload
     - evidence_text stores compact grounding support for reduced-context prompting
-    - doc/source fields enable cheap same-document preference
+    - doc/source fields enable cheap same-document / same-source preference
     """
     # Stable key (derived from canonical query + scope + namespace +
     # context signature + versioning)
@@ -319,19 +325,19 @@ class MemoryHit:
     """
     Returned by MemoryManager.retrieve() when it finds an item.
 
-    Phase 1 notes:
-    - EXACT hits can still return directly
+    Current behavior:
+    - EXACT hits can return directly
+    - LEXICAL hits may return directly only when bypass_allowed=True
     - SEMANTIC hits are primarily intended for context assistance
-    - bypass_allowed is present for forward compatibility, but can remain False
     """
     item: MemoryItem
     source_tier: SourceTier
     match_type: MatchType = MatchType.EXACT
 
-    # For EXACT this is typically 1.0. For SEMANTIC it is cosine similarity.
+    # For EXACT this is typically 1.0. For LEXICAL/SEMANTIC it is a bounded similarity score.
     score: float = 1.0
 
-    # Semantic retrieval metadata
+    # Rank metadata for approximate retrieval
     semantic_rank: Optional[int] = None
     bypass_allowed: bool = False
 

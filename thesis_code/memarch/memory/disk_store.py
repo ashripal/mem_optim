@@ -2,7 +2,7 @@
 """
 Tier 2: Disk store (portable, persistent) for MemoryItem objects.
 
-Phase 1 goals:
+Current goals:
 - Cross-platform (macOS + Jetson Linux + other constrained devices)
 - No external services/daemons
 - Deterministic semantics matching RamStoreLRU interface:
@@ -10,10 +10,11 @@ Phase 1 goals:
     put(namespace, key, item) -> None
     delete(namespace, key) -> None
     iter_namespace(namespace) -> Iterator[MemoryItem]
+    iter_candidates(namespace, ...) -> Iterator[MemoryItem]
     stats() -> Dict[str, int]
     close() -> None
 
-Implementation choice (Phase 1):
+Implementation choice:
 - SQLite via Python stdlib sqlite3 (no extra dependency).
 - Store full MemoryItem as JSON (TEXT), with a small schema version.
 
@@ -23,6 +24,11 @@ Notes:
 - Semantic retrieval fields are stored as part of the serialized MemoryItem payload.
 - Evidence-guided fields are also stored explicitly so disk-restored items behave
   the same as RAM-resident items.
+
+Retrieval support:
+- Exact retrieval uses get(namespace, key)
+- Lexical/semantic retrieval can use iter_namespace(namespace) for bounded brute-force scans
+- iter_candidates(...) provides a convenience coarse filter for future manager optimizations
 """
 
 from __future__ import annotations
@@ -200,6 +206,7 @@ class DiskStoreStats:
         self.puts = 0
         self.deletes = 0
         self.iter_calls = 0
+        self.iter_candidate_calls = 0
 
 
 class DiskStoreSQLite:
@@ -254,6 +261,7 @@ class DiskStoreSQLite:
             "puts": s.puts,
             "deletes": s.deletes,
             "iter_calls": s.iter_calls,
+            "iter_candidate_calls": s.iter_candidate_calls,
         }
 
     def get(self, namespace: str, key: str) -> Optional[MemoryItem]:
@@ -314,7 +322,7 @@ class DiskStoreSQLite:
         """
         Iterate all items in a namespace.
 
-        Phase 1 semantic retrieval may use this for bounded brute-force scanning.
+        Lexical/semantic retrieval may use this for bounded brute-force scanning.
         """
         self._stats.iter_calls += 1
         if not namespace:
@@ -324,8 +332,113 @@ class DiskStoreSQLite:
             "SELECT value_json FROM kv WHERE namespace=? ORDER BY updated_at_utc ASC;",
             (namespace,),
         )
-        for (value_json,) in cur:
-            yield _deserialize_item(value_json)
+
+        def _gen() -> Iterator[MemoryItem]:
+            for (value_json,) in cur:
+                yield _deserialize_item(value_json)
+
+        return _gen()
+
+    def iter_candidates(
+        self,
+        namespace: str,
+        *,
+        task: Optional[str] = None,
+        source_file: Optional[str] = None,
+        doc_signature: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[MemoryItem]:
+        """
+        Iterate candidate items from a namespace with cheap coarse filtering.
+
+        This method intentionally keeps the filtering simple and portable:
+        - fetch rows for the namespace ordered by recency
+        - deserialize items
+        - apply lightweight Python-side filters on:
+            * item.meta["task"]
+            * item.source_file / item.meta["source_file"]
+            * item.doc_signature / item.meta["doc_signature"]
+
+        Why Python-side filtering:
+        - keeps the implementation portable across SQLite builds
+        - avoids reliance on JSON1 extension semantics
+        - remains acceptable because manager-side budgets already bound scans
+
+        Args:
+            namespace: required namespace to scan
+            task: optional exact task filter
+            source_file: optional exact source_file filter
+            doc_signature: optional exact doc_signature filter
+            limit: optional max number of yielded items
+        """
+        self._stats.iter_candidate_calls += 1
+        if not namespace:
+            return iter(())
+
+        task_norm = str(task).strip() if task is not None else None
+        source_norm = str(source_file).strip() if source_file is not None else None
+        doc_norm = str(doc_signature).strip() if doc_signature is not None else None
+
+        cur = self._conn.execute(
+            "SELECT value_json FROM kv WHERE namespace=? ORDER BY updated_at_utc ASC;",
+            (namespace,),
+        )
+
+        def _item_task(item: MemoryItem) -> Optional[str]:
+            value = item.meta.get("task")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def _item_source(item: MemoryItem) -> Optional[str]:
+            if getattr(item, "source_file", None):
+                text = str(item.source_file).strip()
+                if text:
+                    return text
+            value = item.meta.get("source_file")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def _item_doc(item: MemoryItem) -> Optional[str]:
+            if getattr(item, "doc_signature", None):
+                text = str(item.doc_signature).strip()
+                if text:
+                    return text
+            value = item.meta.get("doc_signature")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def _gen() -> Iterator[MemoryItem]:
+            yielded = 0
+            for (value_json,) in cur:
+                item = _deserialize_item(value_json)
+
+                if task_norm is not None:
+                    itask = _item_task(item)
+                    if itask is not None and itask != task_norm:
+                        continue
+
+                if source_norm is not None:
+                    isource = _item_source(item)
+                    if isource is None or isource != source_norm:
+                        continue
+
+                if doc_norm is not None:
+                    idoc = _item_doc(item)
+                    if idoc is None or idoc != doc_norm:
+                        continue
+
+                yield item
+                yielded += 1
+                if limit is not None and yielded >= int(limit):
+                    break
+
+        return _gen()
 
     def close(self) -> None:
         try:

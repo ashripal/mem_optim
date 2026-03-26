@@ -2,24 +2,28 @@
 """
 MemoryManager: deterministic multi-tier personalization memory.
 
-Phase 1 behavior:
+Current behavior:
 - Exact-match retrieval remains primary
-- Semantic retrieval is optional and occurs only after exact-match miss
+- Lexical retrieval is optional and occurs only after exact-match miss
+- Semantic retrieval is optional and occurs after exact / lexical miss
 - Retrieval order:
     1. Exact RAM
     2. Exact DISK
-    3. Semantic RAM / DISK candidate search
-    4. Generator fallback
+    3. Lexical RAM / DISK candidate search
+    4. Semantic RAM / DISK candidate search
+    5. Generator fallback
 - Tiers:
     Tier 1: RAM (RamStoreLRU)
     Tier 2: DISK (DiskStoreSQLite)
-- On DISK exact hit, promote to RAM
-- On semantic hit, use as context for generation by default
+- On DISK exact/lexical/semantic hit, optionally promote to RAM
+- Exact hits may return directly
+- Lexical hits may return directly only for safe tasks and only above a strict threshold
+- Semantic hits remain context-only
 - On miss, call generator, then store according to admission policy
 
 Evidence-guided extension:
 - Store grounded evidence with each memory item
-- Prefer same-document semantic matches before broader matches
+- Prefer same-document lexical and semantic matches before broader matches
 - Keep semantic retrieval context-only (no semantic direct bypass)
 - Pass retrieved evidence forward for reduced-context prompting
 - Normalize task-specific outputs before admission/storage when safe
@@ -28,7 +32,7 @@ Design principles:
 - Single entry point for memory decisions
 - Strict scoping to prevent cross-user contamination
 - Deterministic, bounded operations
-- Keep exact-match logic stable while adding semantic retrieval additively
+- Keep exact-match logic stable while adding lexical/semantic retrieval additively
 """
 
 from __future__ import annotations
@@ -70,8 +74,15 @@ from memarch.memory.schema import (
     Scope,
     SourceTier,
 )
+from memarch.memory.similarity import lexical_score
 from memarch.models.embedder import Embedder
-from memarch.utils.text import canonicalize, context_signature, make_key
+from memarch.utils.text import (
+    canonicalize,
+    context_signature,
+    make_key,
+    normalize_for_lookup,
+    tokenize_lexical,
+)
 
 
 # -------------------------
@@ -93,8 +104,9 @@ class Generator(Protocol):
     """
     Generator interface.
 
-    Phase 1:
+    Current behavior:
     - exact hit may return directly
+    - lexical hit may be direct-reuse or context-assisted depending on threshold/task
     - semantic hit is passed into generator as retrieved context
     """
     def generate(
@@ -114,12 +126,21 @@ class MemoryManagerConfig:
     retrieval_policy: RetrievalPolicy = field(default_factory=default_retrieval_policy)
     admission_policy: AdmissionPolicy = field(default_factory=default_admission_policy)
 
-    # Promote exact/semantic disk hits to RAM for faster repeat access
+    # Promote exact/lexical/semantic disk hits to RAM for faster repeat access
     promote_disk_hits_to_ram: bool = True
 
     # If True, return exact hits directly.
+    # Lexical hits may also return directly if bypass_allowed=True.
     # Semantic hits remain context-only in the evidence-guided design.
     return_memory_directly: bool = True
+
+    # Lexical retrieval controls
+    lexical_enabled: bool = False
+    lexical_context_threshold: float = 0.55
+    lexical_direct_threshold: float = 0.90
+    lexical_top_k: int = 3
+    prefer_same_source: bool = True
+    safe_direct_reuse_tasks: List[str] = field(default_factory=lambda: ["trec"])
 
     # Semantic components
     embedder: Optional[Embedder] = None
@@ -149,6 +170,38 @@ class MemoryManager:
     # -------------------------
     # Small helpers
     # -------------------------
+
+    def _lexical_enabled(self) -> bool:
+        pol = self._cfg.retrieval_policy
+        policy_enabled = bool(getattr(pol, "lexical_enabled", False))
+        return bool(self._cfg.lexical_enabled or policy_enabled)
+
+    def _lexical_context_threshold(self) -> float:
+        pol = self._cfg.retrieval_policy
+        return float(
+            getattr(pol, "lexical_threshold_context", self._cfg.lexical_context_threshold)
+        )
+
+    def _lexical_direct_threshold(self) -> float:
+        pol = self._cfg.retrieval_policy
+        return float(
+            getattr(pol, "lexical_threshold_bypass", self._cfg.lexical_direct_threshold)
+        )
+
+    def _lexical_top_k(self) -> int:
+        pol = self._cfg.retrieval_policy
+        return int(getattr(pol, "lexical_top_k", self._cfg.lexical_top_k))
+
+    def _prefer_same_source(self) -> bool:
+        pol = self._cfg.retrieval_policy
+        return bool(getattr(pol, "prefer_same_source", self._cfg.prefer_same_source))
+
+    def _safe_direct_reuse_tasks(self) -> List[str]:
+        pol = self._cfg.retrieval_policy
+        tasks = getattr(pol, "safe_direct_reuse_tasks", self._cfg.safe_direct_reuse_tasks)
+        if not tasks:
+            return []
+        return [str(t).strip().lower() for t in tasks if str(t).strip()]
 
     def _query_doc_signature(self, mq: MemoryQuery) -> Optional[str]:
         if getattr(mq, "doc_signature", None) is not None:
@@ -220,6 +273,122 @@ class MemoryManager:
         text = str(value).strip()
         return text or None
 
+    def _query_norm(self, mq: MemoryQuery) -> str:
+        return normalize_for_lookup(mq.raw_query)
+
+    def _query_tokens(self, mq: MemoryQuery) -> List[str]:
+        return tokenize_lexical(mq.raw_query)
+
+    def _item_query_norm(self, item: MemoryItem) -> str:
+        raw = getattr(item, "query_canonical", None)
+        return normalize_for_lookup(raw or "")
+
+    def _item_query_tokens(self, item: MemoryItem) -> List[str]:
+        raw = getattr(item, "query_canonical", None)
+        return tokenize_lexical(raw or "")
+
+    def _item_doc_signature(self, item: MemoryItem) -> Optional[str]:
+        value = getattr(item, "doc_signature", None)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+        value = item.meta.get("doc_signature")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _item_source_file(self, item: MemoryItem) -> Optional[str]:
+        value = getattr(item, "source_file", None)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+        value = item.meta.get("source_file")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _item_question_type(self, item: MemoryItem) -> Optional[str]:
+        value = getattr(item, "question_type", None)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+        value = item.meta.get("question_type")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _item_answer_canonical(self, item: MemoryItem) -> Optional[str]:
+        value = getattr(item, "answer_canonical", None)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+        value = item.meta.get("answer_canonical")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _is_item_expired(self, item: MemoryItem, *, now: datetime) -> bool:
+        expires = getattr(item, "expires_at_utc", None)
+        if expires is None:
+            return False
+        try:
+            return bool(expires <= now)
+        except Exception:
+            return False
+
+    def _lexical_candidate_allowed(
+        self,
+        mq: MemoryQuery,
+        item: MemoryItem,
+        *,
+        now: datetime,
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Lightweight lexical candidate filter.
+
+        Unlike exact-match acceptance, lexical candidates should not require
+        identical context signatures. We only enforce basic safety gates here:
+        - not expired
+        - same task
+        - namespace/scope already handled by outer loop
+        """
+        if self._is_item_expired(item, now=now):
+            return False, {"reason": "expired"}
+
+        item_task = str(item.meta.get("task") or "").strip()
+        if item_task and item_task != mq.task:
+            return False, {"reason": "task_mismatch"}
+
+        q_norm = self._query_norm(mq)
+        i_norm = self._item_query_norm(item)
+        if not q_norm or not i_norm:
+            return False, {"reason": "empty_query"}
+
+        same_doc = same_document(mq, item)
+        same_src = False
+        query_src = self._query_source_file(mq)
+        item_src = self._item_source_file(item)
+        if query_src and item_src and query_src == item_src:
+            same_src = True
+
+        dbg = {
+            "reason": "accepted",
+            "same_document": same_doc,
+            "same_source": same_src,
+            "document_relation": document_relation(mq, item),
+            "query_norm": q_norm,
+            "item_norm": i_norm,
+        }
+        return True, dbg
+
     def _merged_store_meta(
         self,
         mq: MemoryQuery,
@@ -269,6 +438,7 @@ class MemoryManager:
             "evidence_text": evidence_text,
             "evidence_chars": len(str(evidence_text)) if evidence_text is not None else None,
             "same_document": bool(hit.debug.get("same_document", False)) if isinstance(hit.debug, dict) else None,
+            "same_source": bool(hit.debug.get("same_source", False)) if isinstance(hit.debug, dict) else None,
             "document_relation": (
                 hit.debug.get("document_relation") if isinstance(hit.debug, dict) else None
             ),
@@ -456,6 +626,10 @@ class MemoryManager:
                                     "disk_reads": disk_reads,
                                     "namespaces_checked": hit_namespaces_checked,
                                     "same_document": same_document(mq, item),
+                                    "same_source": (
+                                        self._query_source_file(mq) is not None
+                                        and self._query_source_file(mq) == self._item_source_file(item)
+                                    ),
                                     "document_relation": document_relation(mq, item),
                                 },
                             ),
@@ -498,6 +672,10 @@ class MemoryManager:
                                     "disk_reads": disk_reads,
                                     "namespaces_checked": hit_namespaces_checked,
                                     "same_document": same_document(mq, item),
+                                    "same_source": (
+                                        self._query_source_file(mq) is not None
+                                        and self._query_source_file(mq) == self._item_source_file(item)
+                                    ),
                                     "document_relation": document_relation(mq, item),
                                 },
                             ),
@@ -526,13 +704,296 @@ class MemoryManager:
         }
 
     # -------------------------
-    # Semantic retrieval
+    # Lexical retrieval
     # -------------------------
 
     def _iter_store_namespace(self, store: MemoryStore, namespace: str) -> Iterable[MemoryItem]:
         if hasattr(store, "iter_namespace"):
             return getattr(store, "iter_namespace")(namespace)
         return ()
+
+    def _build_lexical_candidates(
+        self,
+        mq: MemoryQuery,
+        *,
+        now: datetime,
+    ) -> Tuple[
+        List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]],
+        Dict[str, Any],
+    ]:
+        pol = self._cfg.retrieval_policy
+        budget = budget_from_query(mq)
+
+        candidates: List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]] = []
+        ram_reads = 0
+        disk_reads = 0
+        namespaces_checked: List[Dict[str, Any]] = []
+
+        for rn in resolve_namespaces(mq, scope_order=pol.scope_order, include_missing=False):
+            scope = rn.scope
+            ns = rn.namespace
+
+            ns_dbg: Dict[str, Any] = {
+                "scope": scope.value,
+                "namespace": ns,
+                "lexical_ram_scanned": False,
+                "lexical_disk_scanned": False,
+                "lexical_ram_candidates": 0,
+                "lexical_disk_candidates": 0,
+                "lexical_same_document_candidates": 0,
+                "lexical_same_source_candidates": 0,
+                "lexical_broader_candidates": 0,
+            }
+
+            if ram_reads < budget.max_ram_reads:
+                ram_reads += 1
+                ns_dbg["lexical_ram_scanned"] = True
+                for item in self._iter_store_namespace(self._ram, ns):
+                    ok, dbg = self._lexical_candidate_allowed(mq, item, now=now)
+                    if not ok:
+                        continue
+                    ns_dbg["lexical_ram_candidates"] += 1
+                    if bool(dbg.get("same_document", False)):
+                        ns_dbg["lexical_same_document_candidates"] += 1
+                    if bool(dbg.get("same_source", False)):
+                        ns_dbg["lexical_same_source_candidates"] += 1
+                    if not bool(dbg.get("same_document", False)) and not bool(dbg.get("same_source", False)):
+                        ns_dbg["lexical_broader_candidates"] += 1
+                    candidates.append((SourceTier.RAM, scope, ns, item, dbg))
+
+            if disk_reads < budget.max_disk_reads:
+                disk_reads += 1
+                ns_dbg["lexical_disk_scanned"] = True
+                for item in self._iter_store_namespace(self._disk, ns):
+                    ok, dbg = self._lexical_candidate_allowed(mq, item, now=now)
+                    if not ok:
+                        continue
+                    ns_dbg["lexical_disk_candidates"] += 1
+                    if bool(dbg.get("same_document", False)):
+                        ns_dbg["lexical_same_document_candidates"] += 1
+                    if bool(dbg.get("same_source", False)):
+                        ns_dbg["lexical_same_source_candidates"] += 1
+                    if not bool(dbg.get("same_document", False)) and not bool(dbg.get("same_source", False)):
+                        ns_dbg["lexical_broader_candidates"] += 1
+                    candidates.append((SourceTier.DISK, scope, ns, item, dbg))
+
+            namespaces_checked.append(ns_dbg)
+
+        return candidates, {
+            "ram_reads": ram_reads,
+            "disk_reads": disk_reads,
+            "namespaces_checked": namespaces_checked,
+            "candidate_count": len(candidates),
+            "same_document_candidate_count": sum(1 for c in candidates if bool(c[4].get("same_document", False))),
+            "same_source_candidate_count": sum(1 for c in candidates if bool(c[4].get("same_source", False))),
+            "broader_candidate_count": sum(
+                1 for c in candidates if not bool(c[4].get("same_document", False)) and not bool(c[4].get("same_source", False))
+            ),
+        }
+
+    def _rank_lexical_candidates(
+        self,
+        mq: MemoryQuery,
+        candidates: List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]],
+    ) -> Tuple[
+        List[Tuple[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]], float, int]],
+        Dict[str, Any],
+    ]:
+        q_norm = self._query_norm(mq)
+        q_tokens = self._query_tokens(mq)
+
+        same_doc_candidates: List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]] = []
+        same_source_candidates: List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]] = []
+        broader_candidates: List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]] = []
+
+        for cand in candidates:
+            dbg = cand[4]
+            if bool(dbg.get("same_document", False)):
+                same_doc_candidates.append(cand)
+            elif bool(dbg.get("same_source", False)):
+                same_source_candidates.append(cand)
+            else:
+                broader_candidates.append(cand)
+
+        dbg: Dict[str, Any] = {
+            "prefer_same_source": self._prefer_same_source(),
+            "same_document_pool_size": len(same_doc_candidates),
+            "same_source_pool_size": len(same_source_candidates),
+            "broader_pool_size": len(broader_candidates),
+        }
+
+        def _score_pool(
+            pool: List[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]
+        ) -> List[Tuple[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]], float, int]]:
+            scored: List[Tuple[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]], float]] = []
+            for cand in pool:
+                _source_tier, _scope, _ns, item, cdbg = cand
+                score = lexical_score(
+                    query_norm=q_norm,
+                    query_tokens=q_tokens,
+                    item_norm=self._item_query_norm(item),
+                    item_tokens=self._item_query_tokens(item),
+                    same_source=bool(cdbg.get("same_document", False) or cdbg.get("same_source", False)),
+                )
+
+                # Same-document lexical matches deserve a stronger preference than
+                # the generic same_source boost embedded in lexical_score().
+                if bool(cdbg.get("same_document", False)):
+                    score = min(1.0, float(score) + 0.15)
+                elif bool(cdbg.get("same_source", False)):
+                    score = min(1.0, float(score) + 0.05)
+
+                if score >= self._lexical_context_threshold():
+                    scored.append((cand, float(score)))
+
+            scored.sort(key=lambda x: x[1], reverse=True)
+            top_k = self._lexical_top_k()
+            ranked: List[Tuple[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]], float, int]] = []
+            for idx, (cand, score) in enumerate(scored[:top_k], start=1):
+                ranked.append((cand, score, idx))
+            return ranked
+
+        if same_doc_candidates:
+            ranked = _score_pool(same_doc_candidates)
+            if ranked:
+                dbg["selected_pool"] = "same_document"
+                dbg["selected_pool_size"] = len(same_doc_candidates)
+                return ranked, dbg
+
+        if self._prefer_same_source() and same_source_candidates:
+            ranked = _score_pool(same_source_candidates)
+            if ranked:
+                dbg["selected_pool"] = "same_source"
+                dbg["selected_pool_size"] = len(same_source_candidates)
+                return ranked, dbg
+
+        combined = broader_candidates
+        if not self._prefer_same_source():
+            combined = same_source_candidates + broader_candidates
+
+        ranked = _score_pool(combined)
+        if ranked:
+            dbg["selected_pool"] = "broader" if self._prefer_same_source() else "combined_non_doc"
+            dbg["selected_pool_size"] = len(combined)
+            return ranked, dbg
+
+        dbg["selected_pool"] = None
+        dbg["selected_pool_size"] = 0
+        return [], dbg
+
+    def _retrieve_lexical(
+        self,
+        mq: MemoryQuery,
+        *,
+        now: datetime,
+    ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
+        pol = self._cfg.retrieval_policy
+        budget = budget_from_query(mq)
+
+        if not self._lexical_enabled():
+            return None, {"lexical_enabled": False, "reason": "policy_disabled"}
+        if not budget.allow_semantic and not self._lexical_enabled():
+            return None, {"lexical_enabled": False, "reason": "budget_disabled"}
+
+        candidates, scan_dbg = self._build_lexical_candidates(mq, now=now)
+        if not candidates:
+            return None, {
+                "lexical_enabled": True,
+                "reason": "no_candidates",
+                **scan_dbg,
+            }
+
+        ranked, rank_dbg = self._rank_lexical_candidates(mq, candidates)
+        if not ranked:
+            return None, {
+                "lexical_enabled": True,
+                "reason": "below_threshold",
+                **scan_dbg,
+                **rank_dbg,
+            }
+
+        payload, score, rank = ranked[0]
+        source_tier, scope, ns, item, filter_dbg = payload
+
+        task_l = str(mq.task or "").strip().lower()
+        safe_task = task_l in self._safe_direct_reuse_tasks()
+
+        bypass_allowed = (
+            safe_task
+            and float(score) >= self._lexical_direct_threshold()
+        )
+
+        # Conservative fallback for short-label classification tasks:
+        # if the candidate is from the same document and the task is explicitly
+        # whitelisted for direct reuse, allow bypass once the candidate has already
+        # cleared the lexical context threshold. This is mainly intended for tasks
+        # like TREC, not open-ended QA.
+        if not bypass_allowed and safe_task and bool(filter_dbg.get("same_document", False)):
+            q_type = str(self._query_question_type(mq) or "").strip().lower()
+            i_type = str(self._item_question_type(item) or "").strip().lower()
+            q_ans = str(self._query_answer_canonical(mq) or "").strip()
+            i_ans = str(self._item_answer_canonical(item) or "").strip()
+
+            if q_type == "classification" or i_type == "classification":
+                if float(score) >= self._lexical_context_threshold():
+                    bypass_allowed = True
+            elif q_ans and i_ans and q_ans == i_ans and float(score) >= self._lexical_context_threshold():
+                bypass_allowed = True
+
+        match_type = "direct" if bypass_allowed else "context"
+
+        promoted = False
+        hit = MemoryHit(
+            item=item,
+            source_tier=source_tier,
+            match_type=MatchType.LEXICAL,
+            score=float(score),
+            semantic_rank=rank,
+            bypass_allowed=bypass_allowed,
+            debug=make_hit_debug(
+                scope=scope,
+                namespace=ns,
+                source="lexical_ram" if source_tier == SourceTier.RAM else "lexical_disk",
+                accepted_reason="lexical_direct" if bypass_allowed else "lexical_context",
+                extra={
+                    "lexical_candidate_rank": rank,
+                    "lexical_score": float(score),
+                    "lexical_bypassed": bypass_allowed,
+                    "same_document": bool(filter_dbg.get("same_document", False)),
+                    "same_source": bool(filter_dbg.get("same_source", False)),
+                    "document_relation": filter_dbg.get("document_relation"),
+                    "filter_debug": filter_dbg,
+                    "lexical_match_type": match_type,
+                    **scan_dbg,
+                    **rank_dbg,
+                },
+            ),
+        )
+
+        if source_tier == SourceTier.DISK and self._cfg.promote_disk_hits_to_ram:
+            try:
+                self._ram.put(ns, item.key, item)
+                promoted = True
+            except Exception:
+                promoted = False
+
+        return hit, {
+            "lexical_enabled": True,
+            "reason": "hit",
+            "top_score": float(score),
+            "top_rank": rank,
+            "promoted_to_ram": promoted,
+            "same_document": bool(filter_dbg.get("same_document", False)),
+            "same_source": bool(filter_dbg.get("same_source", False)),
+            "document_relation": filter_dbg.get("document_relation"),
+            "lexical_match_type": match_type,
+            **scan_dbg,
+            **rank_dbg,
+        }
+
+    # -------------------------
+    # Semantic retrieval
+    # -------------------------
 
     def _build_semantic_candidates(
         self,
@@ -545,7 +1006,7 @@ class MemoryManager:
         Dict[str, Any],
     ]:
         """
-        Collect semantic candidates from RAM and DISK after exact retrieval fails.
+        Collect semantic candidates from RAM and DISK after exact / lexical retrieval fails.
 
         Payload shape:
           (source_tier, scope, namespace, item, filter_debug)
@@ -654,11 +1115,6 @@ class MemoryManager:
     ]:
         """
         Rank semantic candidates while preferring same-document items first.
-
-        Strategy:
-        - split candidates into same-document vs broader groups
-        - score same-document group first
-        - only fall back to broader group when no same-document candidate survives threshold
         """
         same_doc_candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
         broader_candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
@@ -715,7 +1171,7 @@ class MemoryManager:
         ctx_sig: str,
     ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
         """
-        Attempt semantic retrieval after exact retrieval fails.
+        Attempt semantic retrieval after exact / lexical retrieval fails.
 
         Evidence-guided behavior:
         - only enabled if query + policy allow it
@@ -800,6 +1256,7 @@ class MemoryManager:
                     "semantic_score": float(score),
                     "semantic_bypassed": False,
                     "same_document": bool(filter_dbg.get("same_document", False)),
+                    "same_source": False,
                     "document_relation": filter_dbg.get("document_relation"),
                     "filter_debug": filter_dbg,
                     **decision_dbg,
@@ -841,7 +1298,8 @@ class MemoryManager:
         Retrieval cascade:
           1. exact RAM
           2. exact DISK
-          3. semantic RAM/DISK
+          3. lexical RAM/DISK
+          4. semantic RAM/DISK
 
         By default returns only:
           - MemoryHit on hit
@@ -865,6 +1323,17 @@ class MemoryManager:
                 return exact_hit, meta
             return exact_hit
 
+        lexical_hit, lexical_dbg = self._retrieve_lexical(mq, now=now)
+        if lexical_hit is not None:
+            meta = {
+                "retrieval_stage": "lexical",
+                "memory_lookup_ms": (time.time() - retrieval_t0) * 1000.0,
+                **lexical_dbg,
+            }
+            if return_meta:
+                return lexical_hit, meta
+            return lexical_hit
+
         semantic_hit, semantic_dbg = self._retrieve_semantic(mq, now=now, ctx_sig=ctx_sig)
         if semantic_hit is not None:
             meta = {
@@ -880,6 +1349,7 @@ class MemoryManager:
             "retrieval_stage": "miss",
             "memory_lookup_ms": (time.time() - retrieval_t0) * 1000.0,
             **exact_dbg,
+            "lexical": lexical_dbg,
             "semantic": semantic_dbg,
         }
         if return_meta:
@@ -1072,6 +1542,7 @@ class MemoryManager:
         Primary entrypoint used by pipeline:
         - retrieve from memory
         - exact hit may return directly
+        - lexical hit may return directly or be used as retrieved context
         - semantic hit is passed into generator as context
         - miss -> generate and store
         """
@@ -1091,6 +1562,9 @@ class MemoryManager:
                 "source_tier": hit.source_tier.value,
                 "match_type": hit.match_type.value,
                 "score": hit.score,
+                "lexical_used": False,
+                "lexical_bypassed": False,
+                "lexical_context_used": False,
                 "semantic_used": False,
                 "semantic_bypassed": False,
                 "semantic_candidate_rank": None,
@@ -1120,7 +1594,58 @@ class MemoryManager:
                 },
             }
 
-        retrieved_for_generation = hit if hit is not None and hit.match_type == MatchType.SEMANTIC else None
+        lexical_hit_for_generation = (
+            hit if hit is not None and hit.match_type == MatchType.LEXICAL and not bool(getattr(hit, "bypass_allowed", False)) else None
+        )
+
+        if (
+            hit is not None
+            and hit.match_type == MatchType.LEXICAL
+            and bool(getattr(hit, "bypass_allowed", False))
+            and self._cfg.return_memory_directly
+        ):
+            item = hit.item
+            evidence_text = getattr(item, "evidence_text", None) or item.meta.get("evidence_text")
+            return item.answer_text, {
+                "used_memory": True,
+                "generated": False,
+                "source_tier": hit.source_tier.value,
+                "match_type": hit.match_type.value,
+                "score": hit.score,
+                "lexical_used": True,
+                "lexical_bypassed": True,
+                "lexical_context_used": False,
+                "semantic_used": False,
+                "semantic_bypassed": False,
+                "semantic_candidate_rank": None,
+                "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
+                "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
+                "hit": dict(hit.debug),
+                "stored": False,
+                "stored_scopes": [],
+                "memory_lookup_ms": memory_lookup_ms,
+                "generation_ms_est": 0.0,
+                "doc_signature": getattr(item, "doc_signature", None) or item.meta.get("doc_signature"),
+                "source_file": getattr(item, "source_file", None) or item.meta.get("source_file"),
+                "chunk_index": (
+                    item.chunk_index
+                    if getattr(item, "chunk_index", None) is not None
+                    else item.meta.get("chunk_index")
+                ),
+                "chunk_id": getattr(item, "chunk_id", None) or item.meta.get("chunk_id"),
+                "question_type": getattr(item, "question_type", None) or item.meta.get("question_type"),
+                "stored_evidence_text": evidence_text,
+                "stored_evidence_chars": len(str(evidence_text)) if evidence_text is not None else None,
+                "query_evidence_text": self._query_evidence_text(mq),
+                "timings_ms": {
+                    "memory_lookup_ms": memory_lookup_ms,
+                    "generation_ms_est": 0.0,
+                    "total_ms": memory_lookup_ms,
+                },
+            }
+
+        semantic_hit_for_generation = hit if hit is not None and hit.match_type == MatchType.SEMANTIC else None
+        retrieved_for_generation = lexical_hit_for_generation or semantic_hit_for_generation
 
         gen_t0 = time.time()
         answer_text, provenance, quality = generator.generate(
@@ -1144,7 +1669,16 @@ class MemoryManager:
                 "memory_context_match_type": (
                     retrieved_for_generation.match_type.value if retrieved_for_generation else None
                 ),
-                "semantic_score": retrieved_for_generation.score if retrieved_for_generation else None,
+                "semantic_score": (
+                    retrieved_for_generation.score
+                    if retrieved_for_generation and retrieved_for_generation.match_type == MatchType.SEMANTIC
+                    else None
+                ),
+                "lexical_score": (
+                    retrieved_for_generation.score
+                    if retrieved_for_generation and retrieved_for_generation.match_type == MatchType.LEXICAL
+                    else None
+                ),
                 "memory_context_doc_signature": (
                     retrieved_summary.get("doc_signature") if retrieved_summary else None
                 ),
@@ -1169,6 +1703,9 @@ class MemoryManager:
                 "memory_context_same_document": (
                     retrieved_summary.get("same_document") if retrieved_summary else None
                 ),
+                "memory_context_same_source": (
+                    retrieved_summary.get("same_source") if retrieved_summary else None
+                ),
                 "memory_context_document_relation": (
                     retrieved_summary.get("document_relation") if retrieved_summary else None
                 ),
@@ -1178,16 +1715,24 @@ class MemoryManager:
         total_ms = memory_lookup_ms + generation_ms_est
         normalized_answer_text = self._normalize_answer_for_storage(mq, answer_text)
 
+        lexical_used = retrieved_for_generation is not None and retrieved_for_generation.match_type == MatchType.LEXICAL
+        semantic_used = retrieved_for_generation is not None and retrieved_for_generation.match_type == MatchType.SEMANTIC
+
         return answer_text, {
             "used_memory": False,
             "generated": True,
             "source_tier": "compute",
             "match_type": None,
             "score": None,
-            "semantic_used": retrieved_for_generation is not None,
+            "lexical_used": bool(lexical_used),
+            "lexical_bypassed": False,
+            "lexical_context_used": bool(lexical_used),
+            "semantic_used": bool(semantic_used),
             "semantic_bypassed": False,
             "semantic_candidate_rank": (
-                retrieved_for_generation.semantic_rank if retrieved_for_generation else None
+                retrieved_for_generation.semantic_rank
+                if retrieved_for_generation and retrieved_for_generation.match_type == MatchType.SEMANTIC
+                else None
             ),
             "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
             "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
@@ -1210,14 +1755,41 @@ class MemoryManager:
             },
             "retrieval_stage": retrieval_dbg.get("retrieval_stage"),
             "retrieval_debug": retrieval_dbg,
+            "lexical_reason": retrieval_dbg.get("reason")
+                if retrieval_dbg.get("retrieval_stage") == "lexical"
+                else (retrieval_dbg.get("lexical") or {}).get("reason"),
+            "lexical_candidate_count": retrieval_dbg.get("candidate_count")
+                if retrieval_dbg.get("retrieval_stage") == "lexical"
+                else (retrieval_dbg.get("lexical") or {}).get("candidate_count"),
+            "lexical_top_score": retrieval_dbg.get("top_score")
+                if retrieval_dbg.get("retrieval_stage") == "lexical"
+                else (retrieval_dbg.get("lexical") or {}).get("top_score"),
+            "lexical_top_rank": retrieval_dbg.get("top_rank")
+                if retrieval_dbg.get("retrieval_stage") == "lexical"
+                else (retrieval_dbg.get("lexical") or {}).get("top_rank"),
+            "lexical_enabled_debug": (
+                retrieval_dbg.get("lexical_enabled")
+                if "lexical_enabled" in retrieval_dbg
+                else (retrieval_dbg.get("lexical") or {}).get("lexical_enabled")
+            ),
+            "lexical_match_type": retrieval_dbg.get("lexical_match_type")
+                if retrieval_dbg.get("retrieval_stage") == "lexical"
+                else (retrieval_dbg.get("lexical") or {}).get("lexical_match_type"),
+            "lexical_same_source": retrieval_dbg.get("same_source")
+                if retrieval_dbg.get("retrieval_stage") == "lexical"
+                else (retrieval_dbg.get("lexical") or {}).get("same_source"),
             "semantic_reason": retrieval_dbg.get("reason")
-                or (retrieval_dbg.get("semantic") or {}).get("reason"),
+                if retrieval_dbg.get("retrieval_stage") == "semantic"
+                else (retrieval_dbg.get("semantic") or {}).get("reason"),
             "semantic_candidate_count": retrieval_dbg.get("candidate_count")
-                or (retrieval_dbg.get("semantic") or {}).get("candidate_count"),
+                if retrieval_dbg.get("retrieval_stage") == "semantic"
+                else (retrieval_dbg.get("semantic") or {}).get("candidate_count"),
             "semantic_top_score": retrieval_dbg.get("top_score")
-                or (retrieval_dbg.get("semantic") or {}).get("top_score"),
+                if retrieval_dbg.get("retrieval_stage") == "semantic"
+                else (retrieval_dbg.get("semantic") or {}).get("top_score"),
             "semantic_top_rank": retrieval_dbg.get("top_rank")
-                or (retrieval_dbg.get("semantic") or {}).get("top_rank"),
+                if retrieval_dbg.get("retrieval_stage") == "semantic"
+                else (retrieval_dbg.get("semantic") or {}).get("top_rank"),
             "semantic_enabled_debug": (
                 retrieval_dbg.get("semantic_enabled")
                 if "semantic_enabled" in retrieval_dbg

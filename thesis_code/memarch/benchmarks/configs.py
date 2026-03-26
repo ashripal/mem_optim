@@ -111,11 +111,21 @@ class MemoryConfig:
     disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite"
     clear_disk_store_before_run: bool = False
 
-    retrieval_mode: str = "exact_only"
+    # retrieval_mode: str = "exact_semantic"
+    retrieval_mode: str = "lexical_gated_direct_semantic_context"
 
     promote_disk_hits_to_ram: bool = True
     return_memory_directly: bool = True
 
+    # Lexical retrieval
+    lexical_enabled: bool = False
+    lexical_threshold_context: float = 0.55
+    lexical_threshold_bypass: float = 0.90
+    lexical_top_k: int = 3
+    prefer_same_source: bool = True
+    safe_direct_reuse_tasks: list[str] = field(default_factory=lambda: ["trec"])
+
+    # Semantic retrieval
     semantic_enabled: bool = False
     semantic_threshold_context: float = 0.85
     semantic_threshold_bypass: float = 1.01
@@ -136,12 +146,34 @@ class MemoryConfig:
         if not str(self.disk_store_path).strip():
             raise ValueError("disk_store_path must be non-empty")
 
-        valid_modes = {"exact_only", "semantic_context", "semantic_bypass"}
+        valid_modes = {
+            "exact_only",
+            "lexical_context",
+            "lexical_gated_direct",
+            "semantic_context",
+            "semantic_bypass",
+            "lexical_semantic_context",
+            "lexical_gated_direct_semantic_context",
+        }
         if self.retrieval_mode not in valid_modes:
             raise ValueError(
                 f"Invalid retrieval_mode: {self.retrieval_mode!r}. "
                 f"Expected one of: {sorted(valid_modes)}"
             )
+
+        if not (0.0 <= float(self.lexical_threshold_context) <= 1.0):
+            raise ValueError("lexical_threshold_context must be in [0.0, 1.0]")
+
+        if float(self.lexical_threshold_bypass) < 0.0:
+            raise ValueError("lexical_threshold_bypass must be >= 0.0")
+
+        if float(self.lexical_threshold_bypass) < float(self.lexical_threshold_context):
+            raise ValueError(
+                "lexical_threshold_bypass must be >= lexical_threshold_context"
+            )
+
+        if int(self.lexical_top_k) <= 0:
+            raise ValueError("lexical_top_k must be > 0")
 
         if not (0.0 <= float(self.semantic_threshold_context) <= 1.0):
             raise ValueError("semantic_threshold_context must be in [0.0, 1.0]")
@@ -166,13 +198,31 @@ class MemoryConfig:
                 f"embedding_device must be one of {sorted(valid_embed_devices)}"
             )
 
+    def effective_lexical_enabled(self) -> bool:
+        return self.retrieval_mode in {
+            "lexical_context",
+            "lexical_gated_direct",
+            "lexical_semantic_context",
+            "lexical_gated_direct_semantic_context",
+        } and self.lexical_enabled
+
+    def effective_lexical_direct_enabled(self) -> bool:
+        return self.retrieval_mode in {
+            "lexical_gated_direct",
+            "lexical_gated_direct_semantic_context",
+        } and self.lexical_enabled
+
     def effective_semantic_enabled(self) -> bool:
-        return self.retrieval_mode in {"semantic_context", "semantic_bypass"} and self.semantic_enabled
+        return self.retrieval_mode in {
+            "semantic_context",
+            "semantic_bypass",
+            "lexical_semantic_context",
+            "lexical_gated_direct_semantic_context",
+        } and self.semantic_enabled
 
     def effective_bypass_enabled(self) -> bool:
         return self.retrieval_mode == "semantic_bypass" and self.semantic_enabled
-
-
+    
 @dataclass
 class BenchmarkConfig:
     """
@@ -287,6 +337,12 @@ class BenchmarkConfig:
         disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
         clear_disk_store_before_run: bool = False,
         retrieval_mode: str = "exact_only",
+        lexical_enabled: bool = False,
+        lexical_context_threshold: float = 0.55,
+        lexical_direct_threshold: float = 0.90,
+        lexical_top_k: int = 3,
+        prefer_same_source: bool = True,
+        safe_direct_reuse_tasks: Optional[list[str]] = None,
         semantic_enabled: bool = False,
         semantic_threshold_context: float = 0.85,
         semantic_threshold_bypass: float = 1.01,
@@ -339,6 +395,12 @@ class BenchmarkConfig:
                 disk_store_path=disk_store_path,
                 clear_disk_store_before_run=clear_disk_store_before_run,
                 retrieval_mode=retrieval_mode,
+                lexical_enabled=lexical_enabled,
+                lexical_context_threshold=lexical_context_threshold,
+                lexical_direct_threshold=lexical_direct_threshold,
+                lexical_top_k=lexical_top_k,
+                prefer_same_source=prefer_same_source,
+                safe_direct_reuse_tasks=safe_direct_reuse_tasks or ["trec"],
                 semantic_enabled=semantic_enabled,
                 semantic_threshold_context=semantic_threshold_context,
                 semantic_threshold_bypass=semantic_threshold_bypass,

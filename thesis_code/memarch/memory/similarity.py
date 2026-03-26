@@ -1,25 +1,31 @@
 # memarch/memory/similarity.py
 """
-Similarity utilities for semantic retrieval.
+Similarity utilities for retrieval.
 
-Phase 1 usage:
+Phase 1 / current usage:
 - exact-match retrieval remains primary
-- semantic retrieval uses brute-force cosine similarity over stored embeddings
+- semantic retrieval can use brute-force cosine similarity over stored embeddings
+- lexical retrieval provides a lightweight approximate matching signal
 - this module stays dependency-light and pure Python for easy testing
 
 This file intentionally does not know about storage tiers, MemoryItem, or indexing.
-It only provides vector scoring and ranking helpers.
+It only provides vector scoring, lexical scoring, and ranking helpers.
 """
 
 from __future__ import annotations
 
 import math
+from collections import Counter
 from typing import Iterable, List, Sequence, Tuple, TypeVar
 
 
 Vector = Sequence[float]
 T = TypeVar("T")
 
+
+# -----------------------------------------------------------------------------
+# Vector helpers (existing semantic retrieval support)
+# -----------------------------------------------------------------------------
 
 def _as_float_list(v: Vector) -> List[float]:
     """Convert a vector-like input to a concrete list of floats."""
@@ -170,3 +176,196 @@ def normalize_scores(scores: List[float]) -> List[float]:
     if mx == mn:
         return [1.0 for _ in scores]
     return [(float(s) - mn) / (mx - mn) for s in scores]
+
+
+# -----------------------------------------------------------------------------
+# Lexical retrieval helpers
+# -----------------------------------------------------------------------------
+
+def _as_token_list(tokens: Sequence[str] | None) -> List[str]:
+    """
+    Normalize token-like input to a concrete list[str], dropping empty values.
+    """
+    if not tokens:
+        return []
+    out: List[str] = []
+    for t in tokens:
+        s = str(t).strip()
+        if s:
+            out.append(s)
+    return out
+
+
+def jaccard_score(a_tokens: Sequence[str] | None, b_tokens: Sequence[str] | None) -> float:
+    """
+    Compute Jaccard similarity over token sets.
+
+    Returns:
+      value in [0, 1]
+
+    Behavior:
+    - both empty -> 1.0
+    - one empty -> 0.0
+    """
+    a = set(_as_token_list(a_tokens))
+    b = set(_as_token_list(b_tokens))
+
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+
+    inter = len(a & b)
+    union = len(a | b)
+    if union == 0:
+        return 0.0
+    return float(inter / union)
+
+
+def token_f1_score(a_tokens: Sequence[str] | None, b_tokens: Sequence[str] | None) -> float:
+    """
+    Compute token-level F1 using multiset overlap.
+
+    Returns:
+      value in [0, 1]
+
+    Behavior:
+    - both empty -> 1.0
+    - one empty -> 0.0
+    """
+    a = _as_token_list(a_tokens)
+    b = _as_token_list(b_tokens)
+
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+
+    ca = Counter(a)
+    cb = Counter(b)
+    overlap = sum((ca & cb).values())
+
+    precision = overlap / max(1, len(a))
+    recall = overlap / max(1, len(b))
+    if precision + recall == 0.0:
+        return 0.0
+    return float(2.0 * precision * recall / (precision + recall))
+
+
+def lexical_score(
+    query_norm: str,
+    query_tokens: Sequence[str] | None,
+    item_norm: str,
+    item_tokens: Sequence[str] | None,
+    *,
+    same_source: bool = False,
+    exact_bonus: float = 0.10,
+    same_source_bonus: float = 0.10,
+) -> float:
+    """
+    Compute a lightweight lexical similarity score in [0, 1].
+
+    Signals combined:
+    - token F1 (primary)
+    - Jaccard overlap
+    - exact-normalized match bonus
+    - same-source bonus
+
+    Suggested usage:
+    - exact canonical lookup first
+    - lexical_score for approximate candidate ranking
+    - high threshold for direct reuse
+    - lower threshold for context-assisted generation
+
+    Args:
+      query_norm:
+        Normalized query text
+      query_tokens:
+        Tokenized normalized query
+      item_norm:
+        Normalized candidate item text
+      item_tokens:
+        Tokenized normalized candidate item text
+      same_source:
+        Whether query and candidate come from the same source/document/file
+      exact_bonus:
+        Bonus added if normalized texts match exactly
+      same_source_bonus:
+        Bonus added if same_source is True
+
+    Returns:
+      float in [0, 1]
+    """
+    qn = (query_norm or "").strip()
+    inorm = (item_norm or "").strip()
+    qt = _as_token_list(query_tokens)
+    it = _as_token_list(item_tokens)
+
+    if not qn and not inorm:
+        return 1.0
+    if not qn or not inorm:
+        return 0.0
+
+    tf1 = token_f1_score(qt, it)
+    jac = jaccard_score(qt, it)
+
+    score = 0.75 * tf1 + 0.15 * jac
+
+    if qn == inorm:
+        score += float(exact_bonus)
+    if same_source:
+        score += float(same_source_bonus)
+
+    return max(0.0, min(1.0, float(score)))
+
+
+def top_k_lexical(
+    query_norm: str,
+    query_tokens: Sequence[str] | None,
+    candidates: Iterable[Tuple[str, Sequence[str], T]],
+    *,
+    k: int = 5,
+    min_score: float = 0.0,
+    same_source_ids: Sequence[int] | None = None,
+) -> List[Tuple[float, T]]:
+    """
+    Rank lexical candidates by `lexical_score`.
+
+    Args:
+      query_norm:
+        Normalized query text
+      query_tokens:
+        Tokenized normalized query
+      candidates:
+        Iterable of (item_norm, item_tokens, payload)
+      k:
+        Number of top results to return
+      min_score:
+        Minimum lexical score required to keep a candidate
+      same_source_ids:
+        Optional indices of candidates that should receive same_source=True.
+        This is a convenience hook; most callers will likely score candidates
+        one at a time and set same_source directly instead.
+
+    Returns:
+      List of (score, payload), sorted by descending score.
+    """
+    if k <= 0:
+        return []
+
+    same_source_idx = set(int(x) for x in (same_source_ids or []))
+    scored: List[Tuple[float, T]] = []
+
+    for idx, (item_norm, item_tokens, payload) in enumerate(candidates):
+        score = lexical_score(
+            query_norm=query_norm,
+            query_tokens=query_tokens,
+            item_norm=item_norm,
+            item_tokens=item_tokens,
+            same_source=(idx in same_source_idx),
+        )
+        if score >= min_score:
+            scored.append((score, payload))
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return scored[:k]

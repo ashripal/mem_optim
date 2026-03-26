@@ -19,10 +19,11 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, Mapping, Optional
+from typing import Any, Mapping, Optional
 
 
 _WS_RE = re.compile(r"\s+", flags=re.UNICODE)
+_PUNCT_RE = re.compile(r"[^\w\s]", flags=re.UNICODE)
 
 
 def canonicalize(text: str) -> str:
@@ -45,6 +46,87 @@ def canonicalize(text: str) -> str:
     s = text.strip()
     s = _WS_RE.sub(" ", s)
     return s
+
+
+def normalize_for_lookup(text: str) -> str:
+    """
+    Normalize text for canonicalized lookup and lightweight lexical retrieval.
+
+    Compared to `canonicalize()`, this is intentionally more aggressive:
+    - lowercase
+    - strip leading/trailing whitespace
+    - remove punctuation
+    - collapse internal whitespace
+
+    This is appropriate for:
+    - canonicalized exact lookup at the query-text level
+    - token-based lexical retrieval
+
+    It should NOT automatically replace `canonicalize()` everywhere, since
+    exact-match memory keys may still need more conservative normalization.
+    """
+    if text is None:
+        return ""
+    s = text.lower().strip()
+    s = _PUNCT_RE.sub(" ", s)
+    s = _WS_RE.sub(" ", s)
+    return s.strip()
+
+
+def tokenize_lexical(text: str) -> list[str]:
+    """
+    Tokenize text for lightweight lexical retrieval.
+
+    Tokenization strategy:
+    - normalize via `normalize_for_lookup`
+    - split on spaces
+
+    Returns:
+      list[str], possibly empty.
+    """
+    s = normalize_for_lookup(text)
+    if not s:
+        return []
+    return s.split(" ")
+
+
+def canonicalize_longbench_query(text: str) -> str:
+    """
+    Canonicalize a LongBench query string.
+
+    For now this is the same as `normalize_for_lookup()` because LongBench
+    evaluation benefits from stable normalization across formatting variants.
+
+    Keeping this as a separate function makes it easy to introduce
+    task-specific handling later without changing callers.
+    """
+    return normalize_for_lookup(text)
+
+
+def build_canonical_key(task: str, source_id: str | None, query_text: str) -> str:
+    """
+    Build a stable canonical key for dataset/query-level exact lookup.
+
+    Intended for:
+    - canonicalized exact lookup before broader lexical search
+    - query-level retrieval keyed by task + source + normalized query
+
+    This is intentionally simpler than `make_key()`:
+    - task scopes reuse across datasets/tasks
+    - source_id optionally restricts reuse to the same source/document/file
+    - query_text is normalized using LongBench/query lookup normalization
+
+    Returns:
+      hex sha256 digest
+    """
+    task_norm = canonicalize(task or "default")
+    source_norm = canonicalize(source_id or "")
+    query_norm = canonicalize_longbench_query(query_text)
+    if not query_norm:
+        raise ValueError("query_text must be non-empty after normalization")
+
+    payload = f"kcanon1|task={task_norm}|source={source_norm}|query={query_norm}"
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _stable_json_dumps(obj: Any) -> str:

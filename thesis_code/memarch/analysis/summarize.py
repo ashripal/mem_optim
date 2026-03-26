@@ -140,6 +140,10 @@ def summarize_run(log_path: str) -> RunSummary:
 
     total_ok = len(ok_events)
 
+    # -------------------------
+    # Serving path counts
+    # -------------------------
+
     used_memory_count = sum(1 for e in ok_events if bool(e.get("used_memory")))
     generated_count = sum(1 for e in ok_events if bool(e.get("generated")))
     ram_hits = sum(1 for e in ok_events if e.get("source_tier") == "ram")
@@ -149,20 +153,50 @@ def summarize_run(log_path: str) -> RunSummary:
     llm_bypassed = sum(1 for e in ok_events if bool(e.get("llm_bypassed")))
     stored_count = sum(1 for e in ok_events if bool(e.get("stored")))
 
+    # -------------------------
+    # Retrieval mode counts
+    # -------------------------
+
     exact_hits = sum(1 for e in ok_events if e.get("match_type") == "exact")
+
+    lexical_used = sum(1 for e in ok_events if bool(e.get("lexical_used")))
+    lexical_context_used = sum(1 for e in ok_events if bool(e.get("lexical_context_used")))
+    lexical_bypassed = sum(1 for e in ok_events if bool(e.get("lexical_bypassed")))
+    lexical_served_directly = sum(
+        1 for e in ok_events
+        if e.get("match_type") == "lexical" and bool(e.get("used_memory"))
+    )
+
+    semantic_used = sum(1 for e in ok_events if bool(e.get("semantic_used")))
+    semantic_context_used = sum(1 for e in ok_events if bool(e.get("semantic_context_used")))
+    semantic_bypassed = sum(1 for e in ok_events if bool(e.get("semantic_bypassed")))
     semantic_served_directly = sum(
         1 for e in ok_events
         if e.get("match_type") == "semantic" and bool(e.get("used_memory"))
     )
-    semantic_used = sum(1 for e in ok_events if bool(e.get("semantic_used")))
-    semantic_bypassed = sum(1 for e in ok_events if bool(e.get("semantic_bypassed")))
 
     match_type_counts: Dict[str, int] = {}
+    retrieval_stage_counts: Dict[str, int] = {}
+    lexical_match_type_counts: Dict[str, int] = {}
+
     for e in ok_events:
         mt = e.get("match_type")
         if mt is None:
             mt = "none"
         match_type_counts[str(mt)] = match_type_counts.get(str(mt), 0) + 1
+
+        stage = e.get("retrieval_stage")
+        if stage is None:
+            stage = "unknown"
+        retrieval_stage_counts[str(stage)] = retrieval_stage_counts.get(str(stage), 0) + 1
+
+        lmt = e.get("lexical_match_type")
+        if lmt is not None:
+            lexical_match_type_counts[str(lmt)] = lexical_match_type_counts.get(str(lmt), 0) + 1
+
+    # -------------------------
+    # Devices
+    # -------------------------
 
     devices: Dict[str, int] = {}
     for e in ok_events:
@@ -175,17 +209,56 @@ def summarize_run(log_path: str) -> RunSummary:
         for k, v in devices.items()
     }
 
+    # -------------------------
+    # Numeric retrieval stats
+    # -------------------------
+
+    lexical_scores = [
+        e.get("lexical_top_score")
+        for e in ok_events
+        if _is_number(e.get("lexical_top_score"))
+    ]
+    lexical_ranks = [
+        e.get("lexical_top_rank")
+        for e in ok_events
+        if _is_number(e.get("lexical_top_rank"))
+    ]
+    lexical_candidate_counts = [
+        e.get("lexical_candidate_count")
+        for e in ok_events
+        if _is_number(e.get("lexical_candidate_count"))
+    ]
+    lexical_same_source_flags = [
+        1.0 if bool(e.get("lexical_same_source")) else 0.0
+        for e in ok_events
+        if e.get("lexical_same_source") is not None
+    ]
+
     semantic_scores = [
         e.get("semantic_score")
         for e in ok_events
         if _is_number(e.get("semantic_score"))
     ]
-
     semantic_ranks = [
         e.get("semantic_candidate_rank")
         for e in ok_events
         if _is_number(e.get("semantic_candidate_rank"))
     ]
+    semantic_candidate_counts = [
+        e.get("semantic_candidate_count")
+        for e in ok_events
+        if _is_number(e.get("semantic_candidate_count"))
+    ]
+
+    retrieval_scores = [
+        e.get("score")
+        for e in ok_events
+        if _is_number(e.get("score"))
+    ]
+
+    # -------------------------
+    # Latency / aggregate counts
+    # -------------------------
 
     rows = ok_events
     latency_values = [e.get("latency_s") for e in rows]
@@ -195,12 +268,21 @@ def summarize_run(log_path: str) -> RunSummary:
     n_generated = sum(1 for r in rows if bool(r.get("generated", False)))
     n_memory_hits = sum(1 for r in rows if bool(r.get("used_memory", False)))
     n_exact_hits = sum(1 for r in rows if r.get("match_type") == "exact")
+    n_lexical_hits = sum(
+        1 for r in rows
+        if (r.get("hit_before_generate") or {}).get("match_type") == "lexical"
+        or r.get("match_type") == "lexical"
+        or bool(r.get("lexical_used", False))
+    )
     n_semantic_hits = sum(
         1 for r in rows
         if (r.get("hit_before_generate") or {}).get("match_type") == "semantic"
         or r.get("match_type") == "semantic"
+        or bool(r.get("semantic_used", False))
     )
-    n_semantic_context_used = sum(1 for r in rows if bool(r.get("semantic_used", False)))
+    n_lexical_context_used = sum(1 for r in rows if bool(r.get("lexical_context_used", False)))
+    n_lexical_bypass = sum(1 for r in rows if bool(r.get("lexical_bypassed", False)))
+    n_semantic_context_used = sum(1 for r in rows if bool(r.get("semantic_context_used", False)))
     n_semantic_bypass = sum(1 for r in rows if bool(r.get("semantic_bypassed", False)))
     memory_hit_rate = n_memory_hits / len(rows) if rows else 0.0
     llm_calls_saved = len(rows) - n_generated
@@ -214,6 +296,9 @@ def summarize_run(log_path: str) -> RunSummary:
         "n_memory_hits": n_memory_hits,
         "memory_hit_rate": memory_hit_rate,
         "n_exact_hits": n_exact_hits,
+        "n_lexical_hits": n_lexical_hits,
+        "n_lexical_context_used": n_lexical_context_used,
+        "n_lexical_bypass": n_lexical_bypass,
         "n_semantic_hits": n_semantic_hits,
         "n_semantic_context_used": n_semantic_context_used,
         "n_semantic_bypass": n_semantic_bypass,
@@ -240,14 +325,40 @@ def summarize_run(log_path: str) -> RunSummary:
         "retrieval": {
             "exact_hits": exact_hits,
             "exact_hit_rate": (exact_hits / total_ok) if total_ok > 0 else 0.0,
+
+            "lexical_used_count": lexical_used,
+            "lexical_used_rate": (lexical_used / total_ok) if total_ok > 0 else 0.0,
+            "lexical_context_used_count": lexical_context_used,
+            "lexical_context_used_rate": (lexical_context_used / total_ok) if total_ok > 0 else 0.0,
+            "lexical_bypassed_count": lexical_bypassed,
+            "lexical_bypassed_rate": (lexical_bypassed / total_ok) if total_ok > 0 else 0.0,
+            "lexical_served_directly": lexical_served_directly,
+
             "semantic_used_count": semantic_used,
             "semantic_used_rate": (semantic_used / total_ok) if total_ok > 0 else 0.0,
+            "semantic_context_used_count": semantic_context_used,
+            "semantic_context_used_rate": (semantic_context_used / total_ok) if total_ok > 0 else 0.0,
             "semantic_bypassed_count": semantic_bypassed,
             "semantic_bypassed_rate": (semantic_bypassed / total_ok) if total_ok > 0 else 0.0,
             "semantic_served_directly": semantic_served_directly,
+
             "match_type_counts": match_type_counts,
+            "retrieval_stage_counts": retrieval_stage_counts,
+            "lexical_match_type_counts": lexical_match_type_counts,
+
+            "retrieval_score": _numeric_stats(retrieval_scores),
+
+            "lexical_score": _numeric_stats(lexical_scores),
+            "lexical_candidate_rank": _numeric_stats(lexical_ranks),
+            "lexical_candidate_count": _numeric_stats(lexical_candidate_counts),
+            "lexical_same_source_rate": (
+                sum(lexical_same_source_flags) / len(lexical_same_source_flags)
+                if lexical_same_source_flags else None
+            ),
+
             "semantic_score": _numeric_stats(semantic_scores),
             "semantic_candidate_rank": _numeric_stats(semantic_ranks),
+            "semantic_candidate_count": _numeric_stats(semantic_candidate_counts),
         },
         "latency": {
             "total_s": latency_stats,
@@ -278,6 +389,62 @@ def summarize_run(log_path: str) -> RunSummary:
             "contains_answer": _numeric_stats([e.get("contains_answer") for e in ok_events]),
             "token_f1": _numeric_stats([e.get("token_f1") for e in ok_events]),
             "char_f1": _numeric_stats([e.get("char_f1") for e in ok_events]),
+            "by_retrieval_mode": {
+                "exact": {
+                    "exact_match": _numeric_stats([e.get("exact_match") for e in ok_events if e.get("match_type") == "exact"]),
+                    "contains_answer": _numeric_stats([e.get("contains_answer") for e in ok_events if e.get("match_type") == "exact"]),
+                    "token_f1": _numeric_stats([e.get("token_f1") for e in ok_events if e.get("match_type") == "exact"]),
+                    "char_f1": _numeric_stats([e.get("char_f1") for e in ok_events if e.get("match_type") == "exact"]),
+                },
+                "lexical_direct": {
+                    "exact_match": _numeric_stats([e.get("exact_match") for e in ok_events if bool(e.get("lexical_bypassed"))]),
+                    "contains_answer": _numeric_stats([e.get("contains_answer") for e in ok_events if bool(e.get("lexical_bypassed"))]),
+                    "token_f1": _numeric_stats([e.get("token_f1") for e in ok_events if bool(e.get("lexical_bypassed"))]),
+                    "char_f1": _numeric_stats([e.get("char_f1") for e in ok_events if bool(e.get("lexical_bypassed"))]),
+                },
+                "lexical_context": {
+                    "exact_match": _numeric_stats([e.get("exact_match") for e in ok_events if bool(e.get("lexical_context_used"))]),
+                    "contains_answer": _numeric_stats([e.get("contains_answer") for e in ok_events if bool(e.get("lexical_context_used"))]),
+                    "token_f1": _numeric_stats([e.get("token_f1") for e in ok_events if bool(e.get("lexical_context_used"))]),
+                    "char_f1": _numeric_stats([e.get("char_f1") for e in ok_events if bool(e.get("lexical_context_used"))]),
+                },
+                "semantic_context": {
+                    "exact_match": _numeric_stats([e.get("exact_match") for e in ok_events if bool(e.get("semantic_context_used"))]),
+                    "contains_answer": _numeric_stats([e.get("contains_answer") for e in ok_events if bool(e.get("semantic_context_used"))]),
+                    "token_f1": _numeric_stats([e.get("token_f1") for e in ok_events if bool(e.get("semantic_context_used"))]),
+                    "char_f1": _numeric_stats([e.get("char_f1") for e in ok_events if bool(e.get("semantic_context_used"))]),
+                },
+                "miss_compute": {
+                    "exact_match": _numeric_stats([
+                        e.get("exact_match")
+                        for e in ok_events
+                        if not bool(e.get("used_memory"))
+                        and not bool(e.get("lexical_context_used"))
+                        and not bool(e.get("semantic_context_used"))
+                    ]),
+                    "contains_answer": _numeric_stats([
+                        e.get("contains_answer")
+                        for e in ok_events
+                        if not bool(e.get("used_memory"))
+                        and not bool(e.get("lexical_context_used"))
+                        and not bool(e.get("semantic_context_used"))
+                    ]),
+                    "token_f1": _numeric_stats([
+                        e.get("token_f1")
+                        for e in ok_events
+                        if not bool(e.get("used_memory"))
+                        and not bool(e.get("lexical_context_used"))
+                        and not bool(e.get("semantic_context_used"))
+                    ]),
+                    "char_f1": _numeric_stats([
+                        e.get("char_f1")
+                        for e in ok_events
+                        if not bool(e.get("used_memory"))
+                        and not bool(e.get("lexical_context_used"))
+                        and not bool(e.get("semantic_context_used"))
+                    ]),
+                },
+            },
         },
         "tiers": {
             "source_tier_counts": {
@@ -317,6 +484,18 @@ def format_summary(summary: RunSummary) -> str:
     lines.append(
         f"Exact hits: {retrieval['exact_hits']} "
         f"({retrieval['exact_hit_rate']:.3f})"
+    )
+    lines.append(
+        f"Lexical used: {retrieval['lexical_used_count']} "
+        f"({retrieval['lexical_used_rate']:.3f})"
+    )
+    lines.append(
+        f"Lexical context: {retrieval['lexical_context_used_count']} "
+        f"({retrieval['lexical_context_used_rate']:.3f})"
+    )
+    lines.append(
+        f"Lexical bypassed: {retrieval['lexical_bypassed_count']} "
+        f"({retrieval['lexical_bypassed_rate']:.3f})"
     )
     lines.append(
         f"Semantic used: {retrieval['semantic_used_count']} "

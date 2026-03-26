@@ -2,18 +2,25 @@
 """
 Tier 1: RAM store (size-bounded LRU) for MemoryItem objects.
 
-Phase 1 goals:
+Current goals:
 - Deterministic behavior (testable)
 - Bounded memory usage (MB budget) for Jetson-class devices
 - Namespace isolation (session/user/cohort/global stored separately)
 - Store interface mirrors disk_store:
     get / put / delete / iter_namespace / stats
 
+Current retrieval support:
+- Exact-match retrieval via get(namespace, key)
+- Lexical retrieval via bounded namespace iteration
+- Semantic retrieval via bounded namespace iteration
+
 Notes:
 - We estimate item size using UTF-8 byte lengths of key fields.
   This is not perfect, but it is deterministic and portable.
 - Semantic retrieval fields are included shallowly in the estimate so
   embedding-enabled items are budgeted more realistically.
+- iter_namespace() is intentionally read-only and does not mutate LRU order.
+  The manager is responsible for ranking/filtering lexical/semantic candidates.
 
 Thread-safety:
 - This implementation is NOT thread-safe. If you later add concurrency, wrap with a lock.
@@ -37,6 +44,7 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
     - answer_text
     - minimal provenance fields
     - shallow quality/meta fields
+    - evidence/source fields
     - semantic fields (embedding model id, norm, embedding length)
 
     This is intentionally approximate but stable across platforms.
@@ -68,6 +76,23 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
     # shallow meta
     for k in item.meta.keys():
         n += b(str(k))
+
+    # evidence/source fields
+    if getattr(item, "evidence_text", None):
+        n += b(item.evidence_text)
+    if getattr(item, "doc_signature", None):
+        n += b(item.doc_signature)
+    if getattr(item, "source_file", None):
+        n += b(item.source_file)
+    if getattr(item, "chunk_id", None):
+        n += b(item.chunk_id)
+    if getattr(item, "question_type", None):
+        n += b(item.question_type)
+    if getattr(item, "answer_canonical", None):
+        n += b(item.answer_canonical)
+
+    if getattr(item, "chunk_index", None) is not None:
+        n += 16  # small fixed accounting for stored integer metadata
 
     # semantic fields
     if item.embedding_model_id:
@@ -104,6 +129,13 @@ class RamStoreLRU:
 
     Internal structure:
       self._ns_maps[namespace] = OrderedDict[key, (MemoryItem, est_bytes)]
+
+    Ordering:
+    - get() promotes an item to MRU within its namespace
+    - put() inserts/promotes an item to MRU within its namespace
+    - iter_namespace() does NOT mutate ordering
+    - global eviction selects the least-recently-used item across namespaces
+      using item.stats.last_access_utc and deterministic tie-breaking
     """
 
     def __init__(self, max_mb: int = 64, max_items: Optional[int] = None) -> None:
@@ -127,6 +159,12 @@ class RamStoreLRU:
 
     def bytes_current(self) -> int:
         return self._bytes_current
+
+    def has_namespace(self, namespace: str) -> bool:
+        if not namespace:
+            return False
+        od = self._ns_maps.get(namespace)
+        return od is not None and len(od) > 0
 
     def stats(self) -> RamStoreStats:
         s = self._stats
@@ -219,8 +257,8 @@ class RamStoreLRU:
         """
         Iterate items in a namespace from least-recently-used to most-recently-used.
 
-        This is mainly used by Phase 1 semantic retrieval for bounded brute-force scans.
-        Iteration does not mutate LRU order.
+        This is used by manager-side lexical and semantic retrieval for bounded
+        brute-force scans. Iteration does not mutate LRU order.
         """
         self._stats.iter_calls += 1
         if not namespace:

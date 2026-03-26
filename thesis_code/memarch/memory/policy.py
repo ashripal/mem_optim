@@ -2,16 +2,22 @@
 """
 Deterministic retrieval + budget policies for memarch.
 
-Phase 1 focus:
+Current behavior:
 - Exact-match routing remains primary
+- Lexical retrieval is optional and occurs after exact-match miss
 - Semantic retrieval is optional and context-assistive by default
 - Personalization-first scope ordering
-- Safety gating: freshness (TTL) + context match + version scoping
+- Safety gating:
+    - freshness (TTL)
+    - context match for exact hits
+    - version scoping
+    - task/version gating for lexical + semantic reuse
 
 Evidence-guided extension:
-- Prefer same-document semantic candidates before broader semantic matches
+- Prefer same-document lexical and semantic candidates before broader matches
 - Keep semantic retrieval context-only (no semantic direct bypass)
-- Surface cheap document-local signals for manager-side ranking/selection
+- Allow lexical direct reuse only for explicitly safe tasks and strict thresholds
+- Surface cheap document/source signals for manager-side ranking/selection
 
 This module contains decision rules, not storage or model calls.
 Keep it pure and unit-testable.
@@ -19,7 +25,7 @@ Keep it pure and unit-testable.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,9 +37,10 @@ class BudgetPolicy:
     """
     Guardrails to keep memory operations bounded on constrained devices.
 
-    Phase 1:
+    Current behavior:
       - exact-match lookups are cheap
-      - semantic retrieval may require bounded candidate scans
+      - lexical retrieval may require bounded candidate scans
+      - semantic retrieval may require bounded candidate scans + scoring
       - disk can still be slow, so reads remain capped
     """
     max_ram_reads: int = 64
@@ -60,7 +67,26 @@ class RetrievalPolicy:
     require_model_id_match: bool = True
     enforce_ttl: bool = True
 
+    # -------------------------
+    # Lexical retrieval policy
+    # -------------------------
+    lexical_enabled: bool = False
+    lexical_threshold_context: float = 0.55
+    lexical_threshold_bypass: float = 0.90
+    lexical_top_k: int = 3
+
+    # Safety gating for lexical reuse
+    require_same_task_for_lexical: bool = True
+    require_same_model_for_lexical: bool = True
+    require_same_prompt_version_for_lexical: bool = True
+
+    # Preference signals (not hard eligibility gates)
+    prefer_same_source: bool = True
+    safe_direct_reuse_tasks: List[str] = field(default_factory=lambda: ["trec"])
+
+    # -------------------------
     # Semantic retrieval policy
+    # -------------------------
     semantic_enabled: bool = False
 
     # Evidence-guided spec:
@@ -91,6 +117,18 @@ class RetrievalPolicy:
     def __post_init__(self) -> None:
         if not self.scope_order:
             raise ValueError("scope_order must be non-empty")
+
+        if not (0.0 <= float(self.lexical_threshold_context) <= 1.0):
+            raise ValueError("lexical_threshold_context must be in [0,1]")
+        if not (0.0 <= float(self.lexical_threshold_bypass) <= 1.0):
+            raise ValueError("lexical_threshold_bypass must be in [0,1]")
+        if self.lexical_top_k < 1:
+            raise ValueError("lexical_top_k must be >= 1")
+        if self.lexical_threshold_bypass < self.lexical_threshold_context:
+            raise ValueError(
+                "lexical_threshold_bypass must be >= lexical_threshold_context"
+            )
+
         if not (0.0 <= float(self.semantic_threshold_context) <= 1.0):
             raise ValueError("semantic_threshold_context must be in [0,1]")
         if not (0.0 <= float(self.semantic_threshold_bypass)):
@@ -101,6 +139,10 @@ class RetrievalPolicy:
             raise ValueError(
                 "semantic_threshold_bypass must be >= semantic_threshold_context"
             )
+
+        for task in self.safe_direct_reuse_tasks:
+            if not str(task).strip():
+                raise ValueError("safe_direct_reuse_tasks must not contain empty task names")
 
 
 def default_retrieval_policy() -> RetrievalPolicy:
@@ -166,7 +208,7 @@ def version_matches(
 
 def task_matches(mq: MemoryQuery, item: MemoryItem) -> bool:
     """
-    Task/domain gating for semantic reuse.
+    Task/domain gating for approximate reuse.
 
     We first look for an explicit task in item.meta for forward compatibility.
     If absent, we fall back to True so older stored items do not break exact retrieval.
@@ -178,7 +220,7 @@ def task_matches(mq: MemoryQuery, item: MemoryItem) -> bool:
 
 
 def _query_doc_signature(mq: MemoryQuery) -> Optional[str]:
-    if mq.doc_signature is not None:
+    if getattr(mq, "doc_signature", None) is not None:
         return mq.doc_signature
     value = mq.context.get("doc_signature")
     if value is None:
@@ -188,9 +230,35 @@ def _query_doc_signature(mq: MemoryQuery) -> Optional[str]:
 
 
 def _item_doc_signature(item: MemoryItem) -> Optional[str]:
-    if item.doc_signature is not None:
+    if getattr(item, "doc_signature", None) is not None:
         return item.doc_signature
     value = item.meta.get("doc_signature")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _query_source_file(mq: MemoryQuery) -> Optional[str]:
+    if getattr(mq, "source_file", None) is not None:
+        value = mq.source_file
+        if value is not None:
+            text = str(value).strip()
+            return text or None
+    value = mq.context.get("source_file")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _item_source_file(item: MemoryItem) -> Optional[str]:
+    if getattr(item, "source_file", None) is not None:
+        value = item.source_file
+        if value is not None:
+            text = str(value).strip()
+            return text or None
+    value = item.meta.get("source_file")
     if value is None:
         return None
     text = str(value).strip()
@@ -204,7 +272,7 @@ def same_document(
     """
     Return True only when both sides have document signatures and they match.
 
-    This is intentionally stricter than the old behavior because we now use it
+    This is intentionally stricter than older behavior because we now use it
     as a preference/ranking signal rather than an eligibility gate.
     """
     mq_doc = _query_doc_signature(mq)
@@ -215,26 +283,145 @@ def same_document(
     return mq_doc == item_doc
 
 
+def same_source(
+    mq: MemoryQuery,
+    item: MemoryItem,
+) -> bool:
+    """
+    Return True when both sides have source identifiers/files and they match.
+
+    This is weaker than same_document and is intended as a cheap lexical preference signal.
+    """
+    mq_src = _query_source_file(mq)
+    item_src = _item_source_file(item)
+
+    if mq_src is None or item_src is None:
+        return False
+    return mq_src == item_src
+
+
 def document_relation(
     mq: MemoryQuery,
     item: MemoryItem,
 ) -> str:
     """
-    Classify semantic candidate document relation.
+    Classify semantic/lexical candidate document relation.
 
     Returns:
       - "same_document" when both signatures exist and match
-      - "different_document" when both signatures exist and differ
-      - "unknown_document" when one or both signatures are unavailable
+      - "same_source" when document signatures do not match but source files do
+      - "different_document" when both document signatures exist and differ
+      - "unknown_document" when one or both signatures are unavailable and source does not match
     """
     mq_doc = _query_doc_signature(mq)
     item_doc = _item_doc_signature(item)
 
-    if mq_doc is None or item_doc is None:
-        return "unknown_document"
-    if mq_doc == item_doc:
-        return "same_document"
-    return "different_document"
+    if mq_doc is not None and item_doc is not None:
+        if mq_doc == item_doc:
+            return "same_document"
+        if same_source(mq, item):
+            return "same_source"
+        return "different_document"
+
+    if same_source(mq, item):
+        return "same_source"
+
+    return "unknown_document"
+
+
+def lexical_candidate_allowed(
+    mq: MemoryQuery,
+    item: MemoryItem,
+    *,
+    policy: RetrievalPolicy,
+    now_utc: Optional[datetime] = None,
+) -> Tuple[bool, Dict[str, Any]]:
+    """
+    Decide whether a MemoryItem is eligible to participate in lexical retrieval.
+
+    This is candidate filtering before lexical similarity thresholds are applied.
+
+    Lexical behavior:
+    - context signature is NOT required to match
+    - same-document / same-source are surfaced as preference signals
+    - lexical direct reuse remains controlled later by score + task gating
+    """
+    dbg: Dict[str, Any] = {"reason": "accepted"}
+
+    if policy.enforce_ttl and not is_fresh(item, now_utc=now_utc):
+        dbg["reason"] = "expired"
+        return False, dbg
+
+    if policy.require_same_task_for_lexical and not task_matches(mq, item):
+        dbg["reason"] = "task_mismatch"
+        dbg["item_task"] = item.meta.get("task")
+        dbg["query_task"] = mq.task
+        return False, dbg
+
+    if policy.require_same_model_for_lexical and item.provenance.model_id != mq.model_id:
+        dbg["reason"] = "model_mismatch"
+        dbg["item_model_id"] = item.provenance.model_id
+        dbg["query_model_id"] = mq.model_id
+        return False, dbg
+
+    if (
+        policy.require_same_prompt_version_for_lexical
+        and item.provenance.prompt_version != mq.prompt_version
+    ):
+        dbg["reason"] = "prompt_version_mismatch"
+        dbg["item_prompt_version"] = item.provenance.prompt_version
+        dbg["query_prompt_version"] = mq.prompt_version
+        return False, dbg
+
+    dbg["document_relation"] = document_relation(mq, item)
+    dbg["same_document"] = same_document(mq, item)
+    dbg["same_source"] = same_source(mq, item)
+    dbg["item_doc_signature"] = _item_doc_signature(item)
+    dbg["query_doc_signature"] = _query_doc_signature(mq)
+    dbg["item_source_file"] = _item_source_file(item)
+    dbg["query_source_file"] = _query_source_file(mq)
+    return True, dbg
+
+
+def lexical_decision(
+    *,
+    score: float,
+    item: MemoryItem,
+    mq: MemoryQuery,
+    policy: RetrievalPolicy,
+) -> Tuple[str, Dict[str, Any]]:
+    """
+    Decide what to do with a lexical candidate after similarity is computed.
+
+    Returns:
+      ("ignore" | "context" | "direct", debug_info)
+
+    Lexical behavior:
+    - context if score >= lexical_threshold_context
+    - direct reuse only if:
+        * score >= lexical_threshold_bypass
+        * task is in safe_direct_reuse_tasks
+    """
+    dbg: Dict[str, Any] = {
+        "score": score,
+        "lexical_threshold_context": policy.lexical_threshold_context,
+        "lexical_threshold_bypass": policy.lexical_threshold_bypass,
+        "safe_direct_reuse_tasks": list(policy.safe_direct_reuse_tasks),
+    }
+
+    if score < policy.lexical_threshold_context:
+        dbg["reason"] = "below_context_threshold"
+        return "ignore", dbg
+
+    task_l = str(mq.task or "").strip().lower()
+    safe_tasks = {str(t).strip().lower() for t in policy.safe_direct_reuse_tasks}
+
+    if score >= policy.lexical_threshold_bypass and task_l in safe_tasks:
+        dbg["reason"] = "lexical_direct"
+        return "direct", dbg
+
+    dbg["reason"] = "lexical_context"
+    return "context", dbg
 
 
 def semantic_candidate_allowed(
@@ -288,8 +475,11 @@ def semantic_candidate_allowed(
     dbg["query_context_signature"] = query_context_signature
     dbg["document_relation"] = document_relation(mq, item)
     dbg["same_document"] = same_document(mq, item)
+    dbg["same_source"] = same_source(mq, item)
     dbg["item_doc_signature"] = _item_doc_signature(item)
     dbg["query_doc_signature"] = _query_doc_signature(mq)
+    dbg["item_source_file"] = _item_source_file(item)
+    dbg["query_source_file"] = _query_source_file(mq)
     return True, dbg
 
 

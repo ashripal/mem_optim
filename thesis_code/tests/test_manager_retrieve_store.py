@@ -6,6 +6,8 @@
 #   - generator invocation on miss
 #   - deterministic scoping/namespace ordering (SESSION -> USER -> COHORT -> GLOBAL)
 #   - TTL/expiration gating (expired items must not be reused)
+#   - exact normalized retrieval
+#   - lexical retrieval (same-source preference, context-only route, gated direct reuse)
 #   - semantic retrieval as context assistance after exact-match miss
 #   - evidence-guided storage and same-document semantic preference
 #
@@ -14,9 +16,10 @@
 
 from __future__ import annotations
 
+import inspect
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
 import pytest
 
@@ -116,6 +119,28 @@ class TinyTestEmbedder:
 # Helpers
 # -------------------------
 
+def _construct_with_supported_kwargs(cls: Any, **kwargs: Any) -> Any:
+    """
+    Construct an object using only kwargs supported by its signature.
+
+    This keeps tests forward-compatible while the memarch internals evolve.
+    """
+    try:
+        sig = inspect.signature(cls)
+    except (TypeError, ValueError):
+        return cls(**kwargs)
+
+    supported = set(sig.parameters.keys())
+    filtered = {k: v for k, v in kwargs.items() if k in supported}
+    return cls(**filtered)
+
+
+def _match_type_value(x: Any) -> Any:
+    if x is None:
+        return None
+    return getattr(x, "value", x)
+
+
 def _mk_item_for_scope(
     *,
     scope: Scope,
@@ -138,7 +163,7 @@ def _mk_item_for_scope(
     """
     Create a MemoryItem consistent with manager keying.
 
-    raw_query_override is useful for semantic tests where the stored query differs
+    raw_query_override is useful for semantic/lexical tests where the stored query differs
     from the current query and therefore must not exact-match.
     """
     raw_query = raw_query_override if raw_query_override is not None else mq.raw_query
@@ -210,6 +235,12 @@ def _build_manager(
     *,
     retrieval_policy: Optional[RetrievalPolicy] = None,
     embedder=None,
+    lexical_enabled: bool = False,
+    lexical_context_threshold: float = 0.55,
+    lexical_direct_threshold: float = 0.90,
+    lexical_top_k: int = 3,
+    prefer_same_source: bool = True,
+    safe_direct_reuse_tasks: Optional[list[str]] = None,
 ) -> Tuple[MemoryManager, RamStoreLRU, DiskStoreSQLite]:
     """
     Build a fresh manager + stores for each test.
@@ -217,13 +248,29 @@ def _build_manager(
     ram = RamStoreLRU(max_mb=8)
     disk = DiskStoreSQLite(str(tmp_path / "mem.sqlite"))
 
-    mm_cfg = MemoryManagerConfig(
-        retrieval_policy=retrieval_policy or RetrievalPolicy(
-            scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL]
-        ),
+    policy = retrieval_policy or _construct_with_supported_kwargs(
+        RetrievalPolicy,
+        scope_order=[Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
+        lexical_enabled=lexical_enabled,
+        lexical_threshold_context=lexical_context_threshold,
+        lexical_threshold_bypass=lexical_direct_threshold,
+        lexical_top_k=lexical_top_k,
+        prefer_same_source=prefer_same_source,
+        safe_direct_reuse_tasks=safe_direct_reuse_tasks or ["trec"],
+    )
+
+    mm_cfg = _construct_with_supported_kwargs(
+        MemoryManagerConfig,
+        retrieval_policy=policy,
         promote_disk_hits_to_ram=True,
         return_memory_directly=True,
         embedder=embedder,
+        lexical_enabled=lexical_enabled,
+        lexical_context_threshold=lexical_context_threshold,
+        lexical_direct_threshold=lexical_direct_threshold,
+        lexical_top_k=lexical_top_k,
+        prefer_same_source=prefer_same_source,
+        safe_direct_reuse_tasks=safe_direct_reuse_tasks or ["trec"],
     )
     mgr = MemoryManager(ram=ram, disk=disk, cfg=mm_cfg)
     return mgr, ram, disk
@@ -268,6 +315,39 @@ def test_manager_miss_calls_generator_and_stores_then_hits_from_ram(tmp_path):
     disk_stats = disk.stats()
     assert ram_stats.puts >= 1
     assert disk_stats["puts"] >= 1
+
+
+def test_manager_exact_normalized_hit_collapses_whitespace(tmp_path):
+    """
+    Exact retrieval should still succeed when canonicalization collapses whitespace
+    between the stored query and the incoming query.
+    """
+    mgr, _ram, disk = _build_manager(tmp_path)
+
+    mq = MemoryQuery(
+        raw_query="Who founded the company?",
+        user_id="u1",
+        session_id="s1",
+        task="qa_task",
+        context={"dataset_context": "The company was founded by Alice Doe."},
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+    )
+
+    ns_session = "session:s1"
+    item = _mk_item_for_scope(
+        scope=Scope.SESSION,
+        namespace=ns_session,
+        mq=mq,
+        raw_query_override="Who   founded   the company?",
+        answer_text="Alice Doe",
+    )
+    disk.put(ns_session, item.key, item)
+
+    hit = mgr.retrieve(mq)
+    assert hit is not None
+    assert _match_type_value(hit.match_type) == "exact"
+    assert hit.item.answer_text == "Alice Doe"
 
 
 def test_manager_disk_hit_promotes_to_ram(tmp_path):
@@ -412,12 +492,254 @@ def test_manager_miss_after_expired_item_calls_generator(tmp_path):
 
     assert gen.call_count == 1
     assert meta.get("generated") is True
-    # assert ans.startswith("GEN:")
     assert ans == "Generated answer using the current document context only."
 
     hit = mgr.retrieve(mq)
     assert hit is not None
     assert hit.item.answer_text == ans
+
+
+# -------------------------
+# Lexical retrieval tests
+# -------------------------
+
+def test_manager_lexical_same_source_retrieval_prefers_same_document_candidate(tmp_path):
+    """
+    When lexical retrieval is enabled and multiple approximate candidates exist,
+    a same-source/same-document candidate should be preferred over a broader one.
+    """
+    mgr, _ram, disk = _build_manager(
+        tmp_path,
+        lexical_enabled=True,
+        lexical_context_threshold=0.50,
+        lexical_direct_threshold=0.95,
+        prefer_same_source=True,
+    )
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="qa_task",
+        context={
+            "dataset_context": "Device troubleshooting manual.",
+            "doc_signature": "doc-A",
+            "source_file": "manual_a.jsonl",
+        },
+        doc_signature="doc-A",
+        source_file="manual_a.jsonl",
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        question_type="qa",
+        evidence_text="Restart instructions mention the front-panel button.",
+    )
+
+    ns_user = "user:u1"
+
+    broader_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override="How do I reboot the device?",
+        answer_text="BROADER_DOC_ANSWER",
+        evidence_text="Broader document reboot instructions.",
+        doc_signature="doc-B",
+        source_file="manual_b.jsonl",
+        question_type="qa",
+    )
+    same_doc_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override="How do I reset the device?",
+        answer_text="SAME_DOC_ANSWER",
+        evidence_text="Same document restart instructions.",
+        doc_signature="doc-A",
+        source_file="manual_a.jsonl",
+        question_type="qa",
+    )
+
+    disk.put(ns_user, broader_item.key, broader_item)
+    disk.put(ns_user, same_doc_item.key, same_doc_item)
+
+    hit = mgr.retrieve(mq)
+    assert hit is not None
+    assert _match_type_value(hit.match_type) == "lexical"
+    assert hit.item.answer_text == "SAME_DOC_ANSWER"
+
+
+def test_manager_lexical_context_only_route_calls_generator_with_retrieved_hit(tmp_path):
+    """
+    For non-safe open-ended QA, a lexical hit should be used as retrieved context
+    rather than directly bypassing generation.
+    """
+    mgr, _ram, disk = _build_manager(
+        tmp_path,
+        lexical_enabled=True,
+        lexical_context_threshold=0.50,
+        lexical_direct_threshold=0.90,
+        prefer_same_source=True,
+        safe_direct_reuse_tasks=["trec"],
+    )
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="qa_task",
+        context={
+            "dataset_context": "Device troubleshooting manual.",
+            "doc_signature": "doc-reset-001",
+            "source_file": "manual.jsonl",
+        },
+        doc_signature="doc-reset-001",
+        source_file="manual.jsonl",
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        question_type="qa",
+        evidence_text="Restart instructions mention the front-panel button.",
+    )
+
+    ns_user = "user:u1"
+    lex_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override="How do I reboot the device?",
+        answer_text="Hold the reset button for ten seconds.",
+        evidence_text="Hold the reset button for ten seconds.",
+        doc_signature="doc-reset-001",
+        source_file="manual.jsonl",
+        question_type="qa",
+        answer_canonical="Hold the reset button for ten seconds.",
+    )
+    disk.put(ns_user, lex_item.key, lex_item)
+
+    ans, meta = mgr.answer(mq, gen)
+
+    assert gen.call_count == 1
+    assert gen.last_retrieved is not None
+    assert _match_type_value(gen.last_retrieved.match_type) == "lexical"
+    assert meta.get("generated") is True
+    assert meta.get("used_memory") is False
+    assert meta.get("lexical_used") is True
+    assert meta.get("lexical_bypassed") is False
+    assert "retrieved supporting memory" in ans
+
+
+def test_manager_lexical_direct_route_bypasses_generator_on_safe_task(tmp_path):
+    """
+    For safe short-label tasks like TREC, a strong lexical hit should be allowed
+    to bypass generation directly.
+    """
+    mgr, _ram, disk = _build_manager(
+        tmp_path,
+        lexical_enabled=True,
+        lexical_context_threshold=0.50,
+        lexical_direct_threshold=0.75,
+        prefer_same_source=True,
+        safe_direct_reuse_tasks=["trec"],
+    )
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="What label should class 3 get?",
+        user_id="u1",
+        session_id="s1",
+        task="trec",
+        context={
+            "dataset_context": "Short TREC context.",
+            "doc_signature": "doc-trec-1",
+            "source_file": "trec.jsonl",
+        },
+        doc_signature="doc-trec-1",
+        source_file="trec.jsonl",
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        question_type="classification",
+        answer_canonical="DESC",
+    )
+
+    ns_user = "user:u1"
+    lex_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override="What is the label for class 3?",
+        answer_text="DESC",
+        evidence_text="Class 3 maps to DESC.",
+        doc_signature="doc-trec-1",
+        source_file="trec.jsonl",
+        question_type="classification",
+        answer_canonical="DESC",
+    )
+    disk.put(ns_user, lex_item.key, lex_item)
+
+    ans, meta = mgr.answer(mq, gen)
+
+    assert gen.call_count == 0
+    assert ans == "DESC"
+    assert meta.get("used_memory") is True
+    assert meta.get("generated") is False
+    assert meta.get("lexical_used") is True
+    assert meta.get("lexical_bypassed") is True
+
+
+def test_manager_lexical_candidate_below_threshold_is_rejected(tmp_path):
+    """
+    An unrelated lexical candidate should be rejected and the manager should fall
+    back to normal generation.
+    """
+    mgr, _ram, disk = _build_manager(
+        tmp_path,
+        lexical_enabled=True,
+        lexical_context_threshold=0.70,
+        lexical_direct_threshold=0.90,
+        prefer_same_source=True,
+        safe_direct_reuse_tasks=["trec"],
+    )
+    gen = FakeGenerator()
+
+    mq = MemoryQuery(
+        raw_query="How do I restart the device?",
+        user_id="u1",
+        session_id="s1",
+        task="qa_task",
+        context={
+            "dataset_context": "Device troubleshooting manual.",
+            "doc_signature": "doc-reset-001",
+            "source_file": "manual.jsonl",
+        },
+        doc_signature="doc-reset-001",
+        source_file="manual.jsonl",
+        model_id="mistral-7b-instruct",
+        prompt_version="v1",
+        question_type="qa",
+    )
+
+    ns_user = "user:u1"
+    unrelated_item = _mk_item_for_scope(
+        scope=Scope.USER,
+        namespace=ns_user,
+        mq=mq,
+        raw_query_override="What is the population of France?",
+        answer_text="67 million",
+        evidence_text="France population is 67 million.",
+        doc_signature="doc-france-1",
+        source_file="facts.jsonl",
+        question_type="qa",
+    )
+    disk.put(ns_user, unrelated_item.key, unrelated_item)
+
+    ans, meta = mgr.answer(mq, gen)
+
+    assert gen.call_count == 1
+    assert gen.last_retrieved is None
+    assert meta.get("generated") is True
+    assert meta.get("used_memory") is False
+    assert meta.get("lexical_used") in (False, None)
+    assert ans == "Generated answer using the current document context only."
 
 
 # -------------------------
@@ -494,9 +816,9 @@ def test_manager_semantic_hit_is_used_as_generation_context_not_direct_bypass(tm
     assert meta["used_memory"] is False
     assert meta["semantic_used"] is True
     assert meta["semantic_bypassed"] is False
-    # assert "retrieved=semantic" in ans
     assert gen.last_retrieved is not None
     assert gen.last_retrieved.match_type == MatchType.SEMANTIC
+
 
 def test_manager_semantic_hit_never_direct_bypasses_even_with_low_bypass_threshold(tmp_path):
     """
@@ -725,7 +1047,6 @@ def test_manager_store_adds_embedding_fields_when_embedder_present(tmp_path):
     )
 
     ans, meta = mgr.answer(mq, gen)
-    # assert ans.startswith("GEN:")
     assert ans == "Generated answer using the current document context only."
     assert meta["generated"] is True
 
