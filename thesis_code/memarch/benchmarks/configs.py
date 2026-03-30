@@ -37,7 +37,7 @@ class WorkloadConfig:
     repeat_fraction: float = 0.0
 
     def validate(self) -> None:
-        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"}
+        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse", "exact_interleaved", "approx_interleaved", "family_clustered"}
         if self.mode not in valid_modes:
             raise ValueError(
                 f"Invalid workload mode: {self.mode!r}. "

@@ -4,10 +4,22 @@ generate_longbench_paraphrases.py
 
 Generate paraphrased LongBench question files using the OpenAI API.
 
-This script is intended to create a paraphrase-based evaluation split for the
-current thesis pipeline. It preserves the original LongBench JSONL row format
-and only rewrites the `input` field (the question), while keeping `context`,
-`answers`, and all other metadata intact.
+This script creates family-aware paraphrase evaluation data for the current
+thesis pipeline. It preserves the original LongBench JSONL row format and only
+rewrites the `input` field (the question), while keeping `context`, `answers`,
+and all other metadata intact.
+
+Updated family-aware behavior:
+- every source row gets a stable family_id
+- optionally includes the original question as the family anchor (A0)
+- each paraphrase becomes a family variant (A1, A2, ...)
+- output rows carry metadata needed by workload builders:
+    * family_id
+    * variant_id
+    * variant_kind
+    * family_size
+    * base_input
+    * original_row_id
 
 Typical flow:
 1. Resolve the LongBench repo directory.
@@ -18,6 +30,10 @@ Typical flow:
 
 Recommended default output mode is `expand_rows`, where each original question
 becomes multiple rows with paraphrased `input` values.
+
+Recommended for family-aware benchmarking:
+- use --include_original so each family contains A0 + paraphrases
+- use --mode expand_rows
 """
 from __future__ import annotations
 
@@ -29,7 +45,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 try:
     # Official OpenAI Python SDK.
@@ -43,8 +59,7 @@ except ImportError as exc:  # pragma: no cover - runtime dependency guard
 # -----------------------------
 # Constants and small utilities
 # -----------------------------
-
-DEFAULT_MODEL = "gpt-5-mini"
+DEFAULT_MODEL = "gpt-5.2"
 DEFAULT_API_ENV = "OPENAI_API_KEY"
 DEFAULT_REQUESTS_PER_MINUTE = 60
 DEFAULT_TEMPERATURE = None
@@ -65,6 +80,7 @@ class RunStats:
     api_calls: int = 0
     api_retries: int = 0
     paraphrases_written: int = 0
+    original_rows_written: int = 0
     elapsed_s: float = 0.0
 
 
@@ -94,7 +110,6 @@ class RateLimiter:
 # -----------------------------
 # LongBench file discovery
 # -----------------------------
-
 
 def extract_longbench_if_needed(repo_dir: Path, out_dir: Optional[Path] = None) -> Path:
     """
@@ -131,7 +146,6 @@ def extract_longbench_if_needed(repo_dir: Path, out_dir: Optional[Path] = None) 
     raise FileNotFoundError(f"No JSONL files found after extracting {zip_path}.")
 
 
-
 def find_task_files(jsonl_dir: Path, task_glob: str = "") -> List[Path]:
     """Find LongBench task files, optionally filtering by substring."""
     files = sorted(jsonl_dir.glob("*.jsonl"))
@@ -145,7 +159,6 @@ def find_task_files(jsonl_dir: Path, task_glob: str = "") -> List[Path]:
 # JSONL helpers
 # -----------------------------
 
-
 def iter_jsonl_rows(path: Path) -> Iterator[Tuple[int, Dict[str, Any]]]:
     """Yield `(line_number, parsed_row)` pairs from a JSONL file."""
     with path.open("r", encoding="utf-8") as f:
@@ -154,7 +167,6 @@ def iter_jsonl_rows(path: Path) -> Iterator[Tuple[int, Dict[str, Any]]]:
             if not line:
                 continue
             yield line_no, json.loads(line)
-
 
 
 def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
@@ -166,7 +178,6 @@ def write_jsonl_row(path: Path, row: Dict[str, Any]) -> None:
 # -----------------------------
 # Prompting and validation
 # -----------------------------
-
 
 def build_paraphrase_messages(
     *,
@@ -201,11 +212,9 @@ def build_paraphrase_messages(
     ]
 
 
-
 def normalize_text(text: str) -> str:
     """Lightweight normalization for duplicate and equality checks."""
     return " ".join((text or "").strip().lower().split())
-
 
 
 def looks_like_question(text: str) -> bool:
@@ -218,7 +227,6 @@ def looks_like_question(text: str) -> bool:
     if not stripped:
         return False
     return True
-
 
 
 def validate_paraphrases(
@@ -256,7 +264,6 @@ def validate_paraphrases(
         seen.add(norm)
         cleaned.append(text)
 
-    # We do not force exact count here because the caller may choose to retry.
     if len(cleaned) > expected_count:
         cleaned = cleaned[:expected_count]
     return cleaned
@@ -266,7 +273,6 @@ def validate_paraphrases(
 # OpenAI API call
 # -----------------------------
 
-
 def call_openai_for_paraphrases(
     *,
     client: OpenAI,
@@ -274,7 +280,7 @@ def call_openai_for_paraphrases(
     task_name: str,
     original_question: str,
     num_paraphrases: int,
-    temperature: float,
+    temperature: Optional[float],
     max_output_tokens: int,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
@@ -331,9 +337,46 @@ def call_openai_for_paraphrases(
 
 
 # -----------------------------
-# Row transformation
+# Family metadata helpers
 # -----------------------------
 
+def _family_id(file_name: str, original_line_no: int) -> str:
+    return f"{file_name}:{original_line_no}"
+
+
+def _variant_id(file_name: str, original_line_no: int, variant_index: int) -> str:
+    return f"{file_name}:{original_line_no}:v{variant_index}"
+
+
+def _base_row_metadata(
+    *,
+    row: Dict[str, Any],
+    file_name: str,
+    original_line_no: int,
+    model: str,
+    prompt_version: str,
+    family_size: int,
+) -> Dict[str, Any]:
+    """
+    Metadata shared by original and paraphrase variants.
+    """
+    base_input = row.get("input", "")
+    family_id = _family_id(file_name, original_line_no)
+
+    return {
+        "family_id": family_id,
+        "family_size": family_size,
+        "base_input": base_input,
+        "paraphrase_of": base_input,
+        "paraphrase_model": model,
+        "prompt_version": prompt_version,
+        "original_row_id": family_id,
+    }
+
+
+# -----------------------------
+# Row transformation
+# -----------------------------
 
 def make_output_rows(
     *,
@@ -344,45 +387,81 @@ def make_output_rows(
     model: str,
     prompt_version: str,
     mode: str,
+    include_original: bool,
 ) -> List[Dict[str, Any]]:
     """
     Convert one original row and generated paraphrases into output rows.
 
-    `expand_rows`: one output row per paraphrase.
-    `replace_input`: one output row using only the first paraphrase.
+    Modes:
+    - expand_rows:
+        one output row per paraphrase, plus optional original A0
+    - replace_input:
+        one output row using only the first paraphrase, plus optional original A0
+
+    Family-aware behavior:
+    - original row (if included) becomes variant_kind="original", paraphrase_index=-1
+    - paraphrases become variant_kind="semantic", paraphrase_index=0..N-1
     """
     rows: List[Dict[str, Any]] = []
+    family_size = len(paraphrases) + (1 if include_original else 0)
+    shared_meta = _base_row_metadata(
+        row=row,
+        file_name=file_name,
+        original_line_no=original_line_no,
+        model=model,
+        prompt_version=prompt_version,
+        family_size=family_size,
+    )
+    base_input = row.get("input", "")
+    family_id = shared_meta["family_id"]
+
+    if include_original:
+        original_row = dict(row)
+        original_row.update(shared_meta)
+        original_row["variant_id"] = _variant_id(file_name, original_line_no, 0)
+        original_row["variant_kind"] = "original"
+        original_row["paraphrase_index"] = -1
+        original_row["input"] = base_input
+        rows.append(original_row)
+
     if mode == "replace_input":
         if not paraphrases:
-            return []
+            return rows
         new_row = dict(row)
-        new_row["paraphrase_of"] = row.get("input", "")
+        new_row.update(shared_meta)
+        new_row["variant_id"] = _variant_id(
+            file_name,
+            original_line_no,
+            1 if include_original else 0,
+        )
+        new_row["variant_kind"] = "semantic"
         new_row["paraphrase_index"] = 0
-        new_row["paraphrase_model"] = model
         new_row["paraphrase_type"] = "llm_semantic_rewrite"
-        new_row["prompt_version"] = prompt_version
-        new_row["original_row_id"] = f"{file_name}:{original_line_no}"
         new_row["input"] = paraphrases[0]
         rows.append(new_row)
         return rows
 
+    start_variant_index = 1 if include_original else 0
     for idx, question in enumerate(paraphrases):
         new_row = dict(row)
-        new_row["paraphrase_of"] = row.get("input", "")
+        new_row.update(shared_meta)
+        new_row["variant_id"] = _variant_id(
+            file_name,
+            original_line_no,
+            start_variant_index + idx,
+        )
+        new_row["variant_kind"] = "semantic"
         new_row["paraphrase_index"] = idx
-        new_row["paraphrase_model"] = model
         new_row["paraphrase_type"] = "llm_semantic_rewrite"
-        new_row["prompt_version"] = prompt_version
-        new_row["original_row_id"] = f"{file_name}:{original_line_no}"
         new_row["input"] = question
         rows.append(new_row)
+
     return rows
 
 
 # -----------------------------
 # Main file processor
 # -----------------------------
-
 
 def process_file(
     *,
@@ -393,11 +472,12 @@ def process_file(
     model: str,
     paraphrases_per_question: int,
     max_examples: int,
-    temperature: float,
+    temperature: Optional[float],
     max_output_tokens: int,
     mode: str,
     prompt_version: str,
     retries: int,
+    include_original: bool,
     dry_run: bool,
     stats: RunStats,
 ) -> None:
@@ -410,7 +490,6 @@ def process_file(
     for line_no, row in iter_jsonl_rows(input_path):
         stats.rows_seen += 1
 
-        # Respect the CLI cap. This is per-file for clarity and predictability.
         if max_examples > 0 and processed >= max_examples:
             break
 
@@ -470,16 +549,18 @@ def process_file(
             model=model,
             prompt_version=prompt_version,
             mode=mode,
+            include_original=include_original,
         )
 
         for out_row in out_rows:
-            # Store lightweight token usage metadata if available; this helps with
-            # reproducibility and auditability.
             if usage_info:
                 out_row["paraphrase_usage"] = usage_info
             write_jsonl_row(output_path, out_row)
             stats.rows_written += 1
-            stats.paraphrases_written += 1
+            if out_row.get("variant_kind") == "original":
+                stats.original_rows_written += 1
+            elif out_row.get("variant_kind") == "semantic":
+                stats.paraphrases_written += 1
 
         processed += 1
 
@@ -487,7 +568,6 @@ def process_file(
 # -----------------------------
 # Summary writing
 # -----------------------------
-
 
 def write_summary(path: Path, payload: Dict[str, Any]) -> None:
     """Write a human- and machine-readable summary JSON file."""
@@ -499,7 +579,6 @@ def write_summary(path: Path, payload: Dict[str, Any]) -> None:
 # -----------------------------
 # CLI
 # -----------------------------
-
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -572,6 +651,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Whether to expand each source row into multiple rows or replace input with one paraphrase.",
     )
     parser.add_argument(
+        "--include_original",
+        action="store_true",
+        help="Include the original question as variant_kind='original' in each family.",
+    )
+    parser.add_argument(
         "--prompt_version",
         default=DEFAULT_PROMPT_VERSION,
         help="String tag stored in output metadata for reproducibility.",
@@ -594,7 +678,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
 # Entrypoint
 # -----------------------------
 
-
 def main() -> None:
     args = build_arg_parser().parse_args()
     start_ts = time.time()
@@ -602,7 +685,6 @@ def main() -> None:
     repo_dir = Path(args.repo_dir).resolve()
     out_dir = Path(args.out_dir).resolve()
 
-    # Resolve the JSONL directory. If the caller already knows it, use it.
     if args.data_dir:
         jsonl_dir = Path(args.data_dir).resolve()
         if not jsonl_dir.exists():
@@ -652,6 +734,7 @@ def main() -> None:
             mode=args.mode,
             prompt_version=args.prompt_version,
             retries=args.retries,
+            include_original=args.include_original,
             dry_run=args.dry_run,
             stats=stats,
         )
@@ -668,6 +751,7 @@ def main() -> None:
         "max_examples": args.max_examples,
         "paraphrases_per_question": args.paraphrases_per_question,
         "mode": args.mode,
+        "include_original": args.include_original,
         "model": args.model,
         "api_key_env": args.api_key_env,
         "temperature": args.temperature,
@@ -684,6 +768,7 @@ def main() -> None:
             "api_calls": stats.api_calls,
             "api_retries": stats.api_retries,
             "paraphrases_written": stats.paraphrases_written,
+            "original_rows_written": stats.original_rows_written,
             "elapsed_s": stats.elapsed_s,
         },
     }

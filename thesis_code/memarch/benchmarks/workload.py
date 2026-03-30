@@ -102,6 +102,15 @@ def build_workload_sequence(
 
     if workload_cfg.mode == "cache_pressure":
         return _build_cache_pressure(base)
+    
+    if workload_cfg.mode == "exact_interleaved":
+        return _build_exact_interleaved(base)
+
+    if workload_cfg.mode == "approx_interleaved":
+        return _build_approx_interleaved(base)
+
+    if workload_cfg.mode == "family_clustered":
+        return _build_family_clustered(base)
 
     if workload_cfg.mode == "mixed_reuse":
         return _build_mixed_reuse(
@@ -350,4 +359,65 @@ def _build_mixed_reuse(
         out.append(_clone_example(src))
 
     rng.shuffle(out)
+    return out
+
+def _group_by_family(examples: List[Example]) -> Dict[str, List[Example]]:
+    groups: Dict[str, List[Example]] = {}
+
+    for ex in examples:
+        fid = ex.get("family_id") or ex.get("original_row_id") or ex.get("example_id")
+        groups.setdefault(fid, []).append(ex)
+
+    return groups
+
+def _build_exact_interleaved(base: List[Example]) -> List[Example]:
+    out: List[Example] = []
+
+    for ex in base:
+        out.append(_clone_example(ex))
+
+    for ex in base:
+        out.append(_clone_example(ex))
+
+    return out
+
+def _build_approx_interleaved(base: List[Example]) -> List[Example]:
+    groups = _group_by_family(base)
+    out: List[Example] = []
+
+    originals = []
+    variants = []
+
+    for fam in groups.values():
+        # sort so original comes first
+        fam_sorted = sorted(fam, key=lambda x: x.get("paraphrase_index", -1))
+
+        if not fam_sorted:
+            continue
+
+        originals.append(fam_sorted[0])
+
+        if len(fam_sorted) > 1:
+            variants.append(fam_sorted[1])  # take first paraphrase
+
+    # First pass: originals
+    for ex in originals:
+        out.append(_clone_example(ex))
+
+    # Second pass: variants
+    for ex in variants:
+        out.append(_clone_example(ex))
+
+    return out
+
+def _build_family_clustered(base: List[Example]) -> List[Example]:
+    groups = _group_by_family(base)
+    out: List[Example] = []
+
+    for fam in groups.values():
+        fam_sorted = sorted(fam, key=lambda x: x.get("paraphrase_index", -1))
+
+        for ex in fam_sorted:
+            out.append(_clone_example(ex))
+
     return out
