@@ -1,21 +1,3 @@
-# memarch/memory/schema.py
-"""
-Core, shared data structures for memarch.
-
-Current focus:
-- Deterministic routing (no LLM-based policy)
-- Exact-match retrieval remains primary
-- Lexical retrieval is optional and occurs after exact-match miss
-- Semantic retrieval is optional and assistive/context-only
-- Personalization via scopes (SESSION / USER / COHORT / GLOBAL)
-
-Evidence-guided memory extension:
-- Memory can store compact grounding evidence alongside answers
-- Queries can carry document/source metadata for document-local retrieval
-- Lexical retrieval may be direct-reuse only for explicitly safe tasks
-- Semantic retrieval remains context-only by default
-"""
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
@@ -60,33 +42,39 @@ class Provenance:
     prompt_version: str
     generated_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
 
-    # Optional extra provenance fields (safe defaults)
-    generator_backend: Optional[str] = None  # e.g., "llama_cpp", "mlx", "remote_http"
-    quantization: Optional[str] = None       # e.g., "Q4_K_M"
-    context_window: Optional[int] = None     # e.g., 4096
+    generator_backend: Optional[str] = None
+    quantization: Optional[str] = None
+    context_window: Optional[int] = None
+
+    def __post_init__(self) -> None:
+        if not str(self.model_id).strip():
+            raise ValueError("Provenance.model_id must be non-empty")
+        if not str(self.prompt_version).strip():
+            raise ValueError("Provenance.prompt_version must be non-empty")
+        if self.generated_at_utc.tzinfo is None:
+            raise ValueError("Provenance.generated_at_utc must be timezone-aware (UTC)")
 
 
 @dataclass
 class QualitySignals:
     """
     Quality metadata for gating admission/reuse.
-
-    Current version:
-    - keep simple
-    - offline eval scores can be attached later
     """
-    # A generic normalized score in [0, 1] if you have one; else None.
     score: Optional[float] = None
-
-    # If you have an explicit success indicator (user feedback, oracle label).
     success: Optional[bool] = None
-
-    # Optional task-specific metrics (e.g., exact_match, rougeL, etc.)
     metrics: Dict[str, float] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.score is not None and not (0.0 <= float(self.score) <= 1.0):
             raise ValueError(f"QualitySignals.score must be in [0,1], got {self.score}")
+
+        cleaned: Dict[str, float] = {}
+        for k, v in (self.metrics or {}).items():
+            key = str(k).strip()
+            if not key:
+                raise ValueError("QualitySignals.metrics keys must be non-empty")
+            cleaned[key] = float(v)
+        self.metrics = cleaned
 
 
 @dataclass
@@ -94,6 +82,12 @@ class AccessStats:
     """Tracks usage for promotion/eviction policies."""
     access_count: int = 0
     last_access_utc: Optional[datetime] = None
+
+    def __post_init__(self) -> None:
+        if int(self.access_count) < 0:
+            raise ValueError("AccessStats.access_count must be >= 0")
+        if self.last_access_utc is not None and self.last_access_utc.tzinfo is None:
+            raise ValueError("AccessStats.last_access_utc must be timezone-aware (UTC)")
 
     def touch(self, when: Optional[datetime] = None) -> None:
         self.access_count += 1
@@ -108,58 +102,51 @@ class AccessStats:
 class MemoryQuery:
     """
     Inputs to MemoryManager for a single user request.
-
-    Keep this as the single object passed across memory/generator boundaries,
-    so pipeline code stays simple and consistent across devices.
     """
     raw_query: str
 
-    # Personalization identifiers
     user_id: Optional[str] = None
     session_id: Optional[str] = None
-
-    # Optional grouping for cohort-level memory
     cohort_id: Optional[str] = None
 
-    # Task/domain scoping (recommended to avoid cross-task contamination)
     task: str = "default"
-
-    # Context is structured and may include device/tool state, dataset metadata,
-    # recent turns, etc. Must remain JSON-serializable if logged or stored.
     context: Dict[str, Any] = field(default_factory=dict)
 
-    # Versioning to prevent stale reuse when templates change
     prompt_version: str = "v1"
-
-    # Model identity used for version scoping (e.g., "mistral-7b-instruct")
     model_id: str = "mistral-7b-instruct"
 
-    # Retrieval knobs
     allow_semantic: bool = False
     max_disk_reads: int = 16
     max_ram_reads: int = 64
 
-    # -------------------------
-    # Evidence / source metadata
-    # -------------------------
-    # These are optional so older call sites remain valid.
     doc_signature: Optional[str] = None
     source_file: Optional[str] = None
+    source_id: Optional[str] = None
     chunk_index: Optional[int] = None
     chunk_id: Optional[str] = None
     question_type: Optional[str] = None
 
-    # Optional compact local evidence derived upstream.
     evidence_text: Optional[str] = None
-
-    # Optional task-normalized answer form for cheap exact-like comparisons.
     answer_canonical: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not self.raw_query or not self.raw_query.strip():
             raise ValueError("MemoryQuery.raw_query must be non-empty")
+
+        normalized_task = str(self.task or "").strip() or "default"
+        object.__setattr__(self, "task", normalized_task)
+
+        if not str(self.prompt_version).strip():
+            raise ValueError("MemoryQuery.prompt_version must be non-empty")
+
+        if not str(self.model_id).strip():
+            raise ValueError("MemoryQuery.model_id must be non-empty")
+
         if self.max_disk_reads < 0 or self.max_ram_reads < 0:
             raise ValueError("max_disk_reads/max_ram_reads must be >= 0")
+
+        if not isinstance(self.context, dict):
+            raise TypeError("MemoryQuery.context must be a dict")
 
         if self.chunk_index is not None and self.chunk_index < 0:
             raise ValueError("MemoryQuery.chunk_index must be >= 0 when provided")
@@ -168,6 +155,8 @@ class MemoryQuery:
             raise ValueError("MemoryQuery.doc_signature must be non-empty when provided")
         if self.source_file is not None and not str(self.source_file).strip():
             raise ValueError("MemoryQuery.source_file must be non-empty when provided")
+        if self.source_id is not None and not str(self.source_id).strip():
+            raise ValueError("MemoryQuery.source_id must be non-empty when provided")
         if self.chunk_id is not None and not str(self.chunk_id).strip():
             raise ValueError("MemoryQuery.chunk_id must be non-empty when provided")
         if self.question_type is not None and not str(self.question_type).strip():
@@ -182,68 +171,37 @@ class MemoryQuery:
 class MemoryItem:
     """
     A stored memory record.
-
-    Current behavior:
-    - exact-match retrieval remains primary
-    - lexical fields reuse query_canonical plus evidence/source metadata
-    - semantic fields are optional and may be absent for older records
-
-    Evidence-guided extension:
-    - answer_text remains the reusable answer payload
-    - evidence_text stores compact grounding support for reduced-context prompting
-    - doc/source fields enable cheap same-document / same-source preference
     """
-    # Stable key (derived from canonical query + scope + namespace +
-    # context signature + versioning)
     key: str
-
-    # Scope & namespace determine who can see this memory item
     scope: Scope
-    namespace: str  # e.g., "session:<id>", "user:<id>", "cohort:<id>", "global:<task>"
+    namespace: str
 
-    # Canonical forms for debugging/auditing and collision detection
     query_canonical: str
     context_signature: str
 
-    # The actual stored content
     answer_text: str
 
-    # Provenance & quality for safe reuse
     provenance: Provenance
     quality: QualitySignals = field(default_factory=QualitySignals)
 
-    # Lifespan control
     created_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    ttl_seconds: Optional[int] = None  # None => no TTL
+    ttl_seconds: Optional[int] = None
     expires_at_utc: Optional[datetime] = None
 
-    # Usage stats (for promotion/eviction decisions)
     stats: AccessStats = field(default_factory=AccessStats)
-
-    # Free-form metadata (must remain JSON-serializable if logged/stored)
     meta: Dict[str, Any] = field(default_factory=dict)
 
-    # -------------------------
-    # Evidence / source fields
-    # -------------------------
     evidence_text: Optional[str] = None
     doc_signature: Optional[str] = None
     source_file: Optional[str] = None
+    source_id: Optional[str] = None
     chunk_index: Optional[int] = None
     chunk_id: Optional[str] = None
     question_type: Optional[str] = None
     answer_canonical: Optional[str] = None
 
-    # -------------------------
-    # Semantic retrieval fields
-    # -------------------------
-    # Stored as a plain list for JSON / SQLite compatibility.
     query_embedding: Optional[List[float]] = None
-
-    # Embedding model used to generate the vector.
     embedding_model_id: Optional[str] = None
-
-    # Useful for validation/debugging; especially if normalization behavior changes.
     embedding_norm: Optional[float] = None
 
     def __post_init__(self) -> None:
@@ -260,7 +218,9 @@ class MemoryItem:
         if not self.answer_text:
             raise ValueError("MemoryItem.answer_text must be non-empty")
 
-        # TTL/expires consistency
+        if self.created_at_utc.tzinfo is None:
+            raise ValueError("MemoryItem.created_at_utc must be timezone-aware (UTC)")
+
         if self.ttl_seconds is not None and self.ttl_seconds < 0:
             raise ValueError("MemoryItem.ttl_seconds must be >= 0 or None")
 
@@ -270,7 +230,6 @@ class MemoryItem:
         if self.expires_at_utc is not None and self.expires_at_utc.tzinfo is None:
             raise ValueError("MemoryItem.expires_at_utc must be timezone-aware (UTC)")
 
-        # Scope-specific sanity checks
         if self.scope == Scope.SESSION and not self.namespace.startswith("session:"):
             raise ValueError("SESSION scope requires namespace starting with 'session:'")
         if self.scope == Scope.USER and not self.namespace.startswith("user:"):
@@ -280,11 +239,12 @@ class MemoryItem:
         if self.scope == Scope.GLOBAL and not self.namespace.startswith("global:"):
             raise ValueError("GLOBAL scope requires namespace starting with 'global:'")
 
-        # Evidence/source field sanity
         if self.doc_signature is not None and not str(self.doc_signature).strip():
             raise ValueError("MemoryItem.doc_signature must be non-empty when provided")
         if self.source_file is not None and not str(self.source_file).strip():
             raise ValueError("MemoryItem.source_file must be non-empty when provided")
+        if self.source_id is not None and not str(self.source_id).strip():
+            raise ValueError("MemoryItem.source_id must be non-empty when provided")
         if self.chunk_index is not None and self.chunk_index < 0:
             raise ValueError("MemoryItem.chunk_index must be >= 0 when provided")
         if self.chunk_id is not None and not str(self.chunk_id).strip():
@@ -296,19 +256,26 @@ class MemoryItem:
         if self.evidence_text is not None and not str(self.evidence_text).strip():
             raise ValueError("MemoryItem.evidence_text must be non-empty when provided")
 
-        # Semantic field sanity
+        if not isinstance(self.meta, dict):
+            raise TypeError("MemoryItem.meta must be a dict")
+
         if self.query_embedding is not None:
             if not isinstance(self.query_embedding, list):
                 raise TypeError("MemoryItem.query_embedding must be a list[float] or None")
             if len(self.query_embedding) == 0:
                 raise ValueError("MemoryItem.query_embedding cannot be an empty list")
+            cleaned_vec: List[float] = []
             for i, value in enumerate(self.query_embedding):
                 try:
-                    float(value)
+                    cleaned_vec.append(float(value))
                 except (TypeError, ValueError) as exc:
                     raise TypeError(
                         f"MemoryItem.query_embedding[{i}] must be numeric, got {value!r}"
                     ) from exc
+            self.query_embedding = cleaned_vec
+
+        if self.embedding_model_id is not None and not str(self.embedding_model_id).strip():
+            raise ValueError("MemoryItem.embedding_model_id must be non-empty when provided")
 
         if self.embedding_norm is not None and float(self.embedding_norm) < 0.0:
             raise ValueError("MemoryItem.embedding_norm must be >= 0 or None")
@@ -324,24 +291,16 @@ class MemoryItem:
 class MemoryHit:
     """
     Returned by MemoryManager.retrieve() when it finds an item.
-
-    Current behavior:
-    - EXACT hits can return directly
-    - LEXICAL hits may return directly only when bypass_allowed=True
-    - SEMANTIC hits are primarily intended for context assistance
     """
     item: MemoryItem
     source_tier: SourceTier
     match_type: MatchType = MatchType.EXACT
 
-    # For EXACT this is typically 1.0. For LEXICAL/SEMANTIC it is a bounded similarity score.
     score: float = 1.0
 
-    # Rank metadata for approximate retrieval
     semantic_rank: Optional[int] = None
     bypass_allowed: bool = False
 
-    # Optional debug info (e.g., applied thresholds, filter reasons)
     debug: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -353,3 +312,5 @@ class MemoryHit:
             raise ValueError(f"MemoryHit.score must be in [0,1], got {self.score}")
         if self.semantic_rank is not None and self.semantic_rank < 1:
             raise ValueError("MemoryHit.semantic_rank must be >= 1 when provided")
+        if not isinstance(self.debug, Mapping):
+            raise TypeError("MemoryHit.debug must be a mapping")

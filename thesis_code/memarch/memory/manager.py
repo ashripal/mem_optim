@@ -1,40 +1,3 @@
-# memarch/memory/manager.py
-"""
-MemoryManager: deterministic multi-tier personalization memory.
-
-Current behavior:
-- Exact-match retrieval remains primary
-- Lexical retrieval is optional and occurs only after exact-match miss
-- Semantic retrieval is optional and occurs after exact / lexical miss
-- Retrieval order:
-    1. Exact RAM
-    2. Exact DISK
-    3. Lexical RAM / DISK candidate search
-    4. Semantic RAM / DISK candidate search
-    5. Generator fallback
-- Tiers:
-    Tier 1: RAM (RamStoreLRU)
-    Tier 2: DISK (DiskStoreSQLite)
-- On DISK exact/lexical/semantic hit, optionally promote to RAM
-- Exact hits may return directly
-- Lexical hits may return directly only for safe tasks and only above a strict threshold
-- Semantic hits remain context-only
-- On miss, call generator, then store according to admission policy
-
-Evidence-guided extension:
-- Store grounded evidence with each memory item
-- Prefer same-document lexical and semantic matches before broader matches
-- Keep semantic retrieval context-only (no semantic direct bypass)
-- Pass retrieved evidence forward for reduced-context prompting
-- Normalize task-specific outputs before admission/storage when safe
-
-Design principles:
-- Single entry point for memory decisions
-- Strict scoping to prevent cross-user contamination
-- Deterministic, bounded operations
-- Keep exact-match logic stable while adding lexical/semantic retrieval additively
-"""
-
 from __future__ import annotations
 
 import re
@@ -85,10 +48,6 @@ from memarch.utils.text import (
 )
 
 
-# -------------------------
-# Store + Generator protocols
-# -------------------------
-
 class MemoryStore(Protocol):
     def get(self, namespace: str, key: str) -> Optional[MemoryItem]: ...
     def put(self, namespace: str, key: str, item: MemoryItem) -> None: ...
@@ -101,14 +60,6 @@ class IterableMemoryStore(MemoryStore, Protocol):
 
 
 class Generator(Protocol):
-    """
-    Generator interface.
-
-    Current behavior:
-    - exact hit may return directly
-    - lexical hit may be direct-reuse or context-assisted depending on threshold/task
-    - semantic hit is passed into generator as retrieved context
-    """
     def generate(
         self,
         mq: MemoryQuery,
@@ -117,24 +68,14 @@ class Generator(Protocol):
         ...
 
 
-# -------------------------
-# Manager config
-# -------------------------
-
 @dataclass(frozen=True)
 class MemoryManagerConfig:
     retrieval_policy: RetrievalPolicy = field(default_factory=default_retrieval_policy)
     admission_policy: AdmissionPolicy = field(default_factory=default_admission_policy)
 
-    # Promote exact/lexical/semantic disk hits to RAM for faster repeat access
     promote_disk_hits_to_ram: bool = True
-
-    # If True, return exact hits directly.
-    # Lexical hits may also return directly if bypass_allowed=True.
-    # Semantic hits remain context-only in the evidence-guided design.
     return_memory_directly: bool = True
 
-    # Lexical retrieval controls
     lexical_enabled: bool = False
     lexical_context_threshold: float = 0.55
     lexical_direct_threshold: float = 0.90
@@ -142,14 +83,13 @@ class MemoryManagerConfig:
     prefer_same_source: bool = True
     safe_direct_reuse_tasks: List[str] = field(default_factory=lambda: ["trec"])
 
-    # Semantic components
     embedder: Optional[Embedder] = None
     embed_index: Optional[EmbedIndexLRU] = None
 
+    enable_storage: bool = True
+    store_in_ram: bool = True
+    store_on_disk: bool = True
 
-# -------------------------
-# MemoryManager
-# -------------------------
 
 class MemoryManager:
     _TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
@@ -166,10 +106,6 @@ class MemoryManager:
         self._cfg = cfg or MemoryManagerConfig()
         self._embedder = self._cfg.embedder
         self._embed_index = self._cfg.embed_index or EmbedIndexLRU(max_entries=10_000)
-
-    # -------------------------
-    # Small helpers
-    # -------------------------
 
     def _lexical_enabled(self) -> bool:
         pol = self._cfg.retrieval_policy
@@ -216,6 +152,16 @@ class MemoryManager:
         if getattr(mq, "source_file", None) is not None:
             return mq.source_file
         value = (mq.context or {}).get("source_file")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
+    def _query_source_id(self, mq: MemoryQuery) -> Optional[str]:
+        if getattr(mq, "source_id", None) is not None:
+            text = str(mq.source_id).strip()
+            return text or None
+        value = (mq.context or {}).get("source_id")
         if value is None:
             return None
         text = str(value).strip()
@@ -311,6 +257,18 @@ class MemoryManager:
         text = str(value).strip()
         return text or None
 
+    def _item_source_id(self, item: MemoryItem) -> Optional[str]:
+        value = getattr(item, "source_id", None)
+        if value:
+            text = str(value).strip()
+            if text:
+                return text
+        value = item.meta.get("source_id")
+        if value is None:
+            return None
+        text = str(value).strip()
+        return text or None
+
     def _item_question_type(self, item: MemoryItem) -> Optional[str]:
         value = getattr(item, "question_type", None)
         if value:
@@ -351,15 +309,6 @@ class MemoryManager:
         *,
         now: datetime,
     ) -> Tuple[bool, Dict[str, Any]]:
-        """
-        Lightweight lexical candidate filter.
-
-        Unlike exact-match acceptance, lexical candidates should not require
-        identical context signatures. We only enforce basic safety gates here:
-        - not expired
-        - same task
-        - namespace/scope already handled by outer loop
-        """
         if self._is_item_expired(item, now=now):
             return False, {"reason": "expired"}
 
@@ -397,16 +346,11 @@ class MemoryManager:
         incoming_meta: Optional[Dict[str, Any]] = None,
         raw_generated_answer: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """
-        Merge caller-provided metadata with stable evidence/source fields.
-
-        We keep these in meta for backward compatibility, even though the
-        primary fields are now also stored explicitly on MemoryItem.
-        """
         meta = dict(incoming_meta or {})
         meta.setdefault("task", mq.task)
         meta.setdefault("doc_signature", self._query_doc_signature(mq))
         meta.setdefault("source_file", self._query_source_file(mq))
+        meta.setdefault("source_id", self._query_source_id(mq))
         meta.setdefault("chunk_index", self._query_chunk_index(mq))
         meta.setdefault("chunk_id", self._query_chunk_id(mq))
         meta.setdefault("question_type", self._query_question_type(mq))
@@ -429,6 +373,7 @@ class MemoryManager:
             "semantic_rank": hit.semantic_rank,
             "doc_signature": getattr(item, "doc_signature", None) or item.meta.get("doc_signature"),
             "source_file": getattr(item, "source_file", None) or item.meta.get("source_file"),
+            "source_id": getattr(item, "source_id", None) or item.meta.get("source_id"),
             "chunk_index": (
                 item.chunk_index if getattr(item, "chunk_index", None) is not None
                 else item.meta.get("chunk_index")
@@ -445,18 +390,6 @@ class MemoryManager:
         }
 
     def _normalize_answer_for_storage(self, mq: MemoryQuery, answer_text: str) -> str:
-        """
-        Normalize generated output before admission/storage.
-
-        The main goal is to convert instruction-model TREC continuations like:
-          - "Type: Location"
-          - "OUTPUT: Invention"
-          - "Reason"
-        into valid coarse labels:
-          LOC / ENTY / DESC / ...
-
-        If normalization is not confident, return the original answer unchanged.
-        """
         text = str(answer_text or "").strip()
         if not text:
             return text
@@ -493,7 +426,6 @@ class MemoryManager:
 
         phrase = cleaned
 
-        # Strong label/synonym cues
         if any(x in phrase for x in ("ABBREVIATION", "ABBREVIATED", "ACRONYM", "SHORT FORM", "EXPRESSION ABBREVIATED")):
             return "ABBR"
 
@@ -547,10 +479,6 @@ class MemoryManager:
 
         return None
 
-    # -------------------------
-    # Exact retrieval
-    # -------------------------
-
     def _retrieve_exact(
         self,
         mq: MemoryQuery,
@@ -558,11 +486,6 @@ class MemoryManager:
         now: datetime,
         ctx_sig: str,
     ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
-        """
-        Attempt exact-match retrieval across scopes and tiers.
-
-        Exact-match behavior is intentionally kept unchanged.
-        """
         pol = self._cfg.retrieval_policy
         budget = budget_from_query(mq)
 
@@ -703,10 +626,6 @@ class MemoryManager:
             "promoted_to_ram": False,
         }
 
-    # -------------------------
-    # Lexical retrieval
-    # -------------------------
-
     def _iter_store_namespace(self, store: MemoryStore, namespace: str) -> Iterable[MemoryItem]:
         if hasattr(store, "iter_namespace"):
             return getattr(store, "iter_namespace")(namespace)
@@ -836,8 +755,6 @@ class MemoryManager:
                     same_source=bool(cdbg.get("same_document", False) or cdbg.get("same_source", False)),
                 )
 
-                # Same-document lexical matches deserve a stronger preference than
-                # the generic same_source boost embedded in lexical_score().
                 if bool(cdbg.get("same_document", False)):
                     score = min(1.0, float(score) + 0.15)
                 elif bool(cdbg.get("same_source", False)):
@@ -887,13 +804,8 @@ class MemoryManager:
         *,
         now: datetime,
     ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
-        pol = self._cfg.retrieval_policy
-        budget = budget_from_query(mq)
-
         if not self._lexical_enabled():
             return None, {"lexical_enabled": False, "reason": "policy_disabled"}
-        if not budget.allow_semantic and not self._lexical_enabled():
-            return None, {"lexical_enabled": False, "reason": "budget_disabled"}
 
         candidates, scan_dbg = self._build_lexical_candidates(mq, now=now)
         if not candidates:
@@ -923,11 +835,6 @@ class MemoryManager:
             and float(score) >= self._lexical_direct_threshold()
         )
 
-        # Conservative fallback for short-label classification tasks:
-        # if the candidate is from the same document and the task is explicitly
-        # whitelisted for direct reuse, allow bypass once the candidate has already
-        # cleared the lexical context threshold. This is mainly intended for tasks
-        # like TREC, not open-ended QA.
         if not bypass_allowed and safe_task and bool(filter_dbg.get("same_document", False)):
             q_type = str(self._query_question_type(mq) or "").strip().lower()
             i_type = str(self._item_question_type(item) or "").strip().lower()
@@ -991,10 +898,6 @@ class MemoryManager:
             **rank_dbg,
         }
 
-    # -------------------------
-    # Semantic retrieval
-    # -------------------------
-
     def _build_semantic_candidates(
         self,
         mq: MemoryQuery,
@@ -1005,12 +908,6 @@ class MemoryManager:
         List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]],
         Dict[str, Any],
     ]:
-        """
-        Collect semantic candidates from RAM and DISK after exact / lexical retrieval fails.
-
-        Payload shape:
-          (source_tier, scope, namespace, item, filter_debug)
-        """
         pol = self._cfg.retrieval_policy
         budget = budget_from_query(mq)
 
@@ -1113,9 +1010,6 @@ class MemoryManager:
         List[Tuple[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]], float, int]],
         Dict[str, Any],
     ]:
-        """
-        Rank semantic candidates while preferring same-document items first.
-        """
         same_doc_candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
         broader_candidates: List[SemanticCandidate[Tuple[SourceTier, Scope, str, MemoryItem, Dict[str, Any]]]] = []
 
@@ -1170,14 +1064,6 @@ class MemoryManager:
         now: datetime,
         ctx_sig: str,
     ) -> Tuple[Optional[MemoryHit], Dict[str, Any]]:
-        """
-        Attempt semantic retrieval after exact / lexical retrieval fails.
-
-        Evidence-guided behavior:
-        - only enabled if query + policy allow it
-        - semantic hits are used for generator context assistance
-        - direct semantic bypass is disabled
-        """
         pol = self._cfg.retrieval_policy
         budget = budget_from_query(mq)
 
@@ -1285,29 +1171,11 @@ class MemoryManager:
             **rank_dbg,
         }
 
-    # -------------------------
-    # Public retrieval API
-    # -------------------------
-
     def retrieve(
         self,
         mq: MemoryQuery,
         return_meta: bool = False,
     ):
-        """
-        Retrieval cascade:
-          1. exact RAM
-          2. exact DISK
-          3. lexical RAM/DISK
-          4. semantic RAM/DISK
-
-        By default returns only:
-          - MemoryHit on hit
-          - None on miss
-
-        If return_meta=True, returns:
-          - (MemoryHit | None, debug_dict)
-        """
         now = datetime.now(timezone.utc)
         ctx_sig = context_signature(mq.context)
 
@@ -1356,16 +1224,9 @@ class MemoryManager:
             return None, meta
         return None
 
-    # -------------------------
-    # Store path
-    # -------------------------
-
-    def _make_embedding_fields(self, mq: MemoryQuery) -> Tuple[Optional[List[float]], Optional[str], Optional[float]]:
-        """
-        Compute embedding-related fields for a stored MemoryItem.
-
-        Best-effort only. Storage should not fail just because embedding generation fails.
-        """
+    def _make_embedding_fields(
+        self, mq: MemoryQuery
+    ) -> Tuple[Optional[List[float]], Optional[str], Optional[float]]:
         if self._embedder is None:
             return None, None, None
 
@@ -1395,16 +1256,16 @@ class MemoryManager:
         quality: Optional[QualitySignals] = None,
         meta: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """
-        Store a generated answer into memory according to admission policy.
-
-        Returns:
-          debug dict describing what was stored (or why not).
-        """
         ap = self._cfg.admission_policy
         q_can = canonicalize(mq.raw_query)
         ctx_sig = context_signature(mq.context)
         now = datetime.now(timezone.utc)
+
+        if not self._cfg.enable_storage:
+            return {
+                "stored": [],
+                "skipped": [{"scope": None, "reason": "storage_disabled"}],
+            }
 
         normalized_answer_text = self._normalize_answer_for_storage(mq, answer_text)
 
@@ -1475,6 +1336,7 @@ class MemoryManager:
                 evidence_text=self._query_evidence_text(mq),
                 doc_signature=self._query_doc_signature(mq),
                 source_file=self._query_source_file(mq),
+                source_id=self._query_source_id(mq),
                 chunk_index=self._query_chunk_index(mq),
                 chunk_id=self._query_chunk_id(mq),
                 question_type=self._query_question_type(mq),
@@ -1484,24 +1346,27 @@ class MemoryManager:
                 embedding_norm=embedding_norm,
             )
 
-            try:
-                self._disk.put(ns, key, item)
-                disk_ok = True
-            except Exception as e:
-                disk_ok = False
-                stored["skipped"].append(
-                    {
-                        "scope": scope.value,
-                        "reason": "disk_write_failed",
-                        "error": str(e),
-                    }
-                )
+            disk_ok = False
+            if self._cfg.store_on_disk:
+                try:
+                    self._disk.put(ns, key, item)
+                    disk_ok = True
+                except Exception as e:
+                    stored["skipped"].append(
+                        {
+                            "scope": scope.value,
+                            "reason": "disk_write_failed",
+                            "error": str(e),
+                        }
+                    )
 
-            try:
-                self._ram.put(ns, key, item)
-                ram_ok = True
-            except Exception:
-                ram_ok = False
+            ram_ok = False
+            if self._cfg.store_in_ram:
+                try:
+                    self._ram.put(ns, key, item)
+                    ram_ok = True
+                except Exception:
+                    ram_ok = False
 
             if query_embedding is not None:
                 try:
@@ -1521,6 +1386,7 @@ class MemoryManager:
                     "embedding_model_id": embedding_model_id,
                     "doc_signature": item.doc_signature,
                     "source_file": item.source_file,
+                    "source_id": item.source_id,
                     "chunk_index": item.chunk_index,
                     "chunk_id": item.chunk_id,
                     "question_type": item.question_type,
@@ -1533,19 +1399,7 @@ class MemoryManager:
 
         return stored
 
-    # -------------------------
-    # Main entrypoint
-    # -------------------------
-
     def answer(self, mq: MemoryQuery, generator: Generator) -> Tuple[str, Dict[str, Any]]:
-        """
-        Primary entrypoint used by pipeline:
-        - retrieve from memory
-        - exact hit may return directly
-        - lexical hit may return directly or be used as retrieved context
-        - semantic hit is passed into generator as context
-        - miss -> generate and store
-        """
         hit, retrieval_dbg = self.retrieve(mq, return_meta=True)
         memory_lookup_ms = float(retrieval_dbg.get("memory_lookup_ms", 0.0) or 0.0)
 
@@ -1560,6 +1414,7 @@ class MemoryManager:
                 "used_memory": True,
                 "generated": False,
                 "source_tier": hit.source_tier.value,
+                "memory_source_tier": hit.source_tier.value,
                 "match_type": hit.match_type.value,
                 "score": hit.score,
                 "lexical_used": False,
@@ -1577,6 +1432,7 @@ class MemoryManager:
                 "generation_ms_est": 0.0,
                 "doc_signature": getattr(exact_item, "doc_signature", None) or exact_item.meta.get("doc_signature"),
                 "source_file": getattr(exact_item, "source_file", None) or exact_item.meta.get("source_file"),
+                "source_id": getattr(exact_item, "source_id", None) or exact_item.meta.get("source_id"),
                 "chunk_index": (
                     exact_item.chunk_index
                     if getattr(exact_item, "chunk_index", None) is not None
@@ -1595,7 +1451,11 @@ class MemoryManager:
             }
 
         lexical_hit_for_generation = (
-            hit if hit is not None and hit.match_type == MatchType.LEXICAL and not bool(getattr(hit, "bypass_allowed", False)) else None
+            hit
+            if hit is not None
+            and hit.match_type == MatchType.LEXICAL
+            and not bool(getattr(hit, "bypass_allowed", False))
+            else None
         )
 
         if (
@@ -1610,6 +1470,7 @@ class MemoryManager:
                 "used_memory": True,
                 "generated": False,
                 "source_tier": hit.source_tier.value,
+                "memory_source_tier": hit.source_tier.value,
                 "match_type": hit.match_type.value,
                 "score": hit.score,
                 "lexical_used": True,
@@ -1627,6 +1488,7 @@ class MemoryManager:
                 "generation_ms_est": 0.0,
                 "doc_signature": getattr(item, "doc_signature", None) or item.meta.get("doc_signature"),
                 "source_file": getattr(item, "source_file", None) or item.meta.get("source_file"),
+                "source_id": getattr(item, "source_id", None) or item.meta.get("source_id"),
                 "chunk_index": (
                     item.chunk_index
                     if getattr(item, "chunk_index", None) is not None
@@ -1685,6 +1547,9 @@ class MemoryManager:
                 "memory_context_source_file": (
                     retrieved_summary.get("source_file") if retrieved_summary else None
                 ),
+                "memory_context_source_id": (
+                    retrieved_summary.get("source_id") if retrieved_summary else None
+                ),
                 "memory_context_chunk_index": (
                     retrieved_summary.get("chunk_index") if retrieved_summary else None
                 ),
@@ -1715,15 +1580,34 @@ class MemoryManager:
         total_ms = memory_lookup_ms + generation_ms_est
         normalized_answer_text = self._normalize_answer_for_storage(mq, answer_text)
 
-        lexical_used = retrieved_for_generation is not None and retrieved_for_generation.match_type == MatchType.LEXICAL
-        semantic_used = retrieved_for_generation is not None and retrieved_for_generation.match_type == MatchType.SEMANTIC
+        lexical_used = (
+            retrieved_for_generation is not None
+            and retrieved_for_generation.match_type == MatchType.LEXICAL
+        )
+        semantic_used = (
+            retrieved_for_generation is not None
+            and retrieved_for_generation.match_type == MatchType.SEMANTIC
+        )
 
         return answer_text, {
-            "used_memory": False,
+            "used_memory": retrieved_for_generation is not None,
             "generated": True,
             "source_tier": "compute",
-            "match_type": None,
-            "score": None,
+            "memory_source_tier": (
+                retrieved_for_generation.source_tier.value
+                if retrieved_for_generation is not None
+                else None
+            ),
+            "match_type": (
+                retrieved_for_generation.match_type.value
+                if retrieved_for_generation is not None
+                else None
+            ),
+            "score": (
+                retrieved_for_generation.score
+                if retrieved_for_generation is not None
+                else None
+            ),
             "lexical_used": bool(lexical_used),
             "lexical_bypassed": False,
             "lexical_context_used": bool(lexical_used),
@@ -1797,23 +1681,27 @@ class MemoryManager:
             ),
             "doc_signature": self._query_doc_signature(mq),
             "source_file": self._query_source_file(mq),
+            "source_id": self._query_source_id(mq),
             "chunk_index": self._query_chunk_index(mq),
             "chunk_id": self._query_chunk_id(mq),
             "question_type": self._query_question_type(mq),
             "query_evidence_text": self._query_evidence_text(mq),
             "query_evidence_chars": (
-                len(str(self._query_evidence_text(mq))) if self._query_evidence_text(mq) is not None else None
+                len(str(self._query_evidence_text(mq)))
+                if self._query_evidence_text(mq) is not None
+                else None
             ),
             "retrieved_memory": retrieved_summary,
             "stored_evidence_text": self._query_evidence_text(mq),
             "stored_evidence_chars": (
-                len(str(self._query_evidence_text(mq))) if self._query_evidence_text(mq) is not None else None
+                len(str(self._query_evidence_text(mq)))
+                if self._query_evidence_text(mq) is not None
+                else None
             ),
             "normalized_answer_for_storage": normalized_answer_text,
         }
 
     def stats(self) -> Dict[str, Any]:
-        """Return combined stats from RAM, DISK, and embedding cache."""
         return {
             "ram": getattr(self._ram, "stats")() if callable(getattr(self._ram, "stats", None)) else None,
             "disk": getattr(self._disk, "stats")() if callable(getattr(self._disk, "stats", None)) else None,

@@ -1,28 +1,3 @@
-# memarch/models/generator.py
-"""
-Generation backend for memarch using Hugging Face Transformers.
-
-Purpose:
-- Provide a stable generation interface for MemoryManager
-- Make it easy to switch from the fake demo generator to a real local model
-- Keep prompt construction explicit so we can prove:
-    1) dataset context is used
-    2) optional retrieved memory can be injected
-    3) behavior is portable across Mac / Jetson / other constrained devices
-
-Evidence-guided design:
-- Exact hits may return directly from MemoryManager
-- Semantic hits are context assistance only
-- Retrieved evidence is preferred over full long context when available
-- Full context is still available when no memory support exists
-- Returns:
-    (answer_text, Provenance, QualitySignals)
-
-Important:
-- This module does NOT implement caching or routing.
-- MemoryManager decides whether generation is needed.
-"""
-
 from __future__ import annotations
 
 import re
@@ -193,7 +168,7 @@ class HFGenerator:
             torch_dtype=self.model_dtype,
         )
         self.model.eval()
-        self.model.to(self.device)
+        self.model.to(device=self.device, dtype=self.model_dtype)
 
         self.last_prompt: Optional[str] = None
         self.last_generation_meta: Optional[Dict[str, object]] = None
@@ -231,9 +206,10 @@ class HFGenerator:
             return torch.float32
 
         if dtype_name == "float16":
-            return torch.float16
+            # CPU float16 inference is usually slow/fragile for this benchmark path.
+            return torch.float32 if device == "cpu" else torch.float16
         if dtype_name == "bfloat16":
-            return torch.bfloat16
+            return torch.float32 if device == "cpu" else torch.bfloat16
         if dtype_name == "float32":
             return torch.float32
 
@@ -292,11 +268,6 @@ class HFGenerator:
         return text[:max_chars].rstrip()
 
     def _model_max_positions(self) -> int:
-        """
-        Best-effort detection of the model's usable position window.
-
-        Must remain robust for unit-test doubles that may not expose `.config`.
-        """
         model_config = getattr(self.model, "config", None)
         if model_config is None:
             return int(self.cfg.max_input_length)
@@ -316,10 +287,6 @@ class HFGenerator:
         return int(self.cfg.max_input_length)
 
     def _effective_prompt_token_budget(self) -> int:
-        """
-        Reserve space for generation so we never overflow the model's
-        positional embedding window.
-        """
         model_limit = self._model_max_positions()
         requested_input = int(self.cfg.max_input_length)
         requested_new = max(1, int(self.cfg.max_new_tokens))
@@ -328,9 +295,6 @@ class HFGenerator:
         return max(1, safe_budget)
 
     def _allowed_new_tokens(self, input_tokens: int) -> int:
-        """
-        Cap generation so input_tokens + new_tokens never exceeds the model limit.
-        """
         model_limit = self._model_max_positions()
         remaining = max(0, int(model_limit) - int(input_tokens))
         return max(0, min(int(self.cfg.max_new_tokens), remaining))
@@ -341,7 +305,6 @@ class HFGenerator:
 
         mode = (self.cfg.decoding_mode or "greedy").lower().strip()
 
-        # Beam search and sampling rely on HF generate().
         if mode in {"beam", "sample"}:
             return "hf_generate"
 
@@ -413,7 +376,8 @@ class HFGenerator:
             f"same_document={str(bool(same_doc)).lower()}",
         ]
         if retrieved.semantic_rank is not None:
-            meta_parts.append(f"semantic_rank={retrieved.semantic_rank}")
+            metaParts_extra = f"semantic_rank={retrieved.semantic_rank}"
+            meta_parts.append(metaParts_extra)
 
         lines = [
             "RETRIEVED MEMORY SUPPORT:",
@@ -464,16 +428,26 @@ class HFGenerator:
             "Return exactly one label and nothing else.",
         ]
 
-        if (
-            retrieved is not None
-            and self.cfg.include_retrieved_memory_context
-            and retrieved.match_type == MatchType.SEMANTIC
-        ):
+        retrieved_block = ""
+        retrieved_evidence = None
+        same_doc = None
+
+        if retrieved is not None and self.cfg.include_retrieved_memory_context:
+            retrieved_block = self._retrieved_section(mq, retrieved)
+            retrieved_evidence = self._truncate_chars(
+                self._retrieved_evidence_text(retrieved),
+                int(self.cfg.max_evidence_chars),
+            )
+            same_doc = self._retrieved_same_document(mq, retrieved)
+
             retrieved_answer = self._safe_text(retrieved.item.answer_text)
             if retrieved_answer:
                 parts.append(
-                    f"Related prior label or answer (use only if helpful): {self._truncate_chars(retrieved_answer, 80)}"
+                    "Related prior label or answer (use only if helpful and consistent): "
+                    f"{self._truncate_chars(retrieved_answer, 80)}"
                 )
+            if retrieved_block:
+                parts.append(retrieved_block)
 
         if self.cfg.trec_use_few_shot:
             parts.extend(
@@ -498,21 +472,13 @@ class HFGenerator:
             self.last_generation_meta = {}
         self.last_generation_meta = dict(self.last_generation_meta or {})
 
-        is_semantic_reduced = (
-            retrieved is not None
-            and retrieved.match_type == MatchType.SEMANTIC
-            and self.cfg.include_retrieved_memory_context
-            and self.cfg.prefer_retrieved_evidence_context
-            and self.cfg.reduce_context_on_semantic_hit
-        )
-
-        self.last_generation_meta["reduced_context_used"] = is_semantic_reduced
+        self.last_generation_meta["reduced_context_used"] = bool(retrieved is not None and retrieved_block)
         self.last_generation_meta["full_context_chars"] = len(self._query_dataset_context(mq))
-        self.last_generation_meta["final_context_chars"] = 0
-        self.last_generation_meta["retrieved_evidence_chars"] = None
-        self.last_generation_meta["retrieved_doc_signature_match"] = (
-            self._retrieved_same_document(mq, retrieved) if retrieved is not None else None
+        self.last_generation_meta["final_context_chars"] = len(retrieved_block) if retrieved_block else 0
+        self.last_generation_meta["retrieved_evidence_chars"] = (
+            len(retrieved_evidence) if retrieved_evidence else None
         )
+        self.last_generation_meta["retrieved_doc_signature_match"] = same_doc
 
         return prompt
 
@@ -661,8 +627,10 @@ class HFGenerator:
 
         return generated_ids
 
-    def _move_model(self, device: str) -> None:
-        self.model.to(device)
+    def _move_model(self, device: str, dtype=None) -> None:
+        if dtype is None:
+            dtype = self.model_dtype
+        self.model.to(device=device, dtype=dtype)
         self.device = device
 
     def _record_meta(
@@ -717,13 +685,6 @@ class HFGenerator:
         self.last_generation_meta = meta
 
     def _effective_char_budget(self, requested_chars: int) -> int:
-        """
-        Scale character-level context budgets to the configured token budget.
-
-        This avoids building huge prompt strings that will just be token-truncated.
-        Cheap heuristic:
-        ~4 chars/token, with a conservative fraction reserved for instructions/question.
-        """
         requested_chars = max(0, int(requested_chars))
         token_budget = max(1, int(self.cfg.max_input_length))
 
@@ -840,8 +801,8 @@ class HFGenerator:
 
         except RuntimeError as e:
             if self.device in {"cuda", "mps"} and self.cfg.cpu_fallback_on_failure:
-                self._move_model("cpu")
                 self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, "cpu")
+                self._move_model("cpu", dtype=self.model_dtype)
 
                 input_ids = input_ids.detach().to("cpu")
                 attention_mask = attention_mask.detach().to("cpu") if attention_mask is not None else None

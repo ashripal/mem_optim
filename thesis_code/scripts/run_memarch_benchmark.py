@@ -39,7 +39,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--mode",
         type=str,
         default="cold",
-        choices=["cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"],
+        choices=[
+            "cold",
+            "replay_once",
+            "replay_k",
+            "cache_pressure",
+            "mixed_reuse",
+            "exact_interleaved",
+            "approx_interleaved",
+            "family_clustered",
+        ],
     )
     parser.add_argument("--replay_k", type=int, default=2)
     parser.add_argument("--shuffle", action="store_true")
@@ -77,7 +86,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype",
         type=str,
-        default="auto",
+        default="float32",
         choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
     )
     parser.add_argument("--local_files_only", action="store_true")
@@ -102,7 +111,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--retrieval_mode",
         type=str,
-        default="exact_only",
+        default="lexical_gated_direct_semantic_context",
         choices=[
             "exact_only",
             "lexical_context",
@@ -121,7 +130,7 @@ def build_parser() -> argparse.ArgumentParser:
     # Lexical controls
     parser.add_argument("--lexical_enabled", action="store_true")
     parser.add_argument("--lexical_context_threshold", type=float, default=0.55)
-    parser.add_argument("--lexical_direct_threshold", type=float, default=0.90)
+    parser.add_argument("--lexical_direct_threshold", type=float, default=0.75)
     parser.add_argument("--lexical_top_k", type=int, default=3)
     parser.add_argument("--prefer_same_source", action="store_true", default=True)
     parser.add_argument("--no_prefer_same_source", dest="prefer_same_source", action="store_false")
@@ -134,7 +143,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Semantic controls
     parser.add_argument("--semantic_enabled", action="store_true")
-    parser.add_argument("--semantic_threshold_context", type=float, default=0.85)
+    parser.add_argument("--semantic_threshold_context", type=float, default=0.75)
     parser.add_argument("--semantic_threshold_bypass", type=float, default=1.01)
     parser.add_argument("--max_semantic_candidates", type=int, default=5)
 

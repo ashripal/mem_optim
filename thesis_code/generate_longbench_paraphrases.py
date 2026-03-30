@@ -48,7 +48,6 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 try:
-    # Official OpenAI Python SDK.
     from openai import OpenAI
 except ImportError as exc:  # pragma: no cover - runtime dependency guard
     raise SystemExit(
@@ -65,6 +64,10 @@ DEFAULT_REQUESTS_PER_MINUTE = 60
 DEFAULT_TEMPERATURE = None
 DEFAULT_MAX_OUTPUT_TOKENS = 256
 DEFAULT_PROMPT_VERSION = "v1"
+DEFAULT_REQUEST_TIMEOUT_S = 60.0
+DEFAULT_CONNECT_TIMEOUT_S = 20.0
+DEFAULT_RETRY_BACKOFF_BASE_S = 2.0
+DEFAULT_PROGRESS_EVERY = 1
 
 
 @dataclass
@@ -105,6 +108,14 @@ class RateLimiter:
         if delta < min_interval:
             time.sleep(min_interval - delta)
         self._last_request_ts = time.time()
+
+
+def log_info(message: str) -> None:
+    print(message, flush=True)
+
+
+def log_warn(message: str) -> None:
+    print(message, file=sys.stderr, flush=True)
 
 
 # -----------------------------
@@ -282,6 +293,7 @@ def call_openai_for_paraphrases(
     num_paraphrases: int,
     temperature: Optional[float],
     max_output_tokens: int,
+    request_timeout_s: float,
 ) -> Tuple[List[str], Dict[str, Any]]:
     """
     Request paraphrases from the OpenAI API.
@@ -300,6 +312,7 @@ def call_openai_for_paraphrases(
         messages=messages,
         temperature=temperature,
         max_completion_tokens=max_output_tokens,
+        timeout=request_timeout_s,
         response_format={
             "type": "json_schema",
             "json_schema": {
@@ -413,7 +426,7 @@ def make_output_rows(
         family_size=family_size,
     )
     base_input = row.get("input", "")
-    family_id = shared_meta["family_id"]
+    file_line_family_id = shared_meta["family_id"]
 
     if include_original:
         original_row = dict(row)
@@ -480,6 +493,9 @@ def process_file(
     include_original: bool,
     dry_run: bool,
     stats: RunStats,
+    request_timeout_s: float,
+    retry_backoff_base_s: float,
+    progress_every: int,
 ) -> None:
     """Process one LongBench JSONL file and write its paraphrased output."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -487,6 +503,8 @@ def process_file(
         output_path.unlink()
 
     processed = 0
+    progress_every = max(1, int(progress_every))
+
     for line_no, row in iter_jsonl_rows(input_path):
         stats.rows_seen += 1
 
@@ -500,7 +518,17 @@ def process_file(
 
         if dry_run:
             processed += 1
+            if processed % progress_every == 0:
+                log_info(
+                    f"[dry-run] {input_path.name} row={processed} line={line_no}"
+                )
             continue
+
+        log_info(
+            f"[info] {input_path.name} row={processed + 1}"
+            f"{f'/{max_examples}' if max_examples > 0 else ''}"
+            f" line={line_no} requesting paraphrases..."
+        )
 
         paraphrases: List[str] = []
         usage_info: Dict[str, Any] = {}
@@ -521,24 +549,51 @@ def process_file(
                     num_paraphrases=paraphrases_per_question,
                     temperature=temperature,
                     max_output_tokens=max_output_tokens,
+                    request_timeout_s=request_timeout_s,
                 )
+
                 paraphrases = validate_paraphrases(
                     original_question=original_question,
                     paraphrases=raw_paraphrases,
                     expected_count=paraphrases_per_question,
                 )
+
                 if len(paraphrases) >= 1:
                     break
+
+                if attempt < retries:
+                    backoff_s = retry_backoff_base_s * (2 ** attempt)
+                    log_warn(
+                        f"[warn] {input_path.name}:{line_no} returned no usable paraphrases "
+                        f"on attempt {attempt + 1}/{retries + 1}; retrying in {backoff_s:.1f}s"
+                    )
+                    time.sleep(backoff_s)
+
+            except KeyboardInterrupt:
+                raise
             except Exception as exc:  # pragma: no cover - API/network dependent
                 last_error = exc
+                if attempt < retries:
+                    backoff_s = retry_backoff_base_s * (2 ** attempt)
+                    log_warn(
+                        f"[warn] Failed {input_path.name}:{line_no} "
+                        f"attempt {attempt + 1}/{retries + 1}: {exc} "
+                        f"(retrying in {backoff_s:.1f}s)"
+                    )
+                    time.sleep(backoff_s)
 
         if not paraphrases:
             stats.rows_failed += 1
             if last_error is not None:
-                print(
-                    f"[warn] Failed to paraphrase {input_path.name}:{line_no}: {last_error}",
-                    file=sys.stderr,
+                log_warn(
+                    f"[warn] Failed to paraphrase {input_path.name}:{line_no}: {last_error}"
                 )
+            else:
+                log_warn(
+                    f"[warn] Failed to paraphrase {input_path.name}:{line_no}: "
+                    "model returned no usable paraphrases"
+                )
+            processed += 1
             continue
 
         out_rows = make_output_rows(
@@ -563,6 +618,12 @@ def process_file(
                 stats.paraphrases_written += 1
 
         processed += 1
+        if processed % progress_every == 0:
+            log_info(
+                f"[info] {input_path.name} completed row={processed}"
+                f"{f'/{max_examples}' if max_examples > 0 else ''}; "
+                f"usable_paraphrases={len(paraphrases)} total_rows_written={stats.rows_written}"
+            )
 
 
 # -----------------------------
@@ -667,6 +728,30 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Number of retries after the first failed paraphrase attempt.",
     )
     parser.add_argument(
+        "--request_timeout_s",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_S,
+        help="Per-request timeout in seconds for the OpenAI API call.",
+    )
+    parser.add_argument(
+        "--connect_timeout_s",
+        type=float,
+        default=DEFAULT_CONNECT_TIMEOUT_S,
+        help="Client connection timeout in seconds.",
+    )
+    parser.add_argument(
+        "--retry_backoff_base_s",
+        type=float,
+        default=DEFAULT_RETRY_BACKOFF_BASE_S,
+        help="Base seconds for exponential retry backoff.",
+    )
+    parser.add_argument(
+        "--progress_every",
+        type=int,
+        default=DEFAULT_PROGRESS_EVERY,
+        help="Print progress every N processed source rows.",
+    )
+    parser.add_argument(
         "--dry_run",
         action="store_true",
         help="Discover files and count rows without making OpenAI API calls or writing output.",
@@ -698,13 +783,13 @@ def main() -> None:
             f"No JSONL task files found in {jsonl_dir} matching task_glob={args.task_glob!r}."
         )
 
-    print(f"[info] JSONL dir: {jsonl_dir}")
-    print(f"[info] Output dir: {out_dir}")
-    print(f"[info] Files selected: {len(task_files)}")
+    log_info(f"[info] JSONL dir: {jsonl_dir}")
+    log_info(f"[info] Output dir: {out_dir}")
+    log_info(f"[info] Files selected: {len(task_files)}")
 
     if args.dry_run:
         for path in task_files:
-            print(f"[dry-run] {path.name}")
+            log_info(f"[dry-run] {path.name}")
         return
 
     api_key = os.environ.get(args.api_key_env)
@@ -713,14 +798,17 @@ def main() -> None:
             f"Missing API key. Set the environment variable {args.api_key_env}."
         )
 
-    client = OpenAI(api_key=api_key)
+    client = OpenAI(
+        api_key=api_key,
+        timeout=args.connect_timeout_s,
+    )
     limiter = RateLimiter(requests_per_minute=args.requests_per_minute)
     stats = RunStats()
 
     for input_path in task_files:
         stats.files_seen += 1
         output_path = out_dir / input_path.name
-        print(f"[info] Processing {input_path.name} -> {output_path}")
+        log_info(f"[info] Processing {input_path.name} -> {output_path}")
         process_file(
             input_path=input_path,
             output_path=output_path,
@@ -737,6 +825,9 @@ def main() -> None:
             include_original=args.include_original,
             dry_run=args.dry_run,
             stats=stats,
+            request_timeout_s=args.request_timeout_s,
+            retry_backoff_base_s=args.retry_backoff_base_s,
+            progress_every=args.progress_every,
         )
         stats.files_written += 1
 
@@ -758,6 +849,10 @@ def main() -> None:
         "max_output_tokens": args.max_output_tokens,
         "requests_per_minute": args.requests_per_minute,
         "prompt_version": args.prompt_version,
+        "request_timeout_s": args.request_timeout_s,
+        "connect_timeout_s": args.connect_timeout_s,
+        "retry_backoff_base_s": args.retry_backoff_base_s,
+        "progress_every": args.progress_every,
         "stats": {
             "files_seen": stats.files_seen,
             "files_written": stats.files_written,
@@ -773,8 +868,8 @@ def main() -> None:
         },
     }
     write_summary(out_dir / "paraphrase_run_summary.json", summary)
-    print(f"[done] Wrote paraphrased data to {out_dir}")
-    print(f"[done] Summary: {out_dir / 'paraphrase_run_summary.json'}")
+    log_info(f"[done] Wrote paraphrased data to {out_dir}")
+    log_info(f"[done] Summary: {out_dir / 'paraphrase_run_summary.json'}")
 
 
 if __name__ == "__main__":

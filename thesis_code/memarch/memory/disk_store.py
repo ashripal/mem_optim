@@ -1,36 +1,3 @@
-# memarch/memory/disk_store.py
-"""
-Tier 2: Disk store (portable, persistent) for MemoryItem objects.
-
-Current goals:
-- Cross-platform (macOS + Jetson Linux + other constrained devices)
-- No external services/daemons
-- Deterministic semantics matching RamStoreLRU interface:
-    get(namespace, key) -> Optional[MemoryItem]
-    put(namespace, key, item) -> None
-    delete(namespace, key) -> None
-    iter_namespace(namespace) -> Iterator[MemoryItem]
-    iter_candidates(namespace, ...) -> Iterator[MemoryItem]
-    stats() -> Dict[str, int]
-    close() -> None
-
-Implementation choice:
-- SQLite via Python stdlib sqlite3 (no extra dependency).
-- Store full MemoryItem as JSON (TEXT), with a small schema version.
-
-Notes:
-- This is not designed for multi-process concurrent writers. Single-process usage is assumed.
-- SQLite WAL mode is enabled for better write performance.
-- Semantic retrieval fields are stored as part of the serialized MemoryItem payload.
-- Evidence-guided fields are also stored explicitly so disk-restored items behave
-  the same as RAM-resident items.
-
-Retrieval support:
-- Exact retrieval uses get(namespace, key)
-- Lexical/semantic retrieval can use iter_namespace(namespace) for bounded brute-force scans
-- iter_candidates(...) provides a convenience coarse filter for future manager optimizations
-"""
-
 from __future__ import annotations
 
 import json
@@ -48,7 +15,7 @@ from memarch.memory.schema import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 def _dt_to_str(dt: Optional[datetime]) -> Optional[str]:
@@ -108,6 +75,7 @@ def _serialize_item(item: MemoryItem) -> str:
         "evidence_text": item.evidence_text,
         "doc_signature": item.doc_signature,
         "source_file": item.source_file,
+        "source_id": item.source_id,
         "chunk_index": item.chunk_index,
         "chunk_id": item.chunk_id,
         "question_type": item.question_type,
@@ -125,9 +93,9 @@ def _deserialize_item(payload: str) -> MemoryItem:
     d = json.loads(payload)
     sv = int(d.get("schema_version", 1))
 
-    if sv not in (1, 2, 3):
+    if sv not in (1, 2, 3, 4):
         raise ValueError(
-            f"Unsupported schema_version: {sv} (expected one of 1, 2, 3)"
+            f"Unsupported schema_version: {sv} (expected one of 1, 2, 3, 4)"
         )
 
     prov_d = d["provenance"]
@@ -185,6 +153,7 @@ def _deserialize_item(payload: str) -> MemoryItem:
         evidence_text=d.get("evidence_text"),
         doc_signature=d.get("doc_signature"),
         source_file=d.get("source_file"),
+        source_id=d.get("source_id"),
         chunk_index=chunk_index,
         chunk_id=d.get("chunk_id"),
         question_type=d.get("question_type"),

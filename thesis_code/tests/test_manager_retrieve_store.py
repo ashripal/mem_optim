@@ -1,19 +1,3 @@
-# tests/test_manager_retrieve_store.py
-#
-# These tests validate the end-to-end behavior of MemoryManager across:
-#   - tiered retrieval (RAM then DISK)
-#   - disk-hit promotion back to RAM
-#   - generator invocation on miss
-#   - deterministic scoping/namespace ordering (SESSION -> USER -> COHORT -> GLOBAL)
-#   - TTL/expiration gating (expired items must not be reused)
-#   - exact normalized retrieval
-#   - lexical retrieval (same-source preference, context-only route, gated direct reuse)
-#   - semantic retrieval as context assistance after exact-match miss
-#   - evidence-guided storage and same-document semantic preference
-#
-# This is one of the most important gates because it proves the architecture
-# actually behaves like a multi-tier memory system rather than a collection of modules.
-
 from __future__ import annotations
 
 import inspect
@@ -155,6 +139,7 @@ def _mk_item_for_scope(
     evidence_text: Optional[str] = None,
     doc_signature: Optional[str] = None,
     source_file: Optional[str] = None,
+    source_id: Optional[str] = None,
     chunk_index: Optional[int] = None,
     chunk_id: Optional[str] = None,
     question_type: Optional[str] = None,
@@ -188,6 +173,14 @@ def _mk_item_for_scope(
         else mq.context.get("doc_signature")
     )
 
+    resolved_source_id = (
+        source_id
+        if source_id is not None
+        else mq.source_id
+        if getattr(mq, "source_id", None) is not None
+        else mq.context.get("source_id")
+    )
+
     prov = Provenance(
         model_id=mq.model_id,
         prompt_version=mq.prompt_version,
@@ -211,6 +204,7 @@ def _mk_item_for_scope(
             "task": mq.task,
             "doc_signature": resolved_doc_signature,
             "source_file": source_file,
+            "source_id": resolved_source_id,
             "chunk_index": chunk_index,
             "chunk_id": chunk_id,
             "question_type": question_type,
@@ -220,6 +214,7 @@ def _mk_item_for_scope(
         evidence_text=evidence_text,
         doc_signature=resolved_doc_signature,
         source_file=source_file,
+        source_id=resolved_source_id,
         chunk_index=chunk_index,
         chunk_id=chunk_id,
         question_type=question_type,
@@ -525,9 +520,11 @@ def test_manager_lexical_same_source_retrieval_prefers_same_document_candidate(t
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-A",
             "source_file": "manual_a.jsonl",
+            "source_id": "manual-a",
         },
         doc_signature="doc-A",
         source_file="manual_a.jsonl",
+        source_id="manual-a",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         question_type="qa",
@@ -545,6 +542,7 @@ def test_manager_lexical_same_source_retrieval_prefers_same_document_candidate(t
         evidence_text="Broader document reboot instructions.",
         doc_signature="doc-B",
         source_file="manual_b.jsonl",
+        source_id="manual-b",
         question_type="qa",
     )
     same_doc_item = _mk_item_for_scope(
@@ -556,6 +554,7 @@ def test_manager_lexical_same_source_retrieval_prefers_same_document_candidate(t
         evidence_text="Same document restart instructions.",
         doc_signature="doc-A",
         source_file="manual_a.jsonl",
+        source_id="manual-a",
         question_type="qa",
     )
 
@@ -592,9 +591,11 @@ def test_manager_lexical_context_only_route_calls_generator_with_retrieved_hit(t
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-reset-001",
             "source_file": "manual.jsonl",
+            "source_id": "manual-reset",
         },
         doc_signature="doc-reset-001",
         source_file="manual.jsonl",
+        source_id="manual-reset",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         question_type="qa",
@@ -611,6 +612,7 @@ def test_manager_lexical_context_only_route_calls_generator_with_retrieved_hit(t
         evidence_text="Hold the reset button for ten seconds.",
         doc_signature="doc-reset-001",
         source_file="manual.jsonl",
+        source_id="manual-reset",
         question_type="qa",
         answer_canonical="Hold the reset button for ten seconds.",
     )
@@ -622,7 +624,7 @@ def test_manager_lexical_context_only_route_calls_generator_with_retrieved_hit(t
     assert gen.last_retrieved is not None
     assert _match_type_value(gen.last_retrieved.match_type) == "lexical"
     assert meta.get("generated") is True
-    assert meta.get("used_memory") is False
+    assert meta.get("used_memory") is True
     assert meta.get("lexical_used") is True
     assert meta.get("lexical_bypassed") is False
     assert "retrieved supporting memory" in ans
@@ -652,9 +654,11 @@ def test_manager_lexical_direct_route_bypasses_generator_on_safe_task(tmp_path):
             "dataset_context": "Short TREC context.",
             "doc_signature": "doc-trec-1",
             "source_file": "trec.jsonl",
+            "source_id": "trec-main",
         },
         doc_signature="doc-trec-1",
         source_file="trec.jsonl",
+        source_id="trec-main",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         question_type="classification",
@@ -671,6 +675,7 @@ def test_manager_lexical_direct_route_bypasses_generator_on_safe_task(tmp_path):
         evidence_text="Class 3 maps to DESC.",
         doc_signature="doc-trec-1",
         source_file="trec.jsonl",
+        source_id="trec-main",
         question_type="classification",
         answer_canonical="DESC",
     )
@@ -710,9 +715,11 @@ def test_manager_lexical_candidate_below_threshold_is_rejected(tmp_path):
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-reset-001",
             "source_file": "manual.jsonl",
+            "source_id": "manual-reset",
         },
         doc_signature="doc-reset-001",
         source_file="manual.jsonl",
+        source_id="manual-reset",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         question_type="qa",
@@ -728,6 +735,7 @@ def test_manager_lexical_candidate_below_threshold_is_rejected(tmp_path):
         evidence_text="France population is 67 million.",
         doc_signature="doc-france-1",
         source_file="facts.jsonl",
+        source_id="facts-france",
         question_type="qa",
     )
     disk.put(ns_user, unrelated_item.key, unrelated_item)
@@ -774,8 +782,10 @@ def test_manager_semantic_hit_is_used_as_generation_context_not_direct_bypass(tm
         context={
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-reset-001",
+            "source_id": "manual-reset",
         },
         doc_signature="doc-reset-001",
+        source_id="manual-reset",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         allow_semantic=True,
@@ -796,6 +806,7 @@ def test_manager_semantic_hit_is_used_as_generation_context_not_direct_bypass(tm
         evidence_text="Press and hold the reset button for 10 seconds.",
         doc_signature="doc-reset-001",
         source_file="manual.jsonl",
+        source_id="manual-reset",
         chunk_index=4,
         chunk_id="reset-4",
         question_type="qa",
@@ -813,7 +824,7 @@ def test_manager_semantic_hit_is_used_as_generation_context_not_direct_bypass(tm
     assert gen.last_retrieved.match_type == MatchType.SEMANTIC
     assert gen.last_retrieved.item.answer_text == "Press and hold the reset button for 10 seconds."
     assert meta["generated"] is True
-    assert meta["used_memory"] is False
+    assert meta["used_memory"] is True
     assert meta["semantic_used"] is True
     assert meta["semantic_bypassed"] is False
     assert gen.last_retrieved is not None
@@ -845,8 +856,10 @@ def test_manager_semantic_hit_never_direct_bypasses_even_with_low_bypass_thresho
         context={
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-reset-001",
+            "source_id": "manual-reset",
         },
         doc_signature="doc-reset-001",
+        source_id="manual-reset",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         allow_semantic=True,
@@ -864,6 +877,7 @@ def test_manager_semantic_hit_never_direct_bypasses_even_with_low_bypass_thresho
         answer_text="DIRECT_SEMANTIC_ANSWER",
         evidence_text="Hold reset for ten seconds.",
         doc_signature="doc-reset-001",
+        source_id="manual-reset",
         query_embedding=stored_vec,
         embedding_model_id=embedder.cfg.model_id,
         embedding_norm=embedder.embedding_norm(stored_vec),
@@ -874,7 +888,7 @@ def test_manager_semantic_hit_never_direct_bypasses_even_with_low_bypass_thresho
 
     assert gen.call_count == 1
     assert gen.last_retrieved is not None
-    assert meta["used_memory"] is False
+    assert meta["used_memory"] is True
     assert meta["generated"] is True
     assert meta["semantic_used"] is True
     assert meta["semantic_bypassed"] is False
@@ -906,8 +920,10 @@ def test_manager_semantic_prefers_same_document_candidate(tmp_path):
         context={
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-A",
+            "source_id": "manual-a",
         },
         doc_signature="doc-A",
+        source_id="manual-a",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         allow_semantic=True,
@@ -926,6 +942,7 @@ def test_manager_semantic_prefers_same_document_candidate(tmp_path):
         answer_text="BROADER_DOC_ANSWER",
         evidence_text="Broader document reset instructions.",
         doc_signature="doc-B",
+        source_id="manual-b",
         query_embedding=stored_vec,
         embedding_model_id=embedder.cfg.model_id,
         embedding_norm=embedder.embedding_norm(stored_vec),
@@ -938,6 +955,7 @@ def test_manager_semantic_prefers_same_document_candidate(tmp_path):
         answer_text="SAME_DOC_ANSWER",
         evidence_text="Same document restart instructions.",
         doc_signature="doc-A",
+        source_id="manual-a",
         query_embedding=embedder.embed("How do I reboot the device?"),
         embedding_model_id=embedder.cfg.model_id,
         embedding_norm=embedder.embedding_norm(embedder.embed("How do I reboot the device?")),
@@ -981,8 +999,10 @@ def test_manager_semantic_broader_candidate_used_when_no_same_document_available
         context={
             "dataset_context": "Device troubleshooting manual.",
             "doc_signature": "doc-A",
+            "source_id": "manual-a",
         },
         doc_signature="doc-A",
+        source_id="manual-a",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         allow_semantic=True,
@@ -1000,6 +1020,7 @@ def test_manager_semantic_broader_candidate_used_when_no_same_document_available
         answer_text="BROADER_DOC_ANSWER",
         evidence_text="Broader document reset instructions.",
         doc_signature="doc-B",
+        source_id="manual-b",
         query_embedding=stored_vec,
         embedding_model_id=embedder.cfg.model_id,
         embedding_norm=embedder.embedding_norm(stored_vec),
@@ -1038,8 +1059,10 @@ def test_manager_store_adds_embedding_fields_when_embedder_present(tmp_path):
         context={
             "dataset_context": "Spec sheet context.",
             "doc_signature": "doc-torque-001",
+            "source_id": "spec-torque",
         },
         doc_signature="doc-torque-001",
+        source_id="spec-torque",
         model_id="mistral-7b-instruct",
         prompt_version="v1",
         allow_semantic=True,
@@ -1075,6 +1098,7 @@ def test_manager_store_persists_evidence_guided_fields(tmp_path):
             "dataset_context": "The company was founded in 1998 by Alice Doe.",
             "doc_signature": "doc-company-1",
             "source_file": "company.jsonl",
+            "source_id": "company-main",
             "chunk_index": 5,
             "chunk_id": "company-5",
             "question_type": "qa",
@@ -1083,6 +1107,7 @@ def test_manager_store_persists_evidence_guided_fields(tmp_path):
         },
         doc_signature="doc-company-1",
         source_file="company.jsonl",
+        source_id="company-main",
         chunk_index=5,
         chunk_id="company-5",
         question_type="qa",
@@ -1102,6 +1127,7 @@ def test_manager_store_persists_evidence_guided_fields(tmp_path):
     item = hit.item
     assert item.doc_signature == "doc-company-1"
     assert item.source_file == "company.jsonl"
+    assert item.source_id == "company-main"
     assert item.chunk_index == 5
     assert item.chunk_id == "company-5"
     assert item.question_type == "qa"
@@ -1110,6 +1136,7 @@ def test_manager_store_persists_evidence_guided_fields(tmp_path):
 
     assert item.meta.get("doc_signature") == "doc-company-1"
     assert item.meta.get("source_file") == "company.jsonl"
+    assert item.meta.get("source_id") == "company-main"
     assert item.meta.get("chunk_index") == 5
     assert item.meta.get("chunk_id") == "company-5"
     assert item.meta.get("question_type") == "qa"

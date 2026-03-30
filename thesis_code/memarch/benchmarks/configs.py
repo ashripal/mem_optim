@@ -1,17 +1,3 @@
-# memarch/benchmarks/configs.py
-"""
-Typed configuration objects for memarch benchmark runs.
-
-Goals:
-- Mirror baseline benchmark config structure as closely as possible
-- Keep workload definition separate from memarch-specific memory controls
-- Make runs easy to serialize, compare, and reproduce
-- Preserve familiar top-level fields like:
-    tier2_repo, out_dir, model_id, max_input_tokens, max_new_tokens
-- Add explicit runtime controls needed for Jetson / edge deployment:
-    device, dtype, local_files_only
-"""
-
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -37,7 +23,16 @@ class WorkloadConfig:
     repeat_fraction: float = 0.0
 
     def validate(self) -> None:
-        valid_modes = {"cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse", "exact_interleaved", "approx_interleaved", "family_clustered"}
+        valid_modes = {
+            "cold",
+            "replay_once",
+            "replay_k",
+            "cache_pressure",
+            "mixed_reuse",
+            "exact_interleaved",
+            "approx_interleaved",
+            "family_clustered",
+        }
         if self.mode not in valid_modes:
             raise ValueError(
                 f"Invalid workload mode: {self.mode!r}. "
@@ -66,6 +61,12 @@ class WorkloadConfig:
             if int(self.total_requests) < int(self.max_examples):
                 raise ValueError(
                     "For mode='mixed_reuse', total_requests must be >= max_examples"
+                )
+
+        if self.mode in {"approx_interleaved", "family_clustered"}:
+            if self.max_examples is None or int(self.max_examples) <= 0:
+                raise ValueError(
+                    f"For mode={self.mode!r}, max_examples must be > 0"
                 )
 
 
@@ -111,23 +112,24 @@ class MemoryConfig:
     disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite"
     clear_disk_store_before_run: bool = False
 
-    # retrieval_mode: str = "exact_semantic"
+    # Default to the full intended retrieval stack for paraphrased workloads:
+    # exact -> lexical gated direct -> semantic context
     retrieval_mode: str = "lexical_gated_direct_semantic_context"
 
     promote_disk_hits_to_ram: bool = True
     return_memory_directly: bool = True
 
     # Lexical retrieval
-    lexical_enabled: bool = False
+    lexical_enabled: bool = True
     lexical_threshold_context: float = 0.55
-    lexical_threshold_bypass: float = 0.90
+    lexical_threshold_bypass: float = 0.75
     lexical_top_k: int = 3
     prefer_same_source: bool = True
     safe_direct_reuse_tasks: list[str] = field(default_factory=lambda: ["trec"])
 
     # Semantic retrieval
-    semantic_enabled: bool = False
-    semantic_threshold_context: float = 0.85
+    semantic_enabled: bool = True
+    semantic_threshold_context: float = 0.75
     semantic_threshold_bypass: float = 1.01
     max_semantic_candidates: int = 5
 
@@ -198,6 +200,16 @@ class MemoryConfig:
                 f"embedding_device must be one of {sorted(valid_embed_devices)}"
             )
 
+        if not self.enable_storage and (self.store_in_ram or self.store_on_disk):
+            raise ValueError(
+                "store_in_ram/store_on_disk cannot be True when enable_storage is False"
+            )
+
+        if self.retrieval_mode == "exact_only":
+            # Allow the flags to be True, but they won't be used. This keeps the
+            # config convenient across experiments.
+            pass
+
     def effective_lexical_enabled(self) -> bool:
         return self.retrieval_mode in {
             "lexical_context",
@@ -222,7 +234,8 @@ class MemoryConfig:
 
     def effective_bypass_enabled(self) -> bool:
         return self.retrieval_mode == "semantic_bypass" and self.semantic_enabled
-    
+
+
 @dataclass
 class BenchmarkConfig:
     """
@@ -239,15 +252,14 @@ class BenchmarkConfig:
     max_input_tokens: int = 8192
     max_new_tokens: int = 64
 
-    # Greedy rollback defaults
-    decoding_mode: str = "greedy"   # "greedy" | "beam"
+    decoding_mode: str = "greedy"  # "greedy" | "beam" | "sample"
     num_beams: int = 1
     temperature: float = 0.2
     top_p: float = 0.95
     do_sample: bool = False
 
     device: str = "auto"
-    dtype: str = "auto"
+    dtype: str = "float32"
     local_files_only: bool = False
     cpu_fallback_on_long: bool = False
 
@@ -278,8 +290,8 @@ class BenchmarkConfig:
         if int(self.max_new_tokens) < 0:
             raise ValueError("max_new_tokens must be >= 0")
 
-        if self.decoding_mode not in {"greedy", "beam"}:
-            raise ValueError("decoding_mode must be 'greedy' or 'beam'")
+        if self.decoding_mode not in {"greedy", "beam", "sample"}:
+            raise ValueError("decoding_mode must be 'greedy', 'beam', or 'sample'")
 
         if int(self.num_beams) <= 0:
             raise ValueError("num_beams must be > 0")
@@ -300,6 +312,12 @@ class BenchmarkConfig:
         self.output.validate()
         self.namespaces.validate()
         self.memory.validate()
+
+        if self.decoding_mode == "beam" and int(self.num_beams) <= 1:
+            raise ValueError("num_beams must be > 1 when decoding_mode='beam'")
+
+        if self.decoding_mode != "beam" and int(self.num_beams) != 1:
+            raise ValueError("num_beams should be 1 unless decoding_mode='beam'")
 
     def resolved_out_dir(self) -> str:
         run_dir = self.output.resolve_run_dir(
@@ -331,20 +349,20 @@ class BenchmarkConfig:
         top_p: float = 0.95,
         do_sample: bool = False,
         device: str = "auto",
-        dtype: str = "auto",
+        dtype: str = "float32",
         local_files_only: bool = False,
         ram_capacity_items: int = 64,
         disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
         clear_disk_store_before_run: bool = False,
-        retrieval_mode: str = "exact_only",
-        lexical_enabled: bool = False,
+        retrieval_mode: str = "lexical_gated_direct_semantic_context",
+        lexical_enabled: bool = True,
         lexical_context_threshold: float = 0.55,
-        lexical_direct_threshold: float = 0.90,
+        lexical_direct_threshold: float = 0.75,
         lexical_top_k: int = 3,
         prefer_same_source: bool = True,
         safe_direct_reuse_tasks: Optional[list[str]] = None,
-        semantic_enabled: bool = False,
-        semantic_threshold_context: float = 0.85,
+        semantic_enabled: bool = True,
+        semantic_threshold_context: float = 0.75,
         semantic_threshold_bypass: float = 1.01,
         max_semantic_candidates: int = 5,
         embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2",
@@ -361,6 +379,11 @@ class BenchmarkConfig:
         session_id: str = "session_a",
         cohort_id: Optional[str] = None,
         notes: str = "",
+        replay_k: int = 2,
+        shuffle: bool = False,
+        seed: int = 0,
+        total_requests: Optional[int] = None,
+        repeat_fraction: float = 0.0,
     ) -> "BenchmarkConfig":
         cfg = cls(
             benchmark_name=benchmark_name,
@@ -383,6 +406,11 @@ class BenchmarkConfig:
                 task_glob="",
                 max_examples=max_examples,
                 mode=mode,
+                replay_k=replay_k,
+                shuffle=shuffle,
+                seed=seed,
+                total_requests=total_requests,
+                repeat_fraction=repeat_fraction,
             ),
             output=OutputConfig(root_dir=out_root),
             namespaces=NamespaceConfig(
@@ -396,8 +424,8 @@ class BenchmarkConfig:
                 clear_disk_store_before_run=clear_disk_store_before_run,
                 retrieval_mode=retrieval_mode,
                 lexical_enabled=lexical_enabled,
-                lexical_context_threshold=lexical_context_threshold,
-                lexical_direct_threshold=lexical_direct_threshold,
+                lexical_threshold_context=lexical_context_threshold,
+                lexical_threshold_bypass=lexical_direct_threshold,
                 lexical_top_k=lexical_top_k,
                 prefer_same_source=prefer_same_source,
                 safe_direct_reuse_tasks=safe_direct_reuse_tasks or ["trec"],

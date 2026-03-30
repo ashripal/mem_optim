@@ -141,10 +141,6 @@ def _maybe_clear_disk_store_before_run(cfg: BenchmarkConfig) -> Optional[str]:
 def _construct_with_supported_kwargs(cls: Any, **kwargs: Any) -> Any:
     """
     Construct an object using only kwargs supported by the target signature.
-
-    This keeps the benchmark executor forward-compatible while memarch internals
-    evolve (for example, when lexical retrieval fields are added to policy/config
-    classes but older versions do not yet accept them).
     """
     try:
         sig = inspect.signature(cls)
@@ -173,26 +169,37 @@ def _extract_semantic_debug(meta: Dict[str, Any]) -> Dict[str, Any]:
         semantic_block = {}
 
     retrieval_stage = meta.get("retrieval_stage", retrieval_debug.get("retrieval_stage"))
+    stage_is_semantic = retrieval_stage == "semantic"
 
     semantic_reason = meta.get("semantic_reason")
     if semantic_reason is None:
-        semantic_reason = retrieval_debug.get("reason", semantic_block.get("reason"))
+        semantic_reason = semantic_block.get("reason") if not stage_is_semantic else retrieval_debug.get(
+            "reason", semantic_block.get("reason")
+        )
 
     semantic_candidate_count = meta.get("semantic_candidate_count")
     if semantic_candidate_count is None:
-        semantic_candidate_count = retrieval_debug.get("candidate_count", semantic_block.get("candidate_count"))
+        semantic_candidate_count = semantic_block.get("candidate_count") if not stage_is_semantic else retrieval_debug.get(
+            "candidate_count", semantic_block.get("candidate_count")
+        )
 
     semantic_top_score = meta.get("semantic_top_score")
     if semantic_top_score is None:
-        semantic_top_score = retrieval_debug.get("top_score", semantic_block.get("top_score"))
+        semantic_top_score = semantic_block.get("top_score") if not stage_is_semantic else retrieval_debug.get(
+            "top_score", semantic_block.get("top_score")
+        )
 
     semantic_top_rank = meta.get("semantic_top_rank")
     if semantic_top_rank is None:
-        semantic_top_rank = retrieval_debug.get("top_rank", semantic_block.get("top_rank"))
+        semantic_top_rank = semantic_block.get("top_rank") if not stage_is_semantic else retrieval_debug.get(
+            "top_rank", semantic_block.get("top_rank")
+        )
 
     semantic_enabled_debug = meta.get("semantic_enabled_debug")
     if semantic_enabled_debug is None:
-        semantic_enabled_debug = retrieval_debug.get("semantic_enabled", semantic_block.get("semantic_enabled"))
+        semantic_enabled_debug = semantic_block.get("semantic_enabled") if not stage_is_semantic else retrieval_debug.get(
+            "semantic_enabled", semantic_block.get("semantic_enabled")
+        )
 
     return {
         "retrieval_stage": retrieval_stage,
@@ -208,10 +215,6 @@ def _extract_semantic_debug(meta: Dict[str, Any]) -> Dict[str, Any]:
 def _extract_lexical_debug(meta: Dict[str, Any]) -> Dict[str, Any]:
     """
     Normalize lexical retrieval debug fields for logging.
-
-    Supports both:
-    - direct lexical fields attached at top level of manager meta
-    - nested retrieval_debug / lexical dicts
     """
     retrieval_debug = meta.get("retrieval_debug")
     if not isinstance(retrieval_debug, dict):
@@ -222,34 +225,49 @@ def _extract_lexical_debug(meta: Dict[str, Any]) -> Dict[str, Any]:
         lexical_block = {}
 
     retrieval_stage = meta.get("retrieval_stage", retrieval_debug.get("retrieval_stage"))
+    stage_is_lexical = retrieval_stage == "lexical"
 
     lexical_reason = meta.get("lexical_reason")
     if lexical_reason is None:
-        lexical_reason = retrieval_debug.get("lexical_reason", lexical_block.get("reason"))
+        lexical_reason = lexical_block.get("reason") if not stage_is_lexical else retrieval_debug.get(
+            "reason", lexical_block.get("reason")
+        )
 
     lexical_candidate_count = meta.get("lexical_candidate_count")
     if lexical_candidate_count is None:
-        lexical_candidate_count = retrieval_debug.get("lexical_candidate_count", lexical_block.get("candidate_count"))
+        lexical_candidate_count = lexical_block.get("candidate_count") if not stage_is_lexical else retrieval_debug.get(
+            "candidate_count", lexical_block.get("candidate_count")
+        )
 
     lexical_top_score = meta.get("lexical_top_score")
     if lexical_top_score is None:
-        lexical_top_score = retrieval_debug.get("lexical_top_score", lexical_block.get("top_score"))
+        lexical_top_score = lexical_block.get("top_score") if not stage_is_lexical else retrieval_debug.get(
+            "top_score", lexical_block.get("top_score")
+        )
 
     lexical_top_rank = meta.get("lexical_top_rank")
     if lexical_top_rank is None:
-        lexical_top_rank = retrieval_debug.get("lexical_top_rank", lexical_block.get("top_rank"))
+        lexical_top_rank = lexical_block.get("top_rank") if not stage_is_lexical else retrieval_debug.get(
+            "top_rank", lexical_block.get("top_rank")
+        )
 
     lexical_enabled_debug = meta.get("lexical_enabled_debug")
     if lexical_enabled_debug is None:
-        lexical_enabled_debug = retrieval_debug.get("lexical_enabled", lexical_block.get("lexical_enabled"))
+        lexical_enabled_debug = lexical_block.get("lexical_enabled") if not stage_is_lexical else retrieval_debug.get(
+            "lexical_enabled", lexical_block.get("lexical_enabled")
+        )
 
     lexical_match_type = meta.get("lexical_match_type")
     if lexical_match_type is None:
-        lexical_match_type = retrieval_debug.get("lexical_match_type", lexical_block.get("match_type"))
+        lexical_match_type = lexical_block.get("lexical_match_type") if not stage_is_lexical else retrieval_debug.get(
+            "lexical_match_type", lexical_block.get("lexical_match_type")
+        )
 
     lexical_same_source = meta.get("lexical_same_source")
     if lexical_same_source is None:
-        lexical_same_source = retrieval_debug.get("lexical_same_source", lexical_block.get("same_source"))
+        lexical_same_source = lexical_block.get("same_source") if not stage_is_lexical else retrieval_debug.get(
+            "same_source", lexical_block.get("same_source")
+        )
 
     return {
         "retrieval_stage": retrieval_stage,
@@ -456,8 +474,6 @@ def _infer_question_type(example: Dict[str, Any], query_text: str) -> str:
 def _build_answer_canonical(example: Dict[str, Any]) -> Optional[str]:
     """
     Cheap task-specific answer normalization from reference labels when available.
-
-    This is optional metadata for future storage/reuse logic.
     """
     task = str(example.get("task") or "").strip().lower()
 
@@ -478,14 +494,6 @@ def _build_answer_canonical(example: Dict[str, Any]) -> Optional[str]:
 def _pick_best_overlap_window(query_text: str, context_text: str, *, window_chars: int = 320) -> str:
     """
     Cheap lexical evidence extraction.
-
-    Strategy:
-    - split context into simple lines if possible
-    - score lines/windows by overlap with query tokens
-    - return the best compact snippet
-    - fall back to the first window if no overlap exists
-
-    This stays deterministic and low-cost.
     """
     ctx = _normalize_ws(context_text)
     if not ctx:
@@ -527,6 +535,7 @@ def _pick_best_overlap_window(query_text: str, context_text: str, *, window_char
         return snippet
 
     return ctx[:window_chars].strip()
+
 
 def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> MemoryQuery:
     query_text = _extract_query_text(example)
@@ -591,7 +600,6 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
     return _construct_with_supported_kwargs(MemoryQuery, **mq_kwargs)
 
 
-
 def _init_ram_store(cfg: BenchmarkConfig) -> Any:
     """
     Initialize RAM store with both:
@@ -617,19 +625,6 @@ def _init_embedder(cfg: BenchmarkConfig) -> Optional[Embedder]:
 
 
 def _init_generator(cfg: BenchmarkConfig) -> HFGenerator:
-    # gen_cfg = GeneratorConfig(
-    #     model_id=cfg.model_id,
-    #     device=getattr(cfg, "device", "auto"),
-    #     max_input_length=int(getattr(cfg, "max_input_tokens", 2048)),
-    #     max_new_tokens=int(getattr(cfg, "max_new_tokens", 64)),
-    #     decoding_mode=str(getattr(cfg, "decoding_mode", "greedy")),
-    #     num_beams=int(getattr(cfg, "num_beams", 1)),
-    #     temperature=float(getattr(cfg, "temperature", 0.2)),
-    #     top_p=float(getattr(cfg, "top_p", 0.95)),
-    #     do_sample=bool(getattr(cfg, "do_sample", False)),
-    #     local_files_only=bool(getattr(cfg, "local_files_only", False)),
-    #     torch_dtype=str(getattr(cfg, "dtype", "auto")),
-    # )
     gen_cfg = GeneratorConfig(
         model_id=cfg.model_id,
         device=getattr(cfg, "device", "auto"),
@@ -677,8 +672,6 @@ def _init_retrieval_policy(cfg: BenchmarkConfig) -> RetrievalPolicy:
 
     policy_kwargs: Dict[str, Any] = {
         "scope_order": [Scope.SESSION, Scope.USER, Scope.COHORT, Scope.GLOBAL],
-
-        # lexical
         "lexical_enabled": lexical_enabled,
         "lexical_threshold_context": float(
             getattr(cfg.memory, "lexical_threshold_context", 0.55)
@@ -689,8 +682,6 @@ def _init_retrieval_policy(cfg: BenchmarkConfig) -> RetrievalPolicy:
         "safe_direct_reuse_tasks": list(
             getattr(cfg.memory, "safe_direct_reuse_tasks", ["trec"])
         ),
-
-        # semantic
         "semantic_enabled": semantic_enabled,
         "semantic_threshold_context": float(
             getattr(cfg.memory, "semantic_threshold_context", 0.85)
@@ -705,6 +696,7 @@ def _init_retrieval_policy(cfg: BenchmarkConfig) -> RetrievalPolicy:
     }
 
     return _construct_with_supported_kwargs(RetrievalPolicy, **policy_kwargs)
+
 
 def _init_manager(cfg: BenchmarkConfig, ram: Any, disk: Any, embedder: Optional[Embedder]) -> Any:
     retrieval_policy = _init_retrieval_policy(cfg)
@@ -723,8 +715,6 @@ def _init_manager(cfg: BenchmarkConfig, ram: Any, disk: Any, embedder: Optional[
         "promote_disk_hits_to_ram": bool(cfg.memory.promote_disk_hits_to_ram),
         "return_memory_directly": bool(cfg.memory.return_memory_directly),
         "embedder": embedder,
-
-        # lexical manager controls
         "lexical_enabled": lexical_enabled,
         "lexical_context_threshold": float(
             getattr(cfg.memory, "lexical_threshold_context", 0.55)
@@ -741,6 +731,9 @@ def _init_manager(cfg: BenchmarkConfig, ram: Any, disk: Any, embedder: Optional[
         "safe_direct_reuse_tasks": list(
             getattr(cfg.memory, "safe_direct_reuse_tasks", ["trec"])
         ),
+        "enable_storage": bool(getattr(cfg.memory, "enable_storage", True)),
+        "store_in_ram": bool(getattr(cfg.memory, "store_in_ram", True)),
+        "store_on_disk": bool(getattr(cfg.memory, "store_on_disk", True)),
     }
 
     mm_cfg = _construct_with_supported_kwargs(MemoryManagerConfig, **manager_kwargs)
@@ -791,11 +784,10 @@ def _build_ok_record(
 
     source_tier = str(meta.get("source_tier", "compute" if generated else "unknown"))
     match_type = meta.get("match_type")
-    llm_bypassed = (
-        bool(meta.get("semantic_bypassed", False))
-        or bool(meta.get("lexical_bypassed", False))
-        or (used_memory and bool(cfg.memory.return_memory_directly))
-    )
+
+    # Bypass should only be true when generation did NOT run and the answer was served
+    # directly from memory.
+    llm_bypassed = bool(used_memory and not generated)
 
     if generated:
         gen_meta = raw_gen_meta
@@ -843,15 +835,14 @@ def _build_ok_record(
     )
 
     lexical_used = bool(meta.get("lexical_used", False)) or (str(match_type or "").lower() == "lexical")
-    lexical_bypassed = bool(meta.get("lexical_bypassed", False)) or (
-        lexical_used and used_memory and bool(cfg.memory.return_memory_directly)
-    )
+    # Respect the manager metadata; do not infer bypass from "used_memory"
+    lexical_bypassed = bool(meta.get("lexical_bypassed", False)) and not generated
     lexical_context_used = bool(meta.get("lexical_context_used", False)) or (
         lexical_used and generated and not lexical_bypassed
     )
 
-    semantic_used = bool(meta.get("semantic_used", False))
-    semantic_bypassed = bool(meta.get("semantic_bypassed", False))
+    semantic_used = bool(meta.get("semantic_used", False)) or (str(match_type or "").lower() == "semantic")
+    semantic_bypassed = bool(meta.get("semantic_bypassed", False)) and not generated
     semantic_context_used = semantic_used and generated and not semantic_bypassed
 
     return {
@@ -862,7 +853,6 @@ def _build_ok_record(
         "source_file": example.get("source_file"),
         "source_id": example.get("source_id"),
 
-        # workload provenance
         "workload_mode": example.get("workload_mode"),
         "workload_pos": example.get("workload_pos"),
         "workload_repeat_index": example.get("workload_repeat_index"),
@@ -871,13 +861,11 @@ def _build_ok_record(
         "base_task": example.get("base_task"),
         "base_source_file": example.get("base_source_file"),
 
-        # namespaces
         "namespace_user_id": example.get("namespace_user_id"),
         "namespace_session_id": example.get("namespace_session_id"),
         "namespace_cohort_id": example.get("namespace_cohort_id"),
         "namespaces_checked": meta.get("namespaces_checked", []),
 
-        # memory / serving path
         "used_memory": used_memory,
         "source_tier": source_tier,
         "served_from": source_tier,
@@ -887,7 +875,6 @@ def _build_ok_record(
         "stored": meta.get("stored"),
         "stored_scopes": meta.get("stored_scopes", []),
 
-        # evidence-guided metadata
         "doc_signature": example.get("doc_signature") or meta.get("doc_signature"),
         "query_question_type": meta.get("question_type") or example.get("question_type"),
         "query_chunk_index": meta.get("chunk_index"),
@@ -903,7 +890,6 @@ def _build_ok_record(
             else None
         ),
 
-        # unified retrieval metadata
         "retrieval_mode_config": getattr(cfg.memory, "retrieval_mode", None),
         "retrieval_stage": semantic_debug["retrieval_stage"] or lexical_debug["retrieval_stage"],
         "match_type": match_type,
@@ -911,7 +897,6 @@ def _build_ok_record(
         "hit_before_generate": meta.get("hit_before_generate"),
         "retrieval_debug": semantic_debug["retrieval_debug"] or lexical_debug["retrieval_debug"],
 
-        # lexical retrieval metadata
         "lexical_used": lexical_used,
         "lexical_bypassed": lexical_bypassed,
         "lexical_context_used": lexical_context_used,
@@ -923,7 +908,6 @@ def _build_ok_record(
         "lexical_match_type": lexical_debug["lexical_match_type"],
         "lexical_same_source": lexical_debug["lexical_same_source"],
 
-        # semantic retrieval metadata
         "semantic_used": semantic_used,
         "semantic_context_used": semantic_context_used,
         "semantic_bypassed": semantic_bypassed,
@@ -939,20 +923,17 @@ def _build_ok_record(
         "semantic_top_rank": semantic_debug["semantic_top_rank"],
         "semantic_enabled_debug": semantic_debug["semantic_enabled_debug"],
 
-        # latency breakdown
         "latency_s": total_latency_s,
         "memory_lookup_ms": memory_lookup_ms,
         "generation_ms_est": generation_ms_est,
         "timings_ms": timings_ms,
 
-        # memory usage
         "rss_before_mb": rss_before,
         "rss_after_mb": rss_after,
         "rss_delta_mb": (
             (rss_after - rss_before) if (rss_before is not None and rss_after is not None) else None
         ),
 
-        # generator / model metadata
         "device": gen_meta.get("device"),
         "dtype": gen_meta.get("dtype"),
         "generation_backend": gen_meta.get("generation_backend"),
@@ -980,7 +961,6 @@ def _build_ok_record(
         "full_context_chars": gen_meta.get("full_context_chars"),
         "final_context_chars": gen_meta.get("final_context_chars"),
 
-        # answer + quality
         "answer": answer,
         "output_text": answer,
         "ref_text": quality.get("ref_text"),
@@ -989,14 +969,12 @@ def _build_ok_record(
         "token_f1": quality.get("token_f1"),
         "char_f1": quality.get("char_f1"),
 
-        # throughput only meaningful on compute path
         "tokens_per_second": (
             (gen_meta.get("output_tokens", 0) / float(gen_meta.get("gen_time_s", 0.0)))
             if generated and float(gen_meta.get("gen_time_s", 0.0) or 0.0) > 0
             else None
         ),
 
-        # live store stats
         "ram_stats_after": _ram_stats(ram),
         "disk_stats_after": _disk_stats(disk),
 
@@ -1059,11 +1037,6 @@ def _build_error_record(
 def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
     """
     Execute one memarch benchmark run and write artifacts.
-
-    Returns a dict with artifact paths:
-      - run_jsonl
-      - workload_manifest_json
-      - summary_json (optional)
     """
     cfg.validate()
 
@@ -1137,8 +1110,14 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                     "return_memory_directly": bool(cfg.memory.return_memory_directly),
                     "promote_disk_hits_to_ram": bool(cfg.memory.promote_disk_hits_to_ram),
                     "lexical_enabled": bool(getattr(cfg.memory, "lexical_enabled", False)),
-                    "lexical_context_threshold": float(getattr(cfg.memory, "lexical_context_threshold", 0.55)),
-                    "lexical_direct_threshold": float(getattr(cfg.memory, "lexical_direct_threshold", 0.90)),
+                    "lexical_context_threshold": float(getattr(cfg.memory, "lexical_threshold_context", 0.55)),
+                    "lexical_direct_threshold": float(
+                        getattr(
+                            cfg.memory,
+                            "lexical_threshold_bypass",
+                            getattr(cfg.memory, "lexical_direct_threshold", 0.90),
+                        )
+                    ),
                     "lexical_top_k": int(getattr(cfg.memory, "lexical_top_k", 3)),
                     "prefer_same_source": bool(getattr(cfg.memory, "prefer_same_source", True)),
                     "safe_direct_reuse_tasks": list(getattr(cfg.memory, "safe_direct_reuse_tasks", ["trec"])),
