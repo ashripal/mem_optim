@@ -43,7 +43,7 @@ from typing import Any, Dict, List, Optional
 
 import torch
 
-from baseline.utils.metrics import compute_basic_metrics
+from memarch.utils.metrics import compute_basic_metrics
 from memarch.benchmarks.configs import BenchmarkConfig
 from memarch.benchmarks.workload import build_workload_manifest, prepare_workload
 from memarch.memory.disk_store import DiskStoreSQLite

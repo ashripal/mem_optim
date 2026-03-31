@@ -4,7 +4,7 @@ import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -24,14 +24,6 @@ def _cuda_available() -> bool:
 
 
 def _select_device(device: str = "auto") -> str:
-    """
-    Device selection policy for generation.
-
-    device='auto' priority:
-      1. CUDA
-      2. MPS
-      3. CPU
-    """
     device = (device or "auto").lower().strip()
 
     if device == "auto":
@@ -59,91 +51,95 @@ def _select_device(device: str = "auto") -> str:
 
 @dataclass(frozen=True)
 class GeneratorConfig:
-    """
-    Configuration for the generation backend.
-
-    Example overrides:
-      model_id="mistralai/Mistral-7B-Instruct-v0.2"
-      model_id="/path/to/local/model"
-    """
     model_id: str = "distilgpt2"
     device: str = "auto"
 
-    # Generation behavior
     max_input_length: int = 2048
     max_new_tokens: int = 256
     temperature: float = 0.2
     top_p: float = 0.95
     do_sample: bool = False
 
-    # Decoding behavior
-    decoding_mode: str = "greedy"   # "greedy" | "beam" | "sample"
+    decoding_mode: str = "greedy"
     num_beams: int = 1
 
-    # Loading behavior
     local_files_only: bool = False
-    torch_dtype: str = "auto"   # "auto" | "float16" | "bfloat16" | "float32"
+    torch_dtype: str = "auto"
     use_fast_tokenizer: bool = False
 
-    # Runtime behavior
     cpu_fallback_on_failure: bool = True
-    generation_backend: str = "auto"  # "auto" | "manual_greedy" | "hf_generate"
+    generation_backend: str = "auto"
 
-    # Prompt behavior
     include_retrieved_memory_context: bool = True
     include_dataset_context: bool = True
-    include_doc_signature: bool = True
+    include_doc_signature: bool = False
 
-    # Evidence-guided prompt behavior
     prefer_retrieved_evidence_context: bool = True
     reduce_context_on_semantic_hit: bool = True
     max_evidence_chars: int = 400
-    max_local_context_chars: int = 220
-    max_full_context_chars: int = 4000
+    max_local_context_chars: int = 260
+    max_full_context_chars: int = 1200
 
-    # TREC prompt behavior
+    prefer_local_context_for_qa: bool = True
+    qa_max_output_words: int = 6
+
     trec_use_few_shot: bool = False
-
-    # Cleanup
     skip_special_tokens: bool = True
 
 
 class HFGenerator:
-    """
-    Hugging Face text generation wrapper.
-
-    Public API:
-      generate(mq: MemoryQuery, retrieved: Optional[MemoryHit]) -> (text, provenance, quality)
-
-    This matches what MemoryManager expects.
-    """
-
     _TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
 
     _TREC_ALIAS_MAP = {
         "ABBREVIATION": "ABBR",
         "ABBR": "ABBR",
-
         "DESCRIPTION": "DESC",
         "DEFINITION": "DESC",
         "DESC": "DESC",
-
         "ENTITY": "ENTY",
         "ENTY": "ENTY",
-
         "HUMAN": "HUM",
         "PERSON": "HUM",
         "INDIVIDUAL": "HUM",
         "HUM": "HUM",
-
         "LOCATION": "LOC",
         "PLACE": "LOC",
         "LOC": "LOC",
-
         "NUMBER": "NUM",
         "NUMERIC": "NUM",
         "NUM": "NUM",
     }
+
+    _ANSWER_PREFIX_RE = re.compile(
+        r"^\s*(?:OUTPUT|FINAL ANSWER|ANSWER|RESPONSE|LABEL)\s*:\s*",
+        flags=re.IGNORECASE,
+    )
+
+    _LEADING_ANSWER_PHRASE_RE = re.compile(
+        r"^\s*(?:"
+        r"the answer is|answer is|it is|it's|the answer|"
+        r"from|the threat is|the film was|film was|"
+        r"he was|she was|they were|there were|there was|"
+        r"located in|based in|set in|called"
+        r")\s+",
+        flags=re.IGNORECASE,
+    )
+
+    _CHAT_TURN_RE = re.compile(
+        r"\b(?:Human|Assistant|User|System)\s*:",
+        flags=re.IGNORECASE,
+    )
+
+    _BOILERPLATE_PATTERNS = [
+        re.compile(r"\bto answer this question\b.*", flags=re.IGNORECASE | re.DOTALL),
+        re.compile(r"\byou need to\b.*", flags=re.IGNORECASE | re.DOTALL),
+        re.compile(r"\bbased on the (?:context|passage|document)\b.*", flags=re.IGNORECASE | re.DOTALL),
+        re.compile(r"\byou are an ai assistant\b.*", flags=re.IGNORECASE | re.DOTALL),
+    ]
+
+    _WS_RE = re.compile(r"\s+")
+    _PUNCT_EDGE_RE = re.compile(r"^[\-\–\—\,\.\:\;\"\']+\s*|\s*[\-\–\—\,\.\:\;\"\']+$")
+    _WORDISH_RE = re.compile(r"\S+")
 
     def __init__(self, cfg: Optional[GeneratorConfig] = None) -> None:
         self.cfg = cfg or GeneratorConfig()
@@ -194,6 +190,9 @@ class HFGenerator:
         if int(self.cfg.max_new_tokens) < 0:
             raise ValueError("max_new_tokens must be >= 0")
 
+        if int(self.cfg.qa_max_output_words) <= 0:
+            raise ValueError("qa_max_output_words must be > 0")
+
     @staticmethod
     def _resolve_torch_dtype(dtype_name: str, device: str):
         dtype_name = (dtype_name or "auto").lower().strip()
@@ -206,7 +205,6 @@ class HFGenerator:
             return torch.float32
 
         if dtype_name == "float16":
-            # CPU float16 inference is usually slow/fragile for this benchmark path.
             return torch.float32 if device == "cpu" else torch.float16
         if dtype_name == "bfloat16":
             return torch.float32 if device == "cpu" else torch.bfloat16
@@ -221,31 +219,38 @@ class HFGenerator:
             return ""
         return str(value).strip()
 
+    @classmethod
+    def _collapse_ws(cls, text: str) -> str:
+        return cls._WS_RE.sub(" ", cls._safe_text(text)).strip()
+
+    @staticmethod
+    def _normalize_for_match(text: str) -> str:
+        text = str(text or "").lower()
+        text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+        text = re.sub(r"\b(a|an|the)\b", " ", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
     def _normalize_trec_output(self, text: str) -> str:
-        """
-        Convert noisy model output into a single coarse TREC label when possible.
-        """
         raw = self._safe_text(text)
         if not raw:
             return raw
 
         upper = raw.upper()
 
-        coarse_patterns = [
+        for pat in [
             r"\b(ABBR|DESC|ENTY|HUM|LOC|NUM)\b",
             r"^(ABBR|DESC|ENTY|HUM|LOC|NUM)[\.\:\-\s_]",
-        ]
-        for pat in coarse_patterns:
+        ]:
             m = re.search(pat, upper)
             if m:
                 return m.group(1)
 
-        alias_patterns = [
+        for pat in [
             r"\bTYPE\s*:\s*([A-Z]+)\b",
             r"\bOUTPUT\s*:\s*([A-Z]+)\b",
             r"^([A-Z]+)\b",
-        ]
-        for pat in alias_patterns:
+        ]:
             m = re.search(pat, upper)
             if m:
                 token = m.group(1)
@@ -260,6 +265,142 @@ class HFGenerator:
 
         return raw
 
+    def _strip_chat_turns(self, text: str) -> str:
+        raw = self._safe_text(text)
+        if not raw:
+            return raw
+        m = self._CHAT_TURN_RE.search(raw)
+        if m:
+            raw = raw[:m.start()].rstrip()
+        return raw
+
+    def _limit_words(self, text: str, max_words: int) -> str:
+        words = self._collapse_ws(text).split()
+        if len(words) <= max_words:
+            return self._collapse_ws(text)
+        return " ".join(words[:max_words]).strip()
+
+    def _trim_edge_punct(self, text: str) -> str:
+        return self._PUNCT_EDGE_RE.sub("", self._safe_text(text)).strip()
+
+    def _candidate_spans_from_context(self, context: str, max_words: int) -> List[str]:
+        ctx = self._safe_text(context)
+        if not ctx:
+            return []
+
+        matches = list(self._WORDISH_RE.finditer(ctx))
+        spans: List[str] = []
+
+        for i in range(len(matches)):
+            for j in range(i, min(len(matches), i + max_words)):
+                start = matches[i].start()
+                end = matches[j].end()
+                span = ctx[start:end].strip()
+                span = self._trim_edge_punct(span)
+                if span:
+                    spans.append(span)
+
+        # preserve order but dedupe
+        seen = set()
+        out: List[str] = []
+        for s in spans:
+            if s not in seen:
+                seen.add(s)
+                out.append(s)
+        return out
+
+    def _snap_answer_to_context(self, answer: str, context: str) -> str:
+        """
+        Try to convert a verbose answer into the shortest answer-like span
+        present in the local context. This is especially useful for outputs like:
+        - "The threat is climate change" -> "climate change"
+        - "From Germany" -> "Germany"
+        - "... Marc Nelson ..." -> "Marc Nelson"
+        """
+        raw = self._collapse_ws(answer)
+        ctx = self._safe_text(context)
+        if not raw or not ctx:
+            return raw
+
+        raw_norm = self._normalize_for_match(raw)
+        if not raw_norm:
+            return raw
+
+        candidates = self._candidate_spans_from_context(ctx, int(self.cfg.qa_max_output_words))
+        best: Optional[Tuple[int, int, str]] = None
+
+        for cand in candidates:
+            cand_norm = self._normalize_for_match(cand)
+            if not cand_norm:
+                continue
+
+            if cand_norm == raw_norm:
+                score = (10_000 + len(cand_norm), -len(cand.split()), cand)
+            elif cand_norm in raw_norm:
+                score = (1_000 + len(cand_norm), -len(cand.split()), cand)
+            elif raw_norm in cand_norm and len(cand.split()) <= int(self.cfg.qa_max_output_words):
+                score = (100 + len(raw_norm), -len(cand.split()), cand)
+            else:
+                continue
+
+            if best is None or score > best:
+                best = score
+
+        if best is not None:
+            return best[2].strip()
+
+        return raw
+
+    def _normalize_short_qa_output(self, text: str, context_text: str = "") -> str:
+        raw = self._safe_text(text)
+        if not raw:
+            return raw
+
+        raw = self._ANSWER_PREFIX_RE.sub("", raw).strip()
+        raw = self._strip_chat_turns(raw)
+
+        lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+        if lines:
+            raw = lines[0]
+
+        for pat in self._BOILERPLATE_PATTERNS:
+            raw = pat.sub("", raw).strip()
+
+        raw = self._strip_chat_turns(raw)
+        raw = re.sub(r"\s{2,}", " ", raw).strip()
+        raw = raw.strip(" \t\r\n\"'`")
+
+        # Remove leading answer phrases like "The answer is ..." / "From ..."
+        raw = self._LEADING_ANSWER_PHRASE_RE.sub("", raw).strip()
+
+        # If the model gives "Name. More text", keep the first answer-like chunk.
+        parts = re.split(r"(?<=[\.\!\?])\s+|;\s+|,\s+(?=[A-Z])", raw, maxsplit=1)
+        if parts:
+            raw = parts[0].strip()
+
+        raw = self._strip_chat_turns(raw)
+
+        # Remove leading punctuation fragments often produced by continuation-style models
+        raw = re.sub(r"^[\-\–\—\,\.\:\;\"\']+\s*", "", raw).strip()
+
+        # If a short answer is followed by glued chat text like "Arne Frager.Human"
+        raw = re.sub(r"([A-Za-z0-9\)])\.(?=(?:Human|Assistant|User|System)\s*:)", r"\1", raw)
+
+        raw = self._trim_edge_punct(raw)
+        raw = self._collapse_ws(raw)
+
+        # Snap verbose answer back to a short span from context when possible.
+        raw = self._snap_answer_to_context(raw, context_text)
+
+        # Keep answers short for extractive QA.
+        raw = self._limit_words(raw, int(self.cfg.qa_max_output_words))
+        raw = self._trim_edge_punct(raw)
+
+        if len(raw.split()) <= 12:
+            raw = raw.rstrip(" .,:;")
+
+        return raw or self._safe_text(text)
+
     @staticmethod
     def _truncate_chars(text: str, max_chars: int) -> str:
         text = str(text or "").strip()
@@ -272,13 +413,12 @@ class HFGenerator:
         if model_config is None:
             return int(self.cfg.max_input_length)
 
-        candidates = [
+        for value in [
             getattr(model_config, "max_position_embeddings", None),
             getattr(model_config, "n_positions", None),
             getattr(model_config, "max_sequence_length", None),
             getattr(model_config, "seq_length", None),
-        ]
-        for value in candidates:
+        ]:
             try:
                 if value is not None and int(value) > 0:
                     return int(value)
@@ -290,7 +430,6 @@ class HFGenerator:
         model_limit = self._model_max_positions()
         requested_input = int(self.cfg.max_input_length)
         requested_new = max(1, int(self.cfg.max_new_tokens))
-
         safe_budget = min(requested_input, max(1, model_limit - requested_new))
         return max(1, safe_budget)
 
@@ -304,10 +443,8 @@ class HFGenerator:
             return self.cfg.generation_backend
 
         mode = (self.cfg.decoding_mode or "greedy").lower().strip()
-
         if mode in {"beam", "sample"}:
             return "hf_generate"
-
         if self.device in {"cpu", "mps"}:
             return "manual_greedy"
         return "hf_generate"
@@ -365,7 +502,7 @@ class HFGenerator:
             int(self.cfg.max_evidence_chars),
         )
         answer_text = self._safe_text(retrieved.item.answer_text)
-        answer_text = self._truncate_chars(answer_text, 300)
+        answer_text = self._truncate_chars(answer_text, 180)
 
         same_doc = self._retrieved_same_document(mq, retrieved)
 
@@ -376,8 +513,7 @@ class HFGenerator:
             f"same_document={str(bool(same_doc)).lower()}",
         ]
         if retrieved.semantic_rank is not None:
-            metaParts_extra = f"semantic_rank={retrieved.semantic_rank}"
-            meta_parts.append(metaParts_extra)
+            meta_parts.append(f"semantic_rank={retrieved.semantic_rank}")
 
         lines = [
             "RETRIEVED MEMORY SUPPORT:",
@@ -386,19 +522,13 @@ class HFGenerator:
 
         if evidence_text:
             lines.append("")
-            lines.append("RETRIEVED EVIDENCE SNIPPET:")
+            lines.append("RETRIEVED EVIDENCE:")
             lines.append(evidence_text)
 
         if answer_text:
             lines.append("")
-            lines.append("PRIOR RELATED ANSWER:")
+            lines.append("PRIOR ANSWER:")
             lines.append(answer_text)
-
-        lines.append("")
-        lines.append(
-            "Use the retrieved material only if it is consistent with the current question "
-            "and the current context."
-        )
 
         return "\n".join(lines)
 
@@ -408,16 +538,23 @@ class HFGenerator:
 
         if task == "trec" or question_type == "classification":
             return (
-                "You are performing TREC coarse question classification.\n"
-                "Valid labels are exactly: ABBR, DESC, ENTY, HUM, LOC, NUM.\n"
-                "Return exactly one label from that set.\n"
-                "Do not output any other words, punctuation, explanation, prefix, or suffix."
+                "Return exactly one label from: ABBR, DESC, ENTY, HUM, LOC, NUM.\n"
+                "Do not output anything else."
             )
 
-        return (
-            "Answer the current question only. Be concise. "
-            "Do not repeat the question. Do not mention retrieval metadata."
-        )
+        if question_type in {"qa", "boolean_qa", "unknown"}:
+            return (
+                "You must answer the question using ONLY a short span from the context.\n"
+                "STRICT RULES:\n"
+                "- Output ONLY the exact answer span.\n"
+                "- Do NOT include explanations.\n"
+                "- Do NOT include prefixes like 'Answer:'.\n"
+                "- Do NOT include assistant text or chat markers.\n"
+                f"- Output at most {int(self.cfg.qa_max_output_words)} words.\n"
+                "- If unsure, output the shortest possible answer."
+            )
+
+        return "Answer briefly and directly."
 
     def _build_trec_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
         question = self._safe_text(mq.raw_query)
@@ -442,10 +579,7 @@ class HFGenerator:
 
             retrieved_answer = self._safe_text(retrieved.item.answer_text)
             if retrieved_answer:
-                parts.append(
-                    "Related prior label or answer (use only if helpful and consistent): "
-                    f"{self._truncate_chars(retrieved_answer, 80)}"
-                )
+                parts.append(f"Related prior label or answer: {self._truncate_chars(retrieved_answer, 80)}")
             if retrieved_block:
                 parts.append(retrieved_block)
 
@@ -468,19 +602,21 @@ class HFGenerator:
         prompt = "\n".join(parts)
         self.last_prompt = prompt
 
-        if self.last_generation_meta is None:
-            self.last_generation_meta = {}
         self.last_generation_meta = dict(self.last_generation_meta or {})
-
         self.last_generation_meta["reduced_context_used"] = bool(retrieved is not None and retrieved_block)
         self.last_generation_meta["full_context_chars"] = len(self._query_dataset_context(mq))
         self.last_generation_meta["final_context_chars"] = len(retrieved_block) if retrieved_block else 0
-        self.last_generation_meta["retrieved_evidence_chars"] = (
-            len(retrieved_evidence) if retrieved_evidence else None
-        )
+        self.last_generation_meta["retrieved_evidence_chars"] = len(retrieved_evidence) if retrieved_evidence else None
         self.last_generation_meta["retrieved_doc_signature_match"] = same_doc
 
         return prompt
+
+    def _effective_char_budget(self, requested_chars: int) -> int:
+        requested_chars = max(0, int(requested_chars))
+        token_budget = max(1, int(self.cfg.max_input_length))
+        context_token_budget = max(16, int(token_budget * 0.5))
+        approx_char_budget = context_token_budget * 4
+        return min(requested_chars, approx_char_budget)
 
     def _select_context_block(
         self,
@@ -492,8 +628,19 @@ class HFGenerator:
             self._query_evidence_text(mq),
             self._effective_char_budget(int(self.cfg.max_local_context_chars)),
         )
-
         full_context_chars = len(dataset_ctx) if dataset_ctx else 0
+
+        question_type = self._query_question_type(mq).lower()
+
+        if self.cfg.prefer_local_context_for_qa and question_type in {"qa", "boolean_qa", "unknown"}:
+            if query_evidence:
+                return query_evidence, {
+                    "reduced_context_used": True,
+                    "full_context_chars": full_context_chars,
+                    "final_context_chars": len(query_evidence),
+                    "retrieved_evidence_chars": None,
+                    "retrieved_doc_signature_match": None,
+                }
 
         if (
             retrieved is not None
@@ -512,7 +659,7 @@ class HFGenerator:
             if retrieved_evidence:
                 parts.append("RETRIEVED EVIDENCE:\n" + retrieved_evidence)
             if query_evidence:
-                parts.append("CURRENT LOCAL CONTEXT:\n" + query_evidence)
+                parts.append("LOCAL CONTEXT:\n" + query_evidence)
 
             context_block = "\n\n".join(parts)
 
@@ -524,11 +671,7 @@ class HFGenerator:
                 "retrieved_doc_signature_match": same_document,
             }
 
-        trimmed_full_ctx = self._truncate_chars(
-            dataset_ctx,
-            int(self.cfg.max_full_context_chars),
-        )
-
+        trimmed_full_ctx = self._truncate_chars(dataset_ctx, int(self.cfg.max_full_context_chars))
         return trimmed_full_ctx, {
             "reduced_context_used": False,
             "full_context_chars": full_context_chars,
@@ -544,40 +687,33 @@ class HFGenerator:
         if task == "trec" or question_type == "classification":
             return self._build_trec_prompt(mq, retrieved=retrieved)
 
-        parts = []
-
-        parts.append(
-            "You are a helpful assistant. Use the provided grounded context to answer "
-            "the current question. If retrieved prior memory is provided, treat it as "
-            "supportive evidence only and use it only when consistent with the current question."
-        )
-
         task_instruction = self._task_instruction(mq)
-        if task_instruction:
-            parts.append(f"OUTPUT RULES:\n{task_instruction}")
-
         context_block, prompt_stats = self._select_context_block(mq, retrieved=retrieved)
-        if self.cfg.include_dataset_context and context_block:
-            parts.append(f"CONTEXT:\n{context_block}")
 
-        if self.cfg.include_doc_signature:
-            doc_sig = self._query_doc_signature(mq)
-            if doc_sig:
-                parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
+        parts = [
+            "Answer the question using the context.",
+            task_instruction,
+        ]
+
+        if context_block:
+            parts.append(f"Context:\n{context_block}")
 
         if self.cfg.include_retrieved_memory_context and retrieved is not None:
             retrieved_block = self._retrieved_section(mq, retrieved)
             if retrieved_block:
                 parts.append(retrieved_block)
 
-        parts.append(f"CURRENT QUESTION:\n{self._safe_text(mq.raw_query)}")
-        parts.append("FINAL ANSWER:")
+        if self.cfg.include_doc_signature:
+            doc_sig = self._query_doc_signature(mq)
+            if doc_sig:
+                parts.append(f"Document signature: {doc_sig}")
+
+        parts.append(f"Question: {self._safe_text(mq.raw_query)}")
+        parts.append("Answer:")
 
         prompt = "\n\n".join(parts)
         self.last_prompt = prompt
 
-        if self.last_generation_meta is None:
-            self.last_generation_meta = {}
         self.last_generation_meta = dict(self.last_generation_meta or {})
         self.last_generation_meta["reduced_context_used"] = prompt_stats["reduced_context_used"]
         self.last_generation_meta["full_context_chars"] = prompt_stats["full_context_chars"]
@@ -684,15 +820,6 @@ class HFGenerator:
 
         self.last_generation_meta = meta
 
-    def _effective_char_budget(self, requested_chars: int) -> int:
-        requested_chars = max(0, int(requested_chars))
-        token_budget = max(1, int(self.cfg.max_input_length))
-
-        context_token_budget = max(16, int(token_budget * 0.5))
-        approx_char_budget = context_token_budget * 4
-
-        return min(requested_chars, approx_char_budget)
-
     def _generate_with_hf(
         self,
         *,
@@ -731,7 +858,6 @@ class HFGenerator:
         retrieved: Optional[MemoryHit] = None,
     ) -> Tuple[str, Provenance, QualitySignals]:
         prompt = self.build_prompt(mq, retrieved=retrieved)
-
         prompt_token_budget = self._effective_prompt_token_budget()
 
         tok_t0 = time.time()
@@ -749,7 +875,6 @@ class HFGenerator:
 
         input_tokens = int(input_ids.shape[-1])
         truncated = input_tokens >= int(prompt_token_budget)
-
         allowed_new_tokens = self._allowed_new_tokens(input_tokens)
 
         input_ids = input_ids.to(self.device)
@@ -869,6 +994,9 @@ class HFGenerator:
 
         if task_name == "trec" or question_type == "classification":
             answer_text = self._normalize_trec_output(answer_text)
+        else:
+            qa_context = self._query_evidence_text(mq) or self._query_dataset_context(mq)
+            answer_text = self._normalize_short_qa_output(answer_text, context_text=qa_context)
 
         self._record_meta(
             prompt=prompt,
@@ -911,26 +1039,10 @@ class HFGenerator:
         if reduced_context_used:
             quality_metrics["reduced_context_used"] = 1.0
 
-        full_context_chars = (
-            self.last_generation_meta.get("full_context_chars")
-            if isinstance(self.last_generation_meta, dict)
-            else None
-        )
-        final_context_chars = (
-            self.last_generation_meta.get("final_context_chars")
-            if isinstance(self.last_generation_meta, dict)
-            else None
-        )
-        retrieved_evidence_chars = (
-            self.last_generation_meta.get("retrieved_evidence_chars")
-            if isinstance(self.last_generation_meta, dict)
-            else None
-        )
-        same_doc = (
-            self.last_generation_meta.get("retrieved_doc_signature_match")
-            if isinstance(self.last_generation_meta, dict)
-            else None
-        )
+        full_context_chars = self.last_generation_meta.get("full_context_chars") if isinstance(self.last_generation_meta, dict) else None
+        final_context_chars = self.last_generation_meta.get("final_context_chars") if isinstance(self.last_generation_meta, dict) else None
+        retrieved_evidence_chars = self.last_generation_meta.get("retrieved_evidence_chars") if isinstance(self.last_generation_meta, dict) else None
+        same_doc = self.last_generation_meta.get("retrieved_doc_signature_match") if isinstance(self.last_generation_meta, dict) else None
 
         if isinstance(full_context_chars, (int, float)):
             quality_metrics["full_context_chars"] = float(full_context_chars)
@@ -970,6 +1082,8 @@ class HFGenerator:
             "max_evidence_chars": self.cfg.max_evidence_chars,
             "max_local_context_chars": self.cfg.max_local_context_chars,
             "max_full_context_chars": self.cfg.max_full_context_chars,
+            "prefer_local_context_for_qa": self.cfg.prefer_local_context_for_qa,
+            "qa_max_output_words": self.cfg.qa_max_output_words,
             "trec_use_few_shot": self.cfg.trec_use_few_shot,
             "model_max_positions": self._model_max_positions(),
         }

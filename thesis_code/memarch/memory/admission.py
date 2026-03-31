@@ -67,7 +67,9 @@ class AdmissionPolicy:
     allow_cohort: bool = False
     allow_global: bool = False
 
-    min_answer_chars: int = 20
+    # Lowered for extractive QA tasks like SQuAD, where valid answers can be short
+    # (e.g. names, years, postal codes, short noun phrases).
+    min_answer_chars: int = 3
     max_answer_chars: int = 50_000
 
     require_success_if_provided: bool = True
@@ -126,7 +128,6 @@ def choose_ttl_seconds(scope: Scope, policy: AdmissionPolicy) -> int:
         return int(policy.ttl_cohort_seconds)
     if scope == Scope.GLOBAL:
         return int(policy.ttl_global_seconds)
-    # Defensive fallback
     return int(policy.ttl_user_seconds)
 
 
@@ -171,11 +172,6 @@ def _looks_like_short_task_label(mq: MemoryQuery, answer_text: str) -> bool:
 def _looks_like_question_echo(answer_text: str, raw_query: str, *, overlap_threshold: float) -> Tuple[bool, Dict[str, Any]]:
     """
     Cheap heuristic to reject answers that are mostly restatements of the question.
-
-    Strategy:
-    - exact normalized equality -> reject
-    - answer contains the full normalized query -> reject
-    - otherwise compute token overlap against query tokens
     """
     ans_norm = _normalize_text(answer_text)
     qry_norm = _normalize_text(raw_query)
@@ -226,9 +222,6 @@ def _validate_task_specific_format(mq: MemoryQuery, answer_text: str) -> Tuple[b
 
     Current strict rule:
     - TREC should be a single coarse label, not a sentence/explanation
-
-    Returns:
-      (is_valid, debug_info)
     """
     task = _task_name(mq)
     qtype = _question_type(mq)
@@ -274,7 +267,6 @@ def should_store(
         return False, {"reason": "too_large", "len": n, "max": policy.max_answer_chars}
 
     if policy.require_success_if_provided and (quality is not None):
-        # If success is explicitly False, reject.
         if hasattr(quality, "success") and (quality.success is False):
             return False, {"reason": "quality_failed"}
 
@@ -300,7 +292,6 @@ def should_store(
         if not is_valid_format:
             return False, {"reason": "invalid_task_format", **format_debug}
 
-    # Scope enablement checks (defensive; scopes are usually pre-filtered)
     if scope == Scope.SESSION and not (policy.allow_session and mq.session_id):
         return False, {"reason": "scope_disabled_or_missing_id", "scope": scope.value}
     if scope == Scope.USER and not (policy.allow_user and mq.user_id):
@@ -316,7 +307,6 @@ def should_store(
     return True, accepted_debug
 
 
-# Convenience wrapper used by some callers
 def should_store_default(
     mq: MemoryQuery,
     answer_text: str,

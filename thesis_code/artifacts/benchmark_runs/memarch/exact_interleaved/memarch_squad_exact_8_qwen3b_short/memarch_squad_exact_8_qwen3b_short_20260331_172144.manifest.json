@@ -1,0 +1,44 @@
+{
+  "benchmark_name": "memarch_squad_exact_8_qwen3b_short",
+  "notes": "SQuAD exact 8 examples qwen3b short",
+  "tier2_repo": "/home/ashripal_elab/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+  "workload_mode": "exact_interleaved",
+  "task_glob": "/home/ashripal_elab/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_exact.jsonl",
+  "base_max_examples": 8,
+  "total_workload_examples": 16,
+  "unique_base_examples": 8,
+  "tasks": [
+    "squad"
+  ],
+  "source_files": [
+    "/home/ashripal_elab/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_exact.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "ram_capacity_items": 64,
+  "disk_store_path": "/home/ashripal_elab/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
+  "retrieval_mode": "exact_only",
+  "semantic_enabled": false,
+  "semantic_threshold_context": 0.75,
+  "semantic_threshold_bypass": 1.01,
+  "max_semantic_candidates": 5,
+  "embedding_model_id": "sentence-transformers/all-MiniLM-L6-v2",
+  "promote_disk_hits_to_ram": true,
+  "return_memory_directly": true,
+  "enable_storage": true,
+  "store_in_ram": true,
+  "store_on_disk": true,
+  "max_input_tokens": 320,
+  "max_new_tokens": 8,
+  "model_id": "/home/ashripal_elab/mem_optim/thesis_code/models/Qwen2.5-3B-Instruct",
+  "namespaces": {
+    "user_id": "user_a",
+    "session_id": "session_a",
+    "cohort_id": null
+  },
+  "total_requests": null,
+  "repeat_fraction": 0.0,
+  "observed_repeat_requests": 8,
+  "observed_repeat_rate": 0.5
+}

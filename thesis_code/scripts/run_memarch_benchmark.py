@@ -34,6 +34,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--notes", type=str, default="")
 
     parser.add_argument("--task_glob", type=str, default="")
+    parser.add_argument(
+        "--input_path",
+        type=str,
+        default=None,
+        help="Direct path to a JSONL workload file (overrides task_glob).",
+    )
+
     parser.add_argument("--max_examples", type=int, default=25)
     parser.add_argument(
         "--mode",
@@ -92,8 +99,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--local_files_only", action="store_true")
     parser.add_argument("--cpu_fallback_on_long", action="store_true")
 
-    # Keep this flag for convenience/documentation, but do not pass it into BenchmarkConfig
-    # unless your local BenchmarkConfig actually defines a jetson_safe_mode field.
+    # Kept only for convenience/documentation.
     parser.add_argument("--jetson_safe_mode", action="store_true")
 
     parser.add_argument("--user_id", type=str, default="user_a")
@@ -123,9 +129,17 @@ def build_parser() -> argparse.ArgumentParser:
         ],
     )
     parser.add_argument("--promote_disk_hits_to_ram", action="store_true", default=True)
-    parser.add_argument("--no_promote_disk_hits_to_ram", dest="promote_disk_hits_to_ram", action="store_false")
+    parser.add_argument(
+        "--no_promote_disk_hits_to_ram",
+        dest="promote_disk_hits_to_ram",
+        action="store_false",
+    )
     parser.add_argument("--return_memory_directly", action="store_true", default=True)
-    parser.add_argument("--no_return_memory_directly", dest="return_memory_directly", action="store_false")
+    parser.add_argument(
+        "--no_return_memory_directly",
+        dest="return_memory_directly",
+        action="store_false",
+    )
 
     # Lexical controls
     parser.add_argument("--lexical_enabled", action="store_true")
@@ -191,8 +205,12 @@ def _parse_task_list(text: str) -> list[str]:
 
 
 def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
+    effective_task_glob = str(args.task_glob or "").strip()
+    if args.input_path:
+        effective_task_glob = str(Path(args.input_path).expanduser().resolve())
+
     workload = WorkloadConfig(
-        task_glob=args.task_glob,
+        task_glob=effective_task_glob,
         max_examples=args.max_examples,
         mode=args.mode,
         replay_k=args.replay_k,
@@ -236,23 +254,19 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         retrieval_mode=retrieval_mode,
         promote_disk_hits_to_ram=args.promote_disk_hits_to_ram,
         return_memory_directly=args.return_memory_directly,
-
         lexical_enabled=bool(args.lexical_enabled or lexical_mode_requested),
         lexical_threshold_context=args.lexical_context_threshold,
         lexical_threshold_bypass=args.lexical_direct_threshold,
         lexical_top_k=args.lexical_top_k,
         prefer_same_source=args.prefer_same_source,
         safe_direct_reuse_tasks=_parse_task_list(args.safe_direct_reuse_tasks),
-
         semantic_enabled=bool(args.semantic_enabled or semantic_mode_requested),
         semantic_threshold_context=args.semantic_threshold_context,
         semantic_threshold_bypass=args.semantic_threshold_bypass,
         max_semantic_candidates=args.max_semantic_candidates,
-
         embedding_model_id=args.embedding_model_id,
         embedding_device=args.embedding_device,
         embedding_local_files_only=args.embedding_local_files_only,
-
         enable_storage=not args.disable_storage,
         store_in_ram=not args.disable_store_in_ram,
         store_on_disk=not args.disable_store_on_disk,
@@ -280,6 +294,10 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         namespaces=namespaces,
         memory=memory,
     )
+
+    if args.decoding_mode != "greedy":
+        print("[warn] Non-greedy decoding may introduce noise in evaluation")
+
     cfg.validate()
     return cfg
 
