@@ -1122,7 +1122,7 @@ class MemoryManager:
                 **rank_dbg,
             }
 
-        bypass_allowed = False
+        bypass_allowed = bool(decision == "bypass")
         promoted = False
 
         hit = MemoryHit(
@@ -1136,11 +1136,14 @@ class MemoryManager:
                 scope=scope,
                 namespace=ns,
                 source="semantic_ram" if source_tier == SourceTier.RAM else "semantic_disk",
-                accepted_reason=decision_dbg.get("reason", "semantic_context"),
+                accepted_reason=decision_dbg.get(
+                    "reason",
+                    "semantic_bypass" if bypass_allowed else "semantic_context",
+                ),
                 extra={
                     "semantic_candidate_rank": rank,
                     "semantic_score": float(score),
-                    "semantic_bypassed": False,
+                    "semantic_bypassed": bypass_allowed,
                     "same_document": bool(filter_dbg.get("same_document", False)),
                     "same_source": False,
                     "document_relation": filter_dbg.get("document_relation"),
@@ -1167,6 +1170,8 @@ class MemoryManager:
             "promoted_to_ram": promoted,
             "same_document": bool(filter_dbg.get("same_document", False)),
             "document_relation": filter_dbg.get("document_relation"),
+            "semantic_match_type": "direct" if bypass_allowed else "context",
+            "semantic_bypassed": bypass_allowed,
             **scan_dbg,
             **rank_dbg,
         }
@@ -1506,7 +1511,61 @@ class MemoryManager:
                 },
             }
 
-        semantic_hit_for_generation = hit if hit is not None and hit.match_type == MatchType.SEMANTIC else None
+        if (
+            hit is not None
+            and hit.match_type == MatchType.SEMANTIC
+            and bool(getattr(hit, "bypass_allowed", False))
+            and self._cfg.return_memory_directly
+        ):
+            item = hit.item
+            evidence_text = getattr(item, "evidence_text", None) or item.meta.get("evidence_text")
+            return item.answer_text, {
+                "used_memory": True,
+                "generated": False,
+                "source_tier": hit.source_tier.value,
+                "memory_source_tier": hit.source_tier.value,
+                "match_type": hit.match_type.value,
+                "score": hit.score,
+                "lexical_used": False,
+                "lexical_bypassed": False,
+                "lexical_context_used": False,
+                "semantic_used": True,
+                "semantic_bypassed": True,
+                "semantic_candidate_rank": hit.semantic_rank,
+                "promoted_to_ram": bool(retrieval_dbg.get("promoted_to_ram", False)),
+                "namespaces_checked": retrieval_dbg.get("namespaces_checked", []),
+                "hit": dict(hit.debug),
+                "stored": False,
+                "stored_scopes": [],
+                "memory_lookup_ms": memory_lookup_ms,
+                "generation_ms_est": 0.0,
+                "doc_signature": getattr(item, "doc_signature", None) or item.meta.get("doc_signature"),
+                "source_file": getattr(item, "source_file", None) or item.meta.get("source_file"),
+                "source_id": getattr(item, "source_id", None) or item.meta.get("source_id"),
+                "chunk_index": (
+                    item.chunk_index
+                    if getattr(item, "chunk_index", None) is not None
+                    else item.meta.get("chunk_index")
+                ),
+                "chunk_id": getattr(item, "chunk_id", None) or item.meta.get("chunk_id"),
+                "question_type": getattr(item, "question_type", None) or item.meta.get("question_type"),
+                "stored_evidence_text": evidence_text,
+                "stored_evidence_chars": len(str(evidence_text)) if evidence_text is not None else None,
+                "query_evidence_text": self._query_evidence_text(mq),
+                "timings_ms": {
+                    "memory_lookup_ms": memory_lookup_ms,
+                    "generation_ms_est": 0.0,
+                    "total_ms": memory_lookup_ms,
+                },
+            }
+
+        semantic_hit_for_generation = (
+            hit
+            if hit is not None
+            and hit.match_type == MatchType.SEMANTIC
+            and not bool(getattr(hit, "bypass_allowed", False))
+            else None
+        )
         retrieved_for_generation = lexical_hit_for_generation or semantic_hit_for_generation
 
         gen_t0 = time.time()
