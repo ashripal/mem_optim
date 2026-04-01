@@ -213,3 +213,6 @@ __marimo__/
 # Download model file
 /Users/ashripal/mem_optim/thesis_code/download_model.py
 /Users/ashripal/mem_optim/thesis_code/artifacts/benchmark_runs/
+
+# Logs
+/Users/ashripal/mem_optim/thesis_code/artifacts/
