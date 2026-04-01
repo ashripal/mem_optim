@@ -14,6 +14,7 @@ from memarch.memory.schema import (
     Scope,
 )
 
+
 SCHEMA_VERSION = 4
 
 
@@ -34,7 +35,15 @@ def _dt_from_str(s: Optional[str]) -> Optional[datetime]:
     return dt.astimezone(timezone.utc)
 
 
+def _normalize_embedding(vec) -> Optional[list[float]]:
+    if vec is None:
+        return None
+    return [round(float(x), 6) for x in vec]
+
+
 def _serialize_item(item: MemoryItem) -> str:
+    query_embedding = _normalize_embedding(getattr(item, "query_embedding", None))
+
     d: Dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "key": item.key,
@@ -64,7 +73,6 @@ def _serialize_item(item: MemoryItem) -> str:
             "last_access_utc": _dt_to_str(item.stats.last_access_utc),
         },
         "meta": item.meta,
-
         "evidence_text": item.evidence_text,
         "doc_signature": item.doc_signature,
         "source_file": item.source_file,
@@ -73,16 +81,25 @@ def _serialize_item(item: MemoryItem) -> str:
         "chunk_id": item.chunk_id,
         "question_type": item.question_type,
         "answer_canonical": item.answer_canonical,
-
-        "query_embedding": item.query_embedding,
+        "query_embedding": query_embedding,
         "embedding_model_id": item.embedding_model_id,
-        "embedding_norm": item.embedding_norm,
+        "embedding_norm": (
+            round(float(item.embedding_norm), 6)
+            if item.embedding_norm is not None
+            else None
+        ),
     }
-    return json.dumps(d, separators=(",", ":"), ensure_ascii=False)
+    return json.dumps(d, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
 def _deserialize_item(payload: str) -> MemoryItem:
     d = json.loads(payload)
+    sv = int(d.get("schema_version", 1))
+
+    if sv not in (1, 2, 3, 4):
+        raise ValueError(
+            f"Unsupported schema_version: {sv} (expected one of 1, 2, 3, 4)"
+        )
 
     prov_d = d["provenance"]
     provenance = Provenance(
@@ -94,10 +111,31 @@ def _deserialize_item(payload: str) -> MemoryItem:
         context_window=prov_d.get("context_window"),
     )
 
-    quality = QualitySignals(**(d.get("quality") or {}))
-    stats = AccessStats(**(d.get("stats") or {}))
+    qd = d.get("quality", {})
+    quality = QualitySignals(
+        score=qd.get("score"),
+        success=qd.get("success"),
+        metrics=dict(qd.get("metrics") or {}),
+    )
 
-    return MemoryItem(
+    sd = d.get("stats", {})
+    stats = AccessStats(
+        access_count=int(sd.get("access_count", 0)),
+        last_access_utc=_dt_from_str(sd.get("last_access_utc")),
+    )
+
+    query_embedding = _normalize_embedding(d.get("query_embedding"))
+
+    embedding_model_id = d.get("embedding_model_id")
+    embedding_norm = d.get("embedding_norm")
+    if embedding_norm is not None:
+        embedding_norm = float(embedding_norm)
+
+    chunk_index = d.get("chunk_index")
+    if chunk_index is not None:
+        chunk_index = int(chunk_index)
+
+    item = MemoryItem(
         key=d["key"],
         scope=Scope(d["scope"]),
         namespace=d["namespace"],
@@ -115,43 +153,54 @@ def _deserialize_item(payload: str) -> MemoryItem:
         doc_signature=d.get("doc_signature"),
         source_file=d.get("source_file"),
         source_id=d.get("source_id"),
-        chunk_index=d.get("chunk_index"),
+        chunk_index=chunk_index,
         chunk_id=d.get("chunk_id"),
         question_type=d.get("question_type"),
         answer_canonical=d.get("answer_canonical"),
-        query_embedding=d.get("query_embedding"),
-        embedding_model_id=d.get("embedding_model_id"),
-        embedding_norm=d.get("embedding_norm"),
+        query_embedding=query_embedding,
+        embedding_model_id=embedding_model_id,
+        embedding_norm=embedding_norm,
     )
+
+    # Important: MemoryItem/schema may coerce embeddings internally.
+    # Force the public field back to stable plain-Python values for tests and portability.
+    item.query_embedding = _normalize_embedding(item.query_embedding)
+    if item.embedding_norm is not None:
+        item.embedding_norm = float(item.embedding_norm)
+
+    return item
+
+
+class DiskStoreStats:
+    def __init__(self) -> None:
+        self.gets = 0
+        self.hits = 0
+        self.misses = 0
+        self.puts = 0
+        self.deletes = 0
+        self.iter_calls = 0
+        self.iter_candidate_calls = 0
 
 
 class DiskStoreSQLite:
-    def __init__(self, path: str, *, autocommit_every: int = 32) -> None:
+    def __init__(self, path: str) -> None:
+        if not path:
+            raise ValueError("path must be non-empty")
+
         self._path = str(Path(path))
         Path(self._path).parent.mkdir(parents=True, exist_ok=True)
 
         self._conn = sqlite3.connect(self._path, timeout=30.0, check_same_thread=False)
-
-        # 🔥 Jetson-optimized pragmas
         self._conn.execute("PRAGMA journal_mode=WAL;")
         self._conn.execute("PRAGMA synchronous=NORMAL;")
         self._conn.execute("PRAGMA temp_store=MEMORY;")
-        self._conn.execute("PRAGMA cache_size=-20000;")  # ~20MB
-        self._conn.execute("PRAGMA mmap_size=268435456;")  # 256MB
 
         self._create_tables()
+        self._stats = DiskStoreStats()
 
-        self._autocommit_every = max(1, int(autocommit_every))
-        self._pending_writes = 0
-
-    def _maybe_commit(self):
-        self._pending_writes += 1
-        if self._pending_writes >= self._autocommit_every:
-            self._conn.commit()
-            self._pending_writes = 0
-
-    def _create_tables(self):
-        self._conn.execute("""
+    def _create_tables(self) -> None:
+        self._conn.execute(
+            """
             CREATE TABLE IF NOT EXISTS kv (
               namespace TEXT NOT NULL,
               key TEXT NOT NULL,
@@ -159,42 +208,95 @@ class DiskStoreSQLite:
               updated_at_utc TEXT NOT NULL,
               PRIMARY KEY (namespace, key)
             );
-        """)
+            """
+        )
+        self._conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_kv_namespace
+            ON kv(namespace);
+            """
+        )
         self._conn.commit()
 
+    def stats(self) -> Dict[str, int]:
+        s = self._stats
+        return {
+            "gets": s.gets,
+            "hits": s.hits,
+            "misses": s.misses,
+            "puts": s.puts,
+            "deletes": s.deletes,
+            "iter_calls": s.iter_calls,
+            "iter_candidate_calls": s.iter_candidate_calls,
+        }
+
     def get(self, namespace: str, key: str) -> Optional[MemoryItem]:
+        self._stats.gets += 1
+        if not namespace or not key:
+            self._stats.misses += 1
+            return None
+
         cur = self._conn.execute(
             "SELECT value_json FROM kv WHERE namespace=? AND key=?;",
             (namespace, key),
         )
         row = cur.fetchone()
-        if not row:
+        if row is None:
+            self._stats.misses += 1
             return None
 
+        self._stats.hits += 1
         item = _deserialize_item(row[0])
         item.stats.touch()
         return item
 
     def put(self, namespace: str, key: str, item: MemoryItem) -> None:
+        if not namespace or not key:
+            raise ValueError("namespace and key must be non-empty")
+        if item.key != key:
+            raise ValueError("key must match item.key")
+
+        self._stats.puts += 1
         payload = _serialize_item(item)
         now = datetime.now(timezone.utc).isoformat()
 
-        self._conn.execute("""
+        self._conn.execute(
+            """
             INSERT INTO kv(namespace, key, value_json, updated_at_utc)
             VALUES(?, ?, ?, ?)
             ON CONFLICT(namespace, key) DO UPDATE SET
               value_json=excluded.value_json,
               updated_at_utc=excluded.updated_at_utc;
-        """, (namespace, key, payload, now))
-
-        self._maybe_commit()
+            """,
+            (namespace, key, payload, now),
+        )
+        self._conn.commit()
 
     def delete(self, namespace: str, key: str) -> None:
+        if not namespace or not key:
+            return
+        self._stats.deletes += 1
         self._conn.execute(
             "DELETE FROM kv WHERE namespace=? AND key=?;",
             (namespace, key),
         )
-        self._maybe_commit()
+        self._conn.commit()
+
+    def iter_namespace(self, namespace: str) -> Iterator[MemoryItem]:
+        self._stats.iter_calls += 1
+        if not namespace:
+            return iter(())
+
+        cur = self._conn.execute(
+            "SELECT value_json FROM kv WHERE namespace=? ORDER BY updated_at_utc ASC;",
+            (namespace,),
+        )
+
+        def _gen() -> Iterator[MemoryItem]:
+            for (value_json,) in cur:
+                yield _deserialize_item(value_json)
+
+        return _gen()
 
     def iter_candidates(
         self,
@@ -205,30 +307,83 @@ class DiskStoreSQLite:
         doc_signature: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> Iterator[MemoryItem]:
+        self._stats.iter_candidate_calls += 1
+        if not namespace:
+            return iter(())
+
+        task_norm = str(task).strip() if task is not None else None
+        source_norm = str(source_file).strip() if source_file is not None else None
+        doc_norm = str(doc_signature).strip() if doc_signature is not None else None
 
         cur = self._conn.execute(
-            "SELECT value_json FROM kv WHERE namespace=?;",
+            "SELECT value_json FROM kv WHERE namespace=? ORDER BY updated_at_utc ASC;",
             (namespace,),
         )
 
-        count = 0
-        for (value_json,) in cur:
-            # 🔥 lightweight pre-filter
-            d = json.loads(value_json)
+        def _item_task(item: MemoryItem) -> Optional[str]:
+            value = item.meta.get("task")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
 
-            if task and d.get("meta", {}).get("task") != task:
-                continue
-            if source_file and d.get("source_file") != source_file:
-                continue
-            if doc_signature and d.get("doc_signature") != doc_signature:
-                continue
+        def _item_source(item: MemoryItem) -> Optional[str]:
+            if getattr(item, "source_file", None):
+                text = str(item.source_file).strip()
+                if text:
+                    return text
+            value = item.meta.get("source_file")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
 
-            yield _deserialize_item(value_json)
+        def _item_doc(item: MemoryItem) -> Optional[str]:
+            if getattr(item, "doc_signature", None):
+                text = str(item.doc_signature).strip()
+                if text:
+                    return text
+            value = item.meta.get("doc_signature")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
 
-            count += 1
-            if limit and count >= limit:
-                break
+        def _gen() -> Iterator[MemoryItem]:
+            yielded = 0
+            for (value_json,) in cur:
+                item = _deserialize_item(value_json)
 
-    def close(self):
-        self._conn.commit()
-        self._conn.close()
+                if task_norm is not None:
+                    itask = _item_task(item)
+                    if itask is not None and itask != task_norm:
+                        continue
+
+                if source_norm is not None:
+                    isource = _item_source(item)
+                    if isource is None or isource != source_norm:
+                        continue
+
+                if doc_norm is not None:
+                    idoc = _item_doc(item)
+                    if idoc is None or idoc != doc_norm:
+                        continue
+
+                yield item
+                yielded += 1
+                if limit is not None and yielded >= int(limit):
+                    break
+
+        return _gen()
+
+    def close(self) -> None:
+        try:
+            self._conn.commit()
+        finally:
+            self._conn.close()
+
+    def __enter__(self) -> "DiskStoreSQLite":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()

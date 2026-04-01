@@ -658,6 +658,49 @@ class MemoryManager:
                 return ()
         return self._iter_store_namespace(store, namespace)
 
+    def _iter_store_semantic_candidates(
+        self,
+        store: MemoryStore,
+        namespace: str,
+        *,
+        mq: MemoryQuery,
+        limit: Optional[int] = None,
+    ) -> Iterable[MemoryItem]:
+        """
+        Semantic retrieval must allow broader candidates when same-document
+        candidates are unavailable.
+
+        Therefore this iterator intentionally avoids source/doc filtering.
+        It only uses store-native filtering for task when supported; otherwise
+        it scans the namespace and filters task in Python.
+        """
+        if hasattr(store, "iter_candidates"):
+            try:
+                return getattr(store, "iter_candidates")(
+                    namespace,
+                    task=mq.task,
+                    source_file=None,
+                    doc_signature=None,
+                    limit=limit,
+                )
+            except TypeError:
+                pass
+            except Exception:
+                return ()
+
+        def _gen() -> Iterable[MemoryItem]:
+            yielded = 0
+            for item in self._iter_store_namespace(store, namespace):
+                item_task = str(item.meta.get("task") or "").strip()
+                if item_task and item_task != mq.task:
+                    continue
+                yield item
+                yielded += 1
+                if limit is not None and yielded >= int(limit):
+                    break
+
+        return _gen()
+
     def _build_lexical_candidates(
         self,
         mq: MemoryQuery,
@@ -675,7 +718,6 @@ class MemoryManager:
         disk_reads = 0
         namespaces_checked: List[Dict[str, Any]] = []
 
-        # Small bounded hint to candidate iterators; keeps Jetson scans tighter
         candidate_limit = max(8, self._lexical_top_k() * 8)
 
         for rn in resolve_namespaces(mq, scope_order=pol.scope_order, include_missing=False):
@@ -970,7 +1012,7 @@ class MemoryManager:
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
                 ns_dbg["semantic_ram_scanned"] = True
-                for item in self._iter_store_candidates(
+                for item in self._iter_store_semantic_candidates(
                     self._ram, ns, mq=mq, limit=candidate_limit
                 ):
                     ok, dbg = semantic_candidate_allowed(
@@ -999,7 +1041,7 @@ class MemoryManager:
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
                 ns_dbg["semantic_disk_scanned"] = True
-                for item in self._iter_store_candidates(
+                for item in self._iter_store_semantic_candidates(
                     self._disk, ns, mq=mq, limit=candidate_limit
                 ):
                     ok, dbg = semantic_candidate_allowed(

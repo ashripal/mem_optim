@@ -106,11 +106,10 @@ class GeneratorConfig:
     trec_use_few_shot: bool = False
     skip_special_tokens: bool = True
 
-    # Jetson / edge-oriented knobs
     low_cpu_mem_usage: bool = True
     use_safetensors: bool = True
     trust_remote_code: bool = False
-    attn_implementation: str = "auto"  # auto | eager | sdpa | flash_attention_2
+    attn_implementation: str = "auto"
     use_kv_cache: bool = True
 
 
@@ -141,7 +140,6 @@ class HFGenerator:
         r"^\s*(?:OUTPUT|FINAL ANSWER|ANSWER|RESPONSE|LABEL)\s*:\s*",
         flags=re.IGNORECASE,
     )
-
     _LEADING_ANSWER_PHRASE_RE = re.compile(
         r"^\s*(?:"
         r"the answer is|answer is|it is|it's|the answer|"
@@ -151,19 +149,13 @@ class HFGenerator:
         r")\s+",
         flags=re.IGNORECASE,
     )
-
-    _CHAT_TURN_RE = re.compile(
-        r"\b(?:Human|Assistant|User|System)\s*:",
-        flags=re.IGNORECASE,
-    )
-
+    _CHAT_TURN_RE = re.compile(r"\b(?:Human|Assistant|User|System)\s*:", flags=re.IGNORECASE)
     _BOILERPLATE_PATTERNS = [
         re.compile(r"\bto answer this question\b.*", flags=re.IGNORECASE | re.DOTALL),
         re.compile(r"\byou need to\b.*", flags=re.IGNORECASE | re.DOTALL),
         re.compile(r"\bbased on the (?:context|passage|document)\b.*", flags=re.IGNORECASE | re.DOTALL),
         re.compile(r"\byou are an ai assistant\b.*", flags=re.IGNORECASE | re.DOTALL),
     ]
-
     _WS_RE = re.compile(r"\s+")
     _PUNCT_EDGE_RE = re.compile(r"^[\-\–\—\,\.\:\;\"\']+\s*|\s*[\-\–\—\,\.\:\;\"\']+$")
     _WORDISH_RE = re.compile(r"\S+")
@@ -187,28 +179,20 @@ class HFGenerator:
 
     def _validate_config(self) -> None:
         mode = (self.cfg.decoding_mode or "greedy").lower().strip()
-
         if mode not in {"greedy", "beam", "sample"}:
             raise ValueError("decoding_mode must be one of: greedy, beam, sample")
-
         if mode == "beam" and int(self.cfg.num_beams) <= 1:
             raise ValueError("Beam mode requires num_beams > 1")
-
         if mode != "sample" and bool(self.cfg.do_sample):
             raise ValueError("do_sample=True is only valid when decoding_mode='sample'")
-
         if mode == "sample" and int(self.cfg.num_beams) != 1:
             raise ValueError("Sample mode requires num_beams == 1")
-
         if int(self.cfg.max_input_length) <= 0:
             raise ValueError("max_input_length must be > 0")
-
         if int(self.cfg.max_new_tokens) < 0:
             raise ValueError("max_new_tokens must be >= 0")
-
         if int(self.cfg.qa_max_output_words) <= 0:
             raise ValueError("qa_max_output_words must be > 0")
-
         attn_impl = (self.cfg.attn_implementation or "auto").strip()
         if attn_impl not in {"auto", "eager", "sdpa", "flash_attention_2"}:
             raise ValueError("attn_implementation must be one of: auto, eager, sdpa, flash_attention_2")
@@ -216,21 +200,18 @@ class HFGenerator:
     @staticmethod
     def _resolve_torch_dtype(dtype_name: str, device: str):
         dtype_name = (dtype_name or "auto").lower().strip()
-
         if dtype_name == "auto":
             if device == "cuda":
                 return torch.float16
             if device == "mps":
                 return torch.float16
             return torch.float32
-
         if dtype_name == "float16":
             return torch.float32 if device == "cpu" else torch.float16
         if dtype_name == "bfloat16":
             return torch.float32 if device == "cpu" else torch.bfloat16
         if dtype_name == "float32":
             return torch.float32
-
         raise ValueError(f"Unsupported torch_dtype: {dtype_name}")
 
     def _load_tokenizer(self, model_source: str):
@@ -248,7 +229,6 @@ class HFGenerator:
             "low_cpu_mem_usage": bool(self.cfg.low_cpu_mem_usage),
             "trust_remote_code": bool(self.cfg.trust_remote_code),
         }
-
         if bool(self.cfg.use_safetensors):
             kwargs["use_safetensors"] = True
 
@@ -256,11 +236,8 @@ class HFGenerator:
         if attn_impl != "auto":
             kwargs["attn_implementation"] = attn_impl
 
-        # On CUDA edge devices like Jetson, load directly to GPU when possible.
-        # On CPU/MPS, let HF load normally and then move.
         if device == "cuda":
             kwargs["device_map"] = {"": 0}
-
         return kwargs
 
     def _load_model(self, model_source: str, device: str, dtype):
@@ -269,10 +246,8 @@ class HFGenerator:
             **self._model_load_kwargs(device, dtype),
         )
         model.eval()
-
         if device != "cuda":
             model.to(device=device, dtype=dtype)
-
         return model
 
     @staticmethod
@@ -297,7 +272,6 @@ class HFGenerator:
         raw = self._safe_text(text)
         if not raw:
             return raw
-
         upper = raw.upper()
 
         for pat in [
@@ -352,7 +326,6 @@ class HFGenerator:
 
         matches = list(self._WORDISH_RE.finditer(ctx))
         spans: List[str] = []
-
         for i in range(len(matches)):
             for j in range(i, min(len(matches), i + max_words)):
                 start = matches[i].start()
@@ -402,7 +375,6 @@ class HFGenerator:
 
         if best is not None:
             return best[2].strip()
-
         return raw
 
     def _normalize_short_qa_output(self, text: str, context_text: str = "") -> str:
@@ -423,7 +395,6 @@ class HFGenerator:
         raw = self._strip_chat_turns(raw)
         raw = re.sub(r"\s{2,}", " ", raw).strip()
         raw = raw.strip(" \t\r\n\"'`")
-
         raw = self._LEADING_ANSWER_PHRASE_RE.sub("", raw).strip()
 
         parts = re.split(r"(?<=[\.\!\?])\s+|;\s+|,\s+(?=[A-Z])", raw, maxsplit=1)
@@ -436,14 +407,12 @@ class HFGenerator:
 
         raw = self._trim_edge_punct(raw)
         raw = self._collapse_ws(raw)
-
         raw = self._snap_answer_to_context(raw, context_text)
         raw = self._limit_words(raw, int(self.cfg.qa_max_output_words))
         raw = self._trim_edge_punct(raw)
 
         if len(raw.split()) <= 12:
             raw = raw.rstrip(" .,:;")
-
         return raw or self._safe_text(text)
 
     @staticmethod
@@ -486,7 +455,6 @@ class HFGenerator:
     def _select_generation_backend(self) -> str:
         if self.cfg.generation_backend != "auto":
             return self.cfg.generation_backend
-
         mode = (self.cfg.decoding_mode or "greedy").lower().strip()
         if mode in {"beam", "sample"}:
             return "hf_generate"
@@ -529,14 +497,12 @@ class HFGenerator:
     def _retrieved_same_document(self, mq: MemoryQuery, retrieved: Optional[MemoryHit]) -> bool:
         if retrieved is None:
             return False
-
         dbg = getattr(retrieved, "debug", {}) or {}
         if "same_document" in dbg:
             try:
                 return bool(dbg.get("same_document"))
             except Exception:
                 pass
-
         query_doc = self._query_doc_signature(mq)
         item_doc = self._retrieved_doc_signature(retrieved)
         return bool(query_doc and item_doc and query_doc == item_doc)
@@ -548,7 +514,6 @@ class HFGenerator:
         )
         answer_text = self._safe_text(retrieved.item.answer_text)
         answer_text = self._truncate_chars(answer_text, 180)
-
         same_doc = self._retrieved_same_document(mq, retrieved)
 
         meta_parts = [
@@ -564,17 +529,10 @@ class HFGenerator:
             "RETRIEVED MEMORY SUPPORT:",
             ", ".join(meta_parts),
         ]
-
         if evidence_text:
-            lines.append("")
-            lines.append("RETRIEVED EVIDENCE:")
-            lines.append(evidence_text)
-
+            lines.extend(["", "RETRIEVED EVIDENCE:", evidence_text])
         if answer_text:
-            lines.append("")
-            lines.append("PRIOR ANSWER:")
-            lines.append(answer_text)
-
+            lines.extend(["", "PRIOR ANSWER:", answer_text])
         return "\n".join(lines)
 
     def _task_instruction(self, mq: MemoryQuery) -> str:
@@ -603,7 +561,6 @@ class HFGenerator:
 
     def _build_trec_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
         question = self._safe_text(mq.raw_query)
-
         parts = [
             "You are a classifier for TREC coarse question types.",
             "Valid labels: ABBR, DESC, ENTY, HUM, LOC, NUM.",
@@ -641,8 +598,12 @@ class HFGenerator:
                 ]
             )
 
-        parts.append(f"Question: {question}")
-        parts.append("Label:")
+        doc_sig = self._query_doc_signature(mq)
+        if doc_sig:
+            parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
+
+        parts.append(f"CURRENT QUESTION: {question}")
+        parts.append("LABEL:")
 
         prompt = "\n".join(parts)
         self.last_prompt = prompt
@@ -668,24 +629,12 @@ class HFGenerator:
         mq: MemoryQuery,
         retrieved: Optional[MemoryHit],
     ) -> Tuple[str, Dict[str, object]]:
-        dataset_ctx = self._query_dataset_context(mq)
+        dataset_ctx = self._query_dataset_context(mq) if self.cfg.include_dataset_context else ""
         query_evidence = self._truncate_chars(
             self._query_evidence_text(mq),
             self._effective_char_budget(int(self.cfg.max_local_context_chars)),
         )
         full_context_chars = len(dataset_ctx) if dataset_ctx else 0
-
-        question_type = self._query_question_type(mq).lower()
-
-        if self.cfg.prefer_local_context_for_qa and question_type in {"qa", "boolean_qa", "unknown"}:
-            if query_evidence:
-                return query_evidence, {
-                    "reduced_context_used": True,
-                    "full_context_chars": full_context_chars,
-                    "final_context_chars": len(query_evidence),
-                    "retrieved_evidence_chars": None,
-                    "retrieved_doc_signature_match": None,
-                }
 
         if (
             retrieved is not None
@@ -704,10 +653,9 @@ class HFGenerator:
             if retrieved_evidence:
                 parts.append("RETRIEVED EVIDENCE:\n" + retrieved_evidence)
             if query_evidence:
-                parts.append("LOCAL CONTEXT:\n" + query_evidence)
+                parts.append("CURRENT LOCAL CONTEXT:\n" + query_evidence)
 
             context_block = "\n\n".join(parts)
-
             return context_block, {
                 "reduced_context_used": bool(context_block),
                 "full_context_chars": full_context_chars,
@@ -715,6 +663,17 @@ class HFGenerator:
                 "retrieved_evidence_chars": len(retrieved_evidence) if retrieved_evidence else None,
                 "retrieved_doc_signature_match": same_document,
             }
+
+        question_type = self._query_question_type(mq).lower()
+        if self.cfg.prefer_local_context_for_qa and question_type in {"qa", "boolean_qa", "unknown"}:
+            if query_evidence:
+                return query_evidence, {
+                    "reduced_context_used": True,
+                    "full_context_chars": full_context_chars,
+                    "final_context_chars": len(query_evidence),
+                    "retrieved_evidence_chars": None,
+                    "retrieved_doc_signature_match": None,
+                }
 
         trimmed_full_ctx = self._truncate_chars(dataset_ctx, int(self.cfg.max_full_context_chars))
         return trimmed_full_ctx, {
@@ -741,26 +700,25 @@ class HFGenerator:
         ]
 
         if context_block:
-            parts.append(f"Context:\n{context_block}")
+            parts.append(f"CONTEXT:\n{context_block}")
 
         if self.cfg.include_retrieved_memory_context and retrieved is not None:
             retrieved_block = self._retrieved_section(mq, retrieved)
             if retrieved_block:
                 parts.append(retrieved_block)
 
-        if self.cfg.include_doc_signature:
-            doc_sig = self._query_doc_signature(mq)
-            if doc_sig:
-                parts.append(f"Document signature: {doc_sig}")
+        doc_sig = self._query_doc_signature(mq)
+        if doc_sig:
+            parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
 
-        parts.append(f"Question: {self._safe_text(mq.raw_query)}")
-        parts.append("Answer:")
+        parts.append(f"CURRENT QUESTION: {self._safe_text(mq.raw_query)}")
+        parts.append("FINAL ANSWER:")
 
         prompt = "\n\n".join(parts)
         self.last_prompt = prompt
 
         self.last_generation_meta = dict(self.last_generation_meta or {})
-        self.last_generation_meta["reduced_context_used"] = prompt_stats["reduced_context_used"]
+        self.last_generation_meta["reduced_context_used"] = bool(prompt_stats["reduced_context_used"])
         self.last_generation_meta["full_context_chars"] = prompt_stats["full_context_chars"]
         self.last_generation_meta["final_context_chars"] = prompt_stats["final_context_chars"]
         self.last_generation_meta["retrieved_evidence_chars"] = prompt_stats["retrieved_evidence_chars"]
@@ -990,7 +948,6 @@ class HFGenerator:
                     backend_used = "hf_generate"
                 else:
                     raise RuntimeError("Model supports neither callable forward pass nor .generate().")
-
             elif backend_used == "hf_generate":
                 if hasattr(self.model, "generate") and callable(getattr(self.model, "generate")):
                     output_ids = self._generate_with_hf(
@@ -1017,7 +974,6 @@ class HFGenerator:
                 fallback_reason = f"{type(e).__name__}: {e}"
 
                 self._reload_model_for_device("cpu")
-
                 input_ids = input_ids.detach().to("cpu")
                 attention_mask = attention_mask.detach().to("cpu") if attention_mask is not None else None
 

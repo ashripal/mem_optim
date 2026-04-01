@@ -222,13 +222,63 @@ class HFEmbedder:
 
         return kwargs
 
+    @staticmethod
+    def _move_model_to_device(model, device: str, dtype) -> None:
+        """
+        Move a model to device as defensively as possible.
+
+        Real HF models usually accept .to(device=..., dtype=...).
+        Some fakes used in unit tests only accept .to(device) or .to("cpu").
+        """
+        try:
+            model.to(device=device, dtype=dtype)
+            return
+        except TypeError:
+            pass
+
+        try:
+            model.to(device)
+            return
+        except TypeError:
+            pass
+
+        # Last-resort variants for unusual test doubles / wrappers.
+        try:
+            model.to(device=device)
+            return
+        except TypeError:
+            pass
+
+        if dtype is not None:
+            try:
+                model.to(dtype=dtype)
+                return
+            except TypeError:
+                pass
+
+        # Re-raise with the simplest call if everything failed.
+        model.to(device)
+
+    @staticmethod
+    def _move_tensor_to_device(t: torch.Tensor, device: str) -> torch.Tensor:
+        """
+        Move tensors defensively across device types.
+
+        non_blocking is useful on CUDA but some backends / test doubles may not
+        like extra kwargs, so we degrade cleanly.
+        """
+        try:
+            return t.to(device, non_blocking=True)
+        except TypeError:
+            return t.to(device)
+
     def _load_model(self, model_source: str, device: str, dtype):
         model = AutoModel.from_pretrained(
             model_source,
             **self._model_load_kwargs(device, dtype),
         )
         model.eval()
-        model.to(device=device, dtype=dtype)
+        self._move_model_to_device(model, device, dtype)
         return model
 
     def _reload_model_for_device(self, device: str) -> None:
@@ -328,8 +378,8 @@ class HFEmbedder:
         )
         tokenize_time_s = time.time() - tok_t0
 
-        input_ids = enc["input_ids"].to(self.device, non_blocking=True)
-        attention_mask = enc["attention_mask"].to(self.device, non_blocking=True)
+        input_ids = self._move_tensor_to_device(enc["input_ids"], self.device)
+        attention_mask = self._move_tensor_to_device(enc["attention_mask"], self.device)
 
         truncated_count = int((attention_mask.sum(dim=1) >= self.cfg.max_length).sum().item())
 

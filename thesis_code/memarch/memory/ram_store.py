@@ -1,31 +1,3 @@
-# memarch/memory/ram_store.py
-"""
-Tier 1: RAM store (size-bounded LRU) for MemoryItem objects.
-
-Current goals:
-- Deterministic behavior (testable)
-- Bounded memory usage (MB budget) for Jetson-class devices
-- Namespace isolation (session/user/cohort/global stored separately)
-- Store interface mirrors disk_store:
-    get / put / delete / iter_namespace / stats
-
-Current retrieval support:
-- Exact-match retrieval via get(namespace, key)
-- Lexical retrieval via bounded namespace iteration
-- Semantic retrieval via bounded namespace iteration
-
-Notes:
-- We estimate item size using UTF-8 byte lengths of key fields.
-  This is not perfect, but it is deterministic and portable.
-- Semantic retrieval fields are included shallowly in the estimate so
-  embedding-enabled items are budgeted more realistically.
-- iter_namespace() is intentionally read-only and does not mutate LRU order.
-  The manager is responsible for ranking/filtering lexical/semantic candidates.
-
-Thread-safety:
-- This implementation is NOT thread-safe. If you later add concurrency, wrap with a lock.
-"""
-
 from __future__ import annotations
 
 from collections import OrderedDict
@@ -33,6 +5,12 @@ from dataclasses import dataclass
 from typing import Dict, Iterator, Optional, Tuple
 
 from memarch.memory.schema import MemoryItem
+
+
+def _normalize_embedding(vec):
+    if vec is None:
+        return None
+    return [round(float(x), 6) for x in vec]
 
 
 def _estimate_item_bytes(item: MemoryItem) -> int:
@@ -112,8 +90,6 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
         n += 16
 
     if item.query_embedding is not None:
-        # Use a larger per-dimension budget than raw float bytes because the vector
-        # lives as Python objects/lists in RAM, not as a compact tensor.
         n += len(item.query_embedding) * 24
 
     return n
@@ -240,6 +216,11 @@ class RamStoreLRU:
             self._bytes_current -= old_est
             self._items_current -= 1
 
+        if getattr(item, "query_embedding", None) is not None:
+            item.query_embedding = _normalize_embedding(item.query_embedding)
+        if getattr(item, "embedding_norm", None) is not None:
+            item.embedding_norm = float(item.embedding_norm)
+
         est = _estimate_item_bytes(item)
 
         if est > self._capacity_bytes:
@@ -273,12 +254,6 @@ class RamStoreLRU:
             del self._ns_maps[namespace]
 
     def iter_namespace(self, namespace: str) -> Iterator[MemoryItem]:
-        """
-        Iterate items in a namespace from least-recently-used to most-recently-used.
-
-        This is used by manager-side lexical and semantic retrieval for bounded
-        brute-force scans. Iteration does not mutate LRU order.
-        """
         self._stats.iter_calls += 1
         if not namespace:
             return iter(())
@@ -302,16 +277,6 @@ class RamStoreLRU:
         doc_signature: Optional[str] = None,
         limit: Optional[int] = None,
     ) -> Iterator[MemoryItem]:
-        """
-        Iterate candidate items from a namespace with cheap coarse filtering.
-
-        Filtering is intentionally lightweight and mirrors disk_store behavior:
-        - task via item.meta["task"]
-        - source_file via item.source_file / item.meta["source_file"]
-        - doc_signature via item.doc_signature / item.meta["doc_signature"]
-
-        Iteration does not mutate LRU order.
-        """
         self._stats.iter_candidate_calls += 1
         if not namespace:
             return iter(())
@@ -379,11 +344,6 @@ class RamStoreLRU:
         return _gen()
 
     def _evict_as_needed(self) -> None:
-        """
-        Evict least-recently-used entries across namespaces until under both:
-        - byte capacity
-        - optional item-count capacity
-        """
         def over_capacity() -> bool:
             over_bytes = self._bytes_current > self._capacity_bytes
             over_items = (
