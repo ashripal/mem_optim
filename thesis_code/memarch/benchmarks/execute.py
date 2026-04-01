@@ -96,7 +96,7 @@ def _get_rss_mb() -> Optional[float]:
 
 
 def _get_system_info() -> Dict[str, Any]:
-    return {
+    info: Dict[str, Any] = {
         "platform": platform.platform(),
         "python_version": platform.python_version(),
         "machine": platform.machine(),
@@ -107,6 +107,19 @@ def _get_system_info() -> Dict[str, Any]:
         "mps_available": bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available(),
         "cuda_device_count": int(torch.cuda.device_count()) if torch.cuda.is_available() else 0,
     }
+
+    if torch.cuda.is_available():
+        try:
+            info["cuda_device_name"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            info["cuda_total_memory_mb"] = round(float(props.total_memory) / (1024.0 * 1024.0), 3)
+            info["cuda_capability"] = f"{props.major}.{props.minor}"
+            info["gpu_mem_allocated_mb"] = round(torch.cuda.memory_allocated() / (1024.0 * 1024.0), 3)
+            info["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / (1024.0 * 1024.0), 3)
+        except Exception:
+            pass
+
+    return info
 
 
 def _make_run_id(prefix: str = "memarch_benchmark") -> str:
@@ -150,6 +163,19 @@ def _construct_with_supported_kwargs(cls: Any, **kwargs: Any) -> Any:
     supported = set(sig.parameters.keys())
     filtered = {k: v for k, v in kwargs.items() if k in supported}
     return cls(**filtered)
+
+
+def _safe_component_info(component: Any) -> Dict[str, Any]:
+    if component is None:
+        return {}
+    info_fn = getattr(component, "info", None)
+    if callable(info_fn):
+        try:
+            out = info_fn()
+            return dict(out) if isinstance(out, dict) else {"info": out}
+        except Exception as e:
+            return {"info_error": f"{type(e).__name__}: {e}"}
+    return {}
 
 
 def _extract_semantic_debug(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -607,7 +633,7 @@ def _init_ram_store(cfg: BenchmarkConfig) -> Any:
     - an explicit item-count cap for benchmark control
     """
     return RamStoreLRU(
-        max_mb=64,
+        max_mb=int(getattr(cfg.memory, "ram_max_mb", 64)),
         max_items=int(cfg.memory.ram_capacity_items),
     )
 
@@ -618,8 +644,18 @@ def _init_embedder(cfg: BenchmarkConfig) -> Optional[Embedder]:
 
     emb_cfg = EmbedderConfig(
         model_id=cfg.memory.embedding_model_id,
-        device=cfg.memory.embedding_device,
-        local_files_only=cfg.memory.embedding_local_files_only,
+        device=getattr(cfg.memory, "embedding_device", "auto"),
+        max_length=int(getattr(cfg.memory, "embedding_max_length", 512)),
+        batch_size=int(getattr(cfg.memory, "embedding_batch_size", 16)),
+        normalize=bool(getattr(cfg.memory, "embedding_normalize", True)),
+        local_files_only=bool(getattr(cfg.memory, "embedding_local_files_only", False)),
+        use_fast_tokenizer=bool(getattr(cfg.memory, "embedding_use_fast_tokenizer", False)),
+        torch_dtype=str(getattr(cfg.memory, "embedding_dtype", "auto")),
+        low_cpu_mem_usage=bool(getattr(cfg.memory, "embedding_low_cpu_mem_usage", True)),
+        use_safetensors=bool(getattr(cfg.memory, "embedding_use_safetensors", True)),
+        trust_remote_code=bool(getattr(cfg.memory, "embedding_trust_remote_code", False)),
+        attn_implementation=str(getattr(cfg.memory, "embedding_attn_implementation", "auto")),
+        cpu_fallback_on_failure=bool(getattr(cfg.memory, "embedding_cpu_fallback_on_failure", True)),
     )
     return Embedder(emb_cfg)
 
@@ -637,6 +673,25 @@ def _init_generator(cfg: BenchmarkConfig) -> HFGenerator:
         do_sample=bool(getattr(cfg, "do_sample", False)),
         local_files_only=bool(getattr(cfg, "local_files_only", False)),
         torch_dtype=str(getattr(cfg, "dtype", "auto")),
+        use_fast_tokenizer=bool(getattr(cfg, "use_fast_tokenizer", False)),
+        cpu_fallback_on_failure=bool(getattr(cfg, "cpu_fallback_on_failure", True)),
+        low_cpu_mem_usage=bool(getattr(cfg, "low_cpu_mem_usage", True)),
+        use_safetensors=bool(getattr(cfg, "use_safetensors", True)),
+        trust_remote_code=bool(getattr(cfg, "trust_remote_code", False)),
+        attn_implementation=str(getattr(cfg, "attn_implementation", "auto")),
+        use_kv_cache=bool(getattr(cfg, "use_kv_cache", True)),
+        include_retrieved_memory_context=bool(getattr(cfg, "include_retrieved_memory_context", True)),
+        include_dataset_context=bool(getattr(cfg, "include_dataset_context", True)),
+        include_doc_signature=bool(getattr(cfg, "include_doc_signature", False)),
+        prefer_retrieved_evidence_context=bool(getattr(cfg, "prefer_retrieved_evidence_context", True)),
+        reduce_context_on_semantic_hit=bool(getattr(cfg, "reduce_context_on_semantic_hit", True)),
+        max_evidence_chars=int(getattr(cfg, "max_evidence_chars", 400)),
+        max_local_context_chars=int(getattr(cfg, "max_local_context_chars", 260)),
+        max_full_context_chars=int(getattr(cfg, "max_full_context_chars", 1200)),
+        prefer_local_context_for_qa=bool(getattr(cfg, "prefer_local_context_for_qa", True)),
+        qa_max_output_words=int(getattr(cfg, "qa_max_output_words", 6)),
+        trec_use_few_shot=bool(getattr(cfg, "trec_use_few_shot", False)),
+        skip_special_tokens=bool(getattr(cfg, "skip_special_tokens", True)),
     )
     return HFGenerator(gen_cfg)
 
@@ -785,8 +840,6 @@ def _build_ok_record(
     source_tier = str(meta.get("source_tier", "compute" if generated else "unknown"))
     match_type = meta.get("match_type")
 
-    # Bypass should only be true when generation did NOT run and the answer was served
-    # directly from memory.
     llm_bypassed = bool(used_memory and not generated)
 
     if generated:
@@ -819,6 +872,10 @@ def _build_ok_record(
             "reduced_context_used": None,
             "full_context_chars": None,
             "final_context_chars": None,
+            "use_kv_cache": None,
+            "fallback_used": None,
+            "fallback_from": None,
+            "fallback_reason": None,
         }
 
     semantic_debug = _extract_semantic_debug(meta)
@@ -835,7 +892,6 @@ def _build_ok_record(
     )
 
     lexical_used = bool(meta.get("lexical_used", False)) or (str(match_type or "").lower() == "lexical")
-    # Respect the manager metadata; do not infer bypass from "used_memory"
     lexical_bypassed = bool(meta.get("lexical_bypassed", False)) and not generated
     lexical_context_used = bool(meta.get("lexical_context_used", False)) or (
         lexical_used and generated and not lexical_bypassed
@@ -960,6 +1016,10 @@ def _build_ok_record(
         "reduced_context_used": gen_meta.get("reduced_context_used"),
         "full_context_chars": gen_meta.get("full_context_chars"),
         "final_context_chars": gen_meta.get("final_context_chars"),
+        "use_kv_cache": gen_meta.get("use_kv_cache"),
+        "fallback_used": gen_meta.get("fallback_used"),
+        "fallback_from": gen_meta.get("fallback_from"),
+        "fallback_reason": gen_meta.get("fallback_reason"),
 
         "answer": answer,
         "output_text": answer,
@@ -1063,18 +1123,8 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
     generator = _init_generator(cfg)
 
     system_info = _get_system_info()
-    generator_info = {}
-    try:
-        generator_info = generator.info()
-    except Exception:
-        generator_info = {}
-
-    embedder_info = {}
-    if embedder is not None:
-        try:
-            embedder_info = embedder.info()
-        except Exception:
-            embedder_info = {}
+    generator_info = _safe_component_info(generator)
+    embedder_info = _safe_component_info(embedder)
 
     n_total = 0
     n_ok = 0
@@ -1232,6 +1282,10 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
 
             logger.write(record)
 
+        # Refresh runtime info at the end in case device/dtype changed via fallback
+        generator_info_final = _safe_component_info(generator)
+        embedder_info_final = _safe_component_info(embedder)
+
         logger.write(
             {
                 "type": "run_footer",
@@ -1256,10 +1310,10 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                 },
                 "ram_stats_final": _ram_stats(ram),
                 "disk_stats_final": _disk_stats(disk),
-                "system_info": system_info,
+                "system_info": _get_system_info(),
                 "resolved_runtime": {
-                    "generator": generator_info,
-                    "embedder": embedder_info,
+                    "generator": generator_info_final,
+                    "embedder": embedder_info_final,
                 },
             }
         )

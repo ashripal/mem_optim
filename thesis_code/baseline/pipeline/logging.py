@@ -1,14 +1,15 @@
-# pipeline/logging.py
 """
 JSONL logging utilities for experiment runs.
 
-This module is responsible for writing newline-delimited JSON records safely and
-consistently. It is intentionally small and reusable across baselines/variants.
+Optimized for:
+- Edge devices (Jetson AGX Orin)
+- Low I/O overhead
+- Reliable but not over-synchronized writes
 
 Design goals:
 - Append-only JSONL output
-- Flush often for robustness (runs can be long)
-- Handle non-JSON-serializable values gracefully (best-effort)
+- Buffered writes with periodic flush
+- Minimal impact on latency measurements
 """
 
 from __future__ import annotations
@@ -19,9 +20,6 @@ from typing import Any, Dict, Optional, TextIO
 
 
 def _json_fallback(obj: Any) -> str:
-    """
-    Best-effort fallback for objects that aren't JSON serializable.
-    """
     try:
         return str(obj)
     except Exception:
@@ -30,38 +28,40 @@ def _json_fallback(obj: Any) -> str:
 
 class JSONLLogger:
     """
-    Simple JSONL writer.
+    Efficient JSONL writer with batched flushing.
 
-    Usage:
-        logger = JSONLLogger("path/to/run.jsonl")
-        logger.write({"type": "run_header", ...})
-        logger.write({"type": "example_result", ...})
-        logger.close()
+    Args:
+        path: Output file path
+        ensure_dir: Create directory if needed
+        flush_every: Flush after N writes (default optimized for edge)
+        fsync: Force OS-level sync (slow, disabled by default)
     """
 
-    def __init__(self, path: str, *, ensure_dir: bool = True, flush_every: int = 1):
+    def __init__(
+        self,
+        path: str,
+        *,
+        ensure_dir: bool = True,
+        flush_every: int = 20,   # 🔥 changed from 1 → 20
+        fsync: bool = False,     # 🔥 new (optional durability)
+    ):
         self.path = os.path.abspath(path)
         self.flush_every = max(1, int(flush_every))
+        self.fsync = fsync
         self._n_written = 0
         self._fh: Optional[TextIO] = None
 
         if ensure_dir:
             os.makedirs(os.path.dirname(self.path), exist_ok=True)
 
-        # Use line buffering where available; also manually flush per flush_every.
-        self._fh = open(self.path, "w", encoding="utf-8", buffering=1)
+        # Use moderate buffering instead of line-buffering
+        self._fh = open(self.path, "w", encoding="utf-8")
 
     @property
     def n_written(self) -> int:
         return self._n_written
 
     def write(self, record: Dict[str, Any]) -> None:
-        """
-        Write one JSON object as a single line.
-
-        Args:
-            record: Dict that will be serialized to JSON.
-        """
         if self._fh is None:
             raise RuntimeError("JSONLLogger is closed.")
 
@@ -69,13 +69,26 @@ class JSONLLogger:
         self._fh.write(line + "\n")
 
         self._n_written += 1
+
         if (self._n_written % self.flush_every) == 0:
-            self._fh.flush()
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._fh is None:
+            return
+
+        self._fh.flush()
+
+        if self.fsync:
+            try:
+                os.fsync(self._fh.fileno())
+            except Exception:
+                pass
 
     def close(self) -> None:
         if self._fh is not None:
             try:
-                self._fh.flush()
+                self._flush()
             finally:
                 self._fh.close()
                 self._fh = None

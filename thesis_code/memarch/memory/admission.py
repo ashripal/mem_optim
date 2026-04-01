@@ -1,19 +1,4 @@
 # memarch/memory/admission.py
-"""
-Admission policy: decides what gets stored after generation.
-
-Phase 1 goals:
-- deterministic (no LLM decisions)
-- lightweight + unit-testable
-- scope-aware TTL + storage enablement
-
-Evidence-guided extension:
-- reject clearly low-value outputs before they enter memory
-- keep storage quality high for future exact/semantic reuse
-- use only cheap string heuristics (latency-friendly)
-
-This module is called by MemoryManager.store().
-"""
 
 from __future__ import annotations
 
@@ -27,7 +12,6 @@ from memarch.memory.schema import MemoryQuery, QualitySignals, Scope
 _WS_RE = re.compile(r"\s+")
 _WORD_RE = re.compile(r"\b\w+\b", re.UNICODE)
 
-# Simple prompt-scaffolding markers that often indicate low-quality stored outputs.
 _SCAFFOLD_MARKERS = (
     "question:",
     "answer:",
@@ -38,70 +22,43 @@ _SCAFFOLD_MARKERS = (
     "assistant:",
 )
 
-# TREC coarse labels. Storing malformed free-form responses hurts reuse quality.
 _TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
 
 
 @dataclass(frozen=True)
 class AdmissionPolicy:
-    """
-    Controls whether we store generated answers and where.
-
-    Storage enablement:
-      - allow_session/user/cohort/global decide which scopes can be written.
-
-    Content gating:
-      - min_answer_chars avoids storing trivial outputs
-      - max_answer_chars avoids huge responses filling disk
-      - reject_question_echo avoids storing answers that mostly restate the query
-      - reject_prompt_scaffolding avoids storing prompt-template leakage
-      - validate_task_format enables cheap task-specific format checks
-      - allow_short_task_labels permits valid short classification outputs
-
-    Quality gating (optional):
-      - if require_success_if_provided=True, then QualitySignals.success must be True
-        when it is provided (default behavior).
-    """
     allow_session: bool = True
     allow_user: bool = True
     allow_cohort: bool = False
     allow_global: bool = False
 
-    # Lowered for extractive QA tasks like SQuAD, where valid answers can be short
-    # (e.g. names, years, postal codes, short noun phrases).
     min_answer_chars: int = 3
     max_answer_chars: int = 50_000
 
     require_success_if_provided: bool = True
 
-    # Cheap storage-quality gates
     reject_question_echo: bool = True
     reject_prompt_scaffolding: bool = True
     validate_task_format: bool = True
     allow_short_task_labels: bool = True
 
-    # Heuristics
     max_question_echo_token_overlap: float = 0.80
     max_scaffold_marker_count: int = 2
 
-    # TTL per scope (seconds). None means "no expiry" (not recommended for session).
-    ttl_session_seconds: int = 60 * 60 * 2        # 2 hours
-    ttl_user_seconds: int = 60 * 60 * 24 * 14     # 14 days
-    ttl_cohort_seconds: int = 60 * 60 * 24 * 30   # 30 days
-    ttl_global_seconds: int = 60 * 60 * 24 * 90   # 90 days
+    # ✅ NEW: skip expensive echo check for long answers
+    max_echo_check_chars: int = 2000
+
+    ttl_session_seconds: int = 60 * 60 * 2
+    ttl_user_seconds: int = 60 * 60 * 24 * 14
+    ttl_cohort_seconds: int = 60 * 60 * 24 * 30
+    ttl_global_seconds: int = 60 * 60 * 24 * 90
 
 
 def default_admission_policy() -> AdmissionPolicy:
-    # Phase 1: write personalization memory (session/user), no cohort/global by default.
     return AdmissionPolicy()
 
 
 def decide_store_scopes(mq: MemoryQuery, policy: AdmissionPolicy) -> List[Scope]:
-    """
-    Decide which scopes are *eligible* to store into for this query.
-
-    Note: this does not apply content/quality gating; that's done in should_store().
-    """
     scopes: List[Scope] = []
 
     if policy.allow_session and mq.session_id:
@@ -150,12 +107,6 @@ def _question_type(mq: MemoryQuery) -> str:
 
 
 def _looks_like_short_task_label(mq: MemoryQuery, answer_text: str) -> bool:
-    """
-    Allow valid short outputs for label-style tasks.
-
-    Current supported case:
-    - TREC coarse class labels
-    """
     task = _task_name(mq)
     qtype = _question_type(mq)
     ans = (answer_text or "").strip()
@@ -170,9 +121,6 @@ def _looks_like_short_task_label(mq: MemoryQuery, answer_text: str) -> bool:
 
 
 def _looks_like_question_echo(answer_text: str, raw_query: str, *, overlap_threshold: float) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Cheap heuristic to reject answers that are mostly restatements of the question.
-    """
     ans_norm = _normalize_text(answer_text)
     qry_norm = _normalize_text(raw_query)
 
@@ -217,12 +165,6 @@ def _fails_scaffolding_check(answer_text: str, *, max_marker_count: int) -> Tupl
 
 
 def _validate_task_specific_format(mq: MemoryQuery, answer_text: str) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Cheap task-specific validation.
-
-    Current strict rule:
-    - TREC should be a single coarse label, not a sentence/explanation
-    """
     task = _task_name(mq)
     qtype = _question_type(mq)
     ans = (answer_text or "").strip()
@@ -252,9 +194,6 @@ def should_store(
     scope: Scope,
     policy: AdmissionPolicy,
 ) -> Tuple[bool, Dict[str, Any]]:
-    """
-    Content/quality gating: returns (ok_to_store, debug_dict).
-    """
     ans = answer_text or ""
     n = len(ans)
 
@@ -270,7 +209,8 @@ def should_store(
         if hasattr(quality, "success") and (quality.success is False):
             return False, {"reason": "quality_failed"}
 
-    if policy.reject_question_echo:
+    # ✅ FIX: skip expensive echo check for long answers
+    if policy.reject_question_echo and n <= policy.max_echo_check_chars:
         is_echo, echo_debug = _looks_like_question_echo(
             ans,
             mq.raw_query,

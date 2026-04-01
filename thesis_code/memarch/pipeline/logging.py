@@ -1,24 +1,4 @@
 # memarch/pipeline/logging.py
-"""
-Structured logging for memarch runs.
-
-Goals:
-- Append-only JSONL logs (easy to stream, analyze, and summarize)
-- Portable across macOS / Jetson / other Linux devices
-- Deterministic schema
-
-What we log per example:
-- identifiers (run_id, example_id, task)
-- query + minimal context preview (optional)
-- timings (total, memory, generation)
-- memory decision metadata (hit/miss, scope, tier)
-- semantic retrieval metadata
-- resource snapshots (rss_mb, gpu mem if available later)
-- store outcomes (what was written)
-
-This module intentionally avoids any dependency on the rest of the pipeline, so it can be
-used in unit tests and by scripts/analysis later.
-"""
 
 from __future__ import annotations
 
@@ -61,22 +41,19 @@ class RunInfo:
 
 
 class JsonlLogger:
-    """
-    Append-only JSONL writer.
-
-    Usage:
-      logger = JsonlLogger("artifacts/runs/run_001/log.jsonl", run_info=RunInfo.create())
-      logger.write_event({...})
-      logger.close()
-    """
-
     def __init__(self, path: str, *, run_info: Optional[RunInfo] = None) -> None:
         if not path:
             raise ValueError("path must be non-empty")
         self.path = path
         ensure_parent_dir(self.path)
-        self._fh = open(self.path, "a", encoding="utf-8")
+
+        # enable OS-level buffering
+        self._fh = open(self.path, "a", encoding="utf-8", buffering=1)
         self._closed = False
+
+        # ✅ NEW: flush batching
+        self._write_count = 0
+        self._flush_every = 50  # flush every 50 writes
 
         self.run_info = run_info
         if self.run_info is not None:
@@ -101,7 +78,11 @@ class JsonlLogger:
 
         line = _stable_json_dumps(event)
         self._fh.write(line + "\n")
-        self._fh.flush()
+
+        # ✅ buffered flush
+        self._write_count += 1
+        if self._write_count % self._flush_every == 0:
+            self._fh.flush()
 
     def log_example(
         self,
@@ -113,13 +94,6 @@ class JsonlLogger:
         timings_ms: Dict[str, float],
         resources: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """
-        Convenience wrapper for a standard per-example event.
-
-        In addition to preserving the raw `meta` dict, this extracts the most
-        important memory/semantic fields into stable top-level columns so that
-        downstream analysis does not have to repeatedly unpack nested metadata.
-        """
         meta = dict(meta or {})
         timings_ms = dict(timings_ms or {})
 
@@ -130,19 +104,16 @@ class JsonlLogger:
             "task": task,
             "query": query,
 
-            # Stable top-level decision fields
             "used_memory": bool(meta.get("used_memory", False)),
             "generated": bool(meta.get("generated", False)),
             "source_tier": meta.get("source_tier"),
             "match_type": meta.get("match_type"),
             "score": meta.get("score"),
 
-            # Semantic retrieval fields
             "semantic_used": bool(meta.get("semantic_used", False)),
             "semantic_bypassed": bool(meta.get("semantic_bypassed", False)),
             "semantic_candidate_rank": meta.get("semantic_candidate_rank"),
 
-            # Raw nested fields retained for flexibility
             "meta": meta,
             "timings_ms": timings_ms,
         }
@@ -162,6 +133,7 @@ class JsonlLogger:
                     "run_id": self.run_info.run_id,
                 }
             )
+        self._fh.flush()  # final flush
         self._fh.close()
         self._closed = True
 

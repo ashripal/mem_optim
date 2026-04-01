@@ -631,6 +631,33 @@ class MemoryManager:
             return getattr(store, "iter_namespace")(namespace)
         return ()
 
+    def _iter_store_candidates(
+        self,
+        store: MemoryStore,
+        namespace: str,
+        *,
+        mq: MemoryQuery,
+        limit: Optional[int] = None,
+    ) -> Iterable[MemoryItem]:
+        """
+        Prefer cheap store-native candidate filtering when available.
+        Falls back to full namespace iteration for stores that do not support it.
+        """
+        if hasattr(store, "iter_candidates"):
+            try:
+                return getattr(store, "iter_candidates")(
+                    namespace,
+                    task=mq.task,
+                    source_file=self._query_source_file(mq),
+                    doc_signature=self._query_doc_signature(mq),
+                    limit=limit,
+                )
+            except TypeError:
+                pass
+            except Exception:
+                return ()
+        return self._iter_store_namespace(store, namespace)
+
     def _build_lexical_candidates(
         self,
         mq: MemoryQuery,
@@ -647,6 +674,9 @@ class MemoryManager:
         ram_reads = 0
         disk_reads = 0
         namespaces_checked: List[Dict[str, Any]] = []
+
+        # Small bounded hint to candidate iterators; keeps Jetson scans tighter
+        candidate_limit = max(8, self._lexical_top_k() * 8)
 
         for rn in resolve_namespaces(mq, scope_order=pol.scope_order, include_missing=False):
             scope = rn.scope
@@ -667,7 +697,9 @@ class MemoryManager:
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
                 ns_dbg["lexical_ram_scanned"] = True
-                for item in self._iter_store_namespace(self._ram, ns):
+                for item in self._iter_store_candidates(
+                    self._ram, ns, mq=mq, limit=candidate_limit
+                ):
                     ok, dbg = self._lexical_candidate_allowed(mq, item, now=now)
                     if not ok:
                         continue
@@ -683,7 +715,9 @@ class MemoryManager:
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
                 ns_dbg["lexical_disk_scanned"] = True
-                for item in self._iter_store_namespace(self._disk, ns):
+                for item in self._iter_store_candidates(
+                    self._disk, ns, mq=mq, limit=candidate_limit
+                ):
                     ok, dbg = self._lexical_candidate_allowed(mq, item, now=now)
                     if not ok:
                         continue
@@ -916,6 +950,8 @@ class MemoryManager:
         disk_reads = 0
         namespaces_checked: List[Dict[str, Any]] = []
 
+        candidate_limit = max(8, int(getattr(pol, "max_semantic_candidates", 5)) * 8)
+
         for rn in resolve_namespaces(mq, scope_order=pol.scope_order, include_missing=False):
             scope = rn.scope
             ns = rn.namespace
@@ -934,7 +970,9 @@ class MemoryManager:
             if ram_reads < budget.max_ram_reads:
                 ram_reads += 1
                 ns_dbg["semantic_ram_scanned"] = True
-                for item in self._iter_store_namespace(self._ram, ns):
+                for item in self._iter_store_candidates(
+                    self._ram, ns, mq=mq, limit=candidate_limit
+                ):
                     ok, dbg = semantic_candidate_allowed(
                         mq,
                         item,
@@ -961,7 +999,9 @@ class MemoryManager:
             if disk_reads < budget.max_disk_reads:
                 disk_reads += 1
                 ns_dbg["semantic_disk_scanned"] = True
-                for item in self._iter_store_namespace(self._disk, ns):
+                for item in self._iter_store_candidates(
+                    self._disk, ns, mq=mq, limit=candidate_limit
+                ):
                     ok, dbg = semantic_candidate_allowed(
                         mq,
                         item,
@@ -1107,6 +1147,7 @@ class MemoryManager:
         source_tier, scope, ns, item, filter_dbg = payload
 
         decision, decision_dbg = semantic_decision(
+            mq=mq,
             score=score,
             item=item,
             policy=pol,
@@ -1407,6 +1448,8 @@ class MemoryManager:
     def answer(self, mq: MemoryQuery, generator: Generator) -> Tuple[str, Dict[str, Any]]:
         hit, retrieval_dbg = self.retrieve(mq, return_meta=True)
         memory_lookup_ms = float(retrieval_dbg.get("memory_lookup_ms", 0.0) or 0.0)
+        query_evidence_text = self._query_evidence_text(mq)
+        query_evidence_chars = len(str(query_evidence_text)) if query_evidence_text is not None else None
 
         if (
             hit is not None
@@ -1447,7 +1490,7 @@ class MemoryManager:
                 "question_type": getattr(exact_item, "question_type", None) or exact_item.meta.get("question_type"),
                 "stored_evidence_text": exact_evidence_text,
                 "stored_evidence_chars": len(str(exact_evidence_text)) if exact_evidence_text is not None else None,
-                "query_evidence_text": self._query_evidence_text(mq),
+                "query_evidence_text": query_evidence_text,
                 "timings_ms": {
                     "memory_lookup_ms": memory_lookup_ms,
                     "generation_ms_est": 0.0,
@@ -1503,7 +1546,7 @@ class MemoryManager:
                 "question_type": getattr(item, "question_type", None) or item.meta.get("question_type"),
                 "stored_evidence_text": evidence_text,
                 "stored_evidence_chars": len(str(evidence_text)) if evidence_text is not None else None,
-                "query_evidence_text": self._query_evidence_text(mq),
+                "query_evidence_text": query_evidence_text,
                 "timings_ms": {
                     "memory_lookup_ms": memory_lookup_ms,
                     "generation_ms_est": 0.0,
@@ -1551,7 +1594,7 @@ class MemoryManager:
                 "question_type": getattr(item, "question_type", None) or item.meta.get("question_type"),
                 "stored_evidence_text": evidence_text,
                 "stored_evidence_chars": len(str(evidence_text)) if evidence_text is not None else None,
-                "query_evidence_text": self._query_evidence_text(mq),
+                "query_evidence_text": query_evidence_text,
                 "timings_ms": {
                     "memory_lookup_ms": memory_lookup_ms,
                     "generation_ms_est": 0.0,
@@ -1744,19 +1787,11 @@ class MemoryManager:
             "chunk_index": self._query_chunk_index(mq),
             "chunk_id": self._query_chunk_id(mq),
             "question_type": self._query_question_type(mq),
-            "query_evidence_text": self._query_evidence_text(mq),
-            "query_evidence_chars": (
-                len(str(self._query_evidence_text(mq)))
-                if self._query_evidence_text(mq) is not None
-                else None
-            ),
+            "query_evidence_text": query_evidence_text,
+            "query_evidence_chars": query_evidence_chars,
             "retrieved_memory": retrieved_summary,
-            "stored_evidence_text": self._query_evidence_text(mq),
-            "stored_evidence_chars": (
-                len(str(self._query_evidence_text(mq)))
-                if self._query_evidence_text(mq) is not None
-                else None
-            ),
+            "stored_evidence_text": query_evidence_text,
+            "stored_evidence_chars": query_evidence_chars,
             "normalized_answer_for_storage": normalized_answer_text,
         }
 

@@ -1,17 +1,15 @@
 # analysis/summarize.py
+
 """
 Summarize a LongBench baseline run JSONL into aggregated statistics.
 
-This module is intentionally "pure analysis":
-- Reads a run JSONL (produced by pipeline/logging.py)
-- Extracts per-example records (type == "example_result")
-- Computes aggregate stats for latency/tokens/memory/cache/device/quality
-- Optionally writes a flattened single-row CSV summary
+TRUE BASELINE:
+- Stateless execution
+- NO cache
+- NO memory
+- ALL requests go to the LLM
 
-It does NOT:
-- Plot (see analysis/plot.py)
-- Parse CLI args (use a thin CLI wrapper if desired)
-- Depend on the dataset loader, cache, or compute modules
+This module is pure analysis.
 """
 
 from __future__ import annotations
@@ -19,9 +17,8 @@ from __future__ import annotations
 import csv
 import json
 import math
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 
 # -----------------------------
@@ -29,38 +26,22 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 # -----------------------------
 
 def load_run_jsonl(path: str) -> List[Dict[str, Any]]:
-    """
-    Load a run JSONL file into a list of dict records.
-
-    Notes:
-    - We keep all records (header/footer/example_result/etc.)
-      and filter downstream to allow richer summaries later.
-    """
     p = Path(path).expanduser().resolve()
     if not p.exists():
         raise FileNotFoundError(f"run_jsonl not found: {p}")
-    records: List[Dict[str, Any]] = []
+
+    records = []
     with p.open("r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
             if not line:
                 continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError as e:
-                raise ValueError(f"Invalid JSON at {p} line {line_no}: {e}") from e
+            records.append(json.loads(line))
     return records
 
 
 def extract_example_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Keep only per-example result records.
-
-    We consider a record valid if:
-    - record["type"] == "example_result"
-    """
-    out = [r for r in records if r.get("type") == "example_result"]
-    return out
+    return [r for r in records if r.get("type") == "example_result"]
 
 
 # -----------------------------
@@ -72,213 +53,85 @@ def _is_number(x: Any) -> bool:
 
 
 def _collect_numeric(records: List[Dict[str, Any]], key: str) -> List[float]:
-    vals: List[float] = []
-    for r in records:
-        v = r.get(key, None)
-        if _is_number(v):
-            vals.append(float(v))
-    return vals
+    return [float(r[key]) for r in records if _is_number(r.get(key))]
 
 
-def _mean(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
-    return sum(xs) / len(xs)
+def _mean(xs):
+    return sum(xs) / len(xs) if xs else None
 
 
-def _min(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
-    return float(min(xs))
-
-
-def _max(xs: List[float]) -> Optional[float]:
-    if not xs:
-        return None
-    return float(max(xs))
-
-
-def _median(xs: List[float]) -> Optional[float]:
+def _percentile(xs, p):
     if not xs:
         return None
     ys = sorted(xs)
-    n = len(ys)
-    mid = n // 2
-    if n % 2 == 1:
-        return float(ys[mid])
-    return float((ys[mid - 1] + ys[mid]) / 2.0)
-
-
-def _percentile(xs: List[float], p: float) -> Optional[float]:
-    """
-    Compute percentile using linear interpolation between closest ranks.
-    p in [0, 100]
-    """
-    if not xs:
-        return None
-    if p <= 0:
-        return float(min(xs))
-    if p >= 100:
-        return float(max(xs))
-
-    ys = sorted(xs)
-    n = len(ys)
-    # rank in [0, n-1]
-    r = (p / 100.0) * (n - 1)
-    lo = int(math.floor(r))
-    hi = int(math.ceil(r))
-    if lo == hi:
-        return float(ys[lo])
+    r = (p / 100.0) * (len(ys) - 1)
+    lo, hi = int(r), min(int(r) + 1, len(ys) - 1)
     w = r - lo
-    return float((1.0 - w) * ys[lo] + w * ys[hi])
+    return ys[lo] * (1 - w) + ys[hi] * w
 
 
-def _summary_stats(xs: List[float]) -> Dict[str, Any]:
-    """
-    Standard summary for a numeric list.
-    """
+def _summary(xs):
     return {
         "count": len(xs),
         "mean": _mean(xs),
-        "median": _median(xs),
-        "p90": _percentile(xs, 90.0),
-        "p95": _percentile(xs, 95.0),
-        "p99": _percentile(xs, 99.0),
-        "min": _min(xs),
-        "max": _max(xs),
+        "p50": _percentile(xs, 50),
+        "p95": _percentile(xs, 95),
+        "p99": _percentile(xs, 99),
+        "min": min(xs) if xs else None,
+        "max": max(xs) if xs else None,
     }
 
 
-def _count_where(records: List[Dict[str, Any]], key: str, truthy: bool = True) -> int:
-    n = 0
-    for r in records:
-        v = r.get(key, None)
-        if truthy:
-            if bool(v):
-                n += 1
-        else:
-            if not bool(v):
-                n += 1
-    return n
-
-
 # -----------------------------
-# Summarizers
+# Summaries
 # -----------------------------
 
-def summarize_counts(records: List[Dict[str, Any]]) -> Dict[str, Any]:
+def summarize_counts(records):
     total = len(records)
-    ok = sum(1 for r in records if bool(r.get("ok", False)))
-    err = total - ok
-    return {"total": total, "ok": ok, "err": err, "ok_rate": (ok / total) if total else None}
-
-
-def summarize_latency(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    # Use latency_s only on ok records (err records may not include it)
-    ok_records = [r for r in records if bool(r.get("ok", False))]
-    lat = _collect_numeric(ok_records, "latency_s")
-    return _summary_stats(lat)
-
-
-def summarize_tokens(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ok_records = [r for r in records if bool(r.get("ok", False))]
-    in_tok = _collect_numeric(ok_records, "input_tokens")
-    out_tok = _collect_numeric(ok_records, "output_tokens")
-    tps = _collect_numeric(ok_records, "tokens_per_second")
-
-    truncated_count = _count_where(ok_records, "truncated", truthy=True)
-    truncated_rate = (truncated_count / len(ok_records)) if ok_records else None
-
+    ok = sum(1 for r in records if r.get("ok"))
     return {
-        "input_tokens": _summary_stats(in_tok),
-        "output_tokens": _summary_stats(out_tok),
-        "tokens_per_second": _summary_stats(tps),
-        "truncated_count": truncated_count,
-        "truncated_rate": truncated_rate,
+        "total": total,
+        "ok": ok,
+        "err": total - ok,
+        "ok_rate": ok / total if total else None,
     }
 
 
-def summarize_memory(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ok_records = [r for r in records if bool(r.get("ok", False))]
-    rss_before = _collect_numeric(ok_records, "rss_before_mb")
-    rss_after = _collect_numeric(ok_records, "rss_after_mb")
-    rss_delta = _collect_numeric(ok_records, "rss_delta_mb")
+def summarize_latency(records):
+    ok = [r for r in records if r.get("ok")]
+    return _summary(_collect_numeric(ok, "latency_s"))
+
+
+def summarize_tokens(records):
+    ok = [r for r in records if r.get("ok")]
+
     return {
-        "rss_before_mb": _summary_stats(rss_before),
-        "rss_after_mb": _summary_stats(rss_after),
-        "rss_delta_mb": _summary_stats(rss_delta),
+        "input_tokens": _summary(_collect_numeric(ok, "input_tokens")),
+        "output_tokens": _summary(_collect_numeric(ok, "output_tokens")),
+        "tokens_per_second": _summary(_collect_numeric(ok, "tokens_per_second")),
     }
 
 
-def summarize_devices(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ok_records = [r for r in records if bool(r.get("ok", False))]
-    counts: Dict[str, int] = {}
-    for r in ok_records:
-        d = r.get("device", None)
-        if d is None:
-            d = "unknown"
-        counts[str(d)] = counts.get(str(d), 0) + 1
-
-    total = len(ok_records)
-    shares = {k: (v / total) if total else None for k, v in counts.items()}
-    return {"counts": counts, "shares": shares}
+def summarize_devices(records):
+    ok = [r for r in records if r.get("ok")]
+    counts = {}
+    for r in ok:
+        d = str(r.get("device", "unknown"))
+        counts[d] = counts.get(d, 0) + 1
+    return {"counts": counts}
 
 
-def summarize_cache(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    ok_records = [r for r in records if bool(r.get("ok", False))]
-    hits = _count_where(ok_records, "cache_hit", truthy=True)
-    misses = _count_where(ok_records, "cache_hit", truthy=False)
-    total = len(ok_records)
-    hit_rate = (hits / total) if total else None
-    return {"hits": hits, "misses": misses, "hit_rate": hit_rate}
+def summarize_quality(records):
+    ok = [r for r in records if r.get("ok")]
 
-
-def summarize_quality(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Summarize generic text-quality metrics *if present* in the example records.
-
-    Your evaluator may add metrics like:
-      - exact_match, contains_answer, token_f1, char_f1
-
-    If they are absent, stats will have count=0 and mean=None.
-    """
-    ok_records = [r for r in records if bool(r.get("ok", False))]
-
-    exact = _collect_numeric(ok_records, "exact_match")
-    contains = _collect_numeric(ok_records, "contains_answer")
-    token_f1 = _collect_numeric(ok_records, "token_f1")
-    char_f1 = _collect_numeric(ok_records, "char_f1")
-
-    # For "rate" metrics, mean is already the rate if inputs are 0/1
-    return {
-        "exact_match": _summary_stats(exact),
-        "contains_answer": _summary_stats(contains),
-        "token_f1": _summary_stats(token_f1),
-        "char_f1": _summary_stats(char_f1),
-    }
-
-
-def summarize_baseline_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
-    rows = records
-    latencies = _collect_numeric(rows, "latency_s")
-    compute_latencies = _collect_numeric(rows, "compute_latency_s")
-    lookup_latencies = _collect_numeric(rows, "lookup_latency_s")
-
-    n_examples = len(rows)
-    n_generated = sum(1 for r in rows if r.get("served_from") == "tier0_compute")
-    n_cache_hits = sum(1 for r in rows if bool(r.get("cache_hit", False)))
-    cache_hit_rate = (n_cache_hits / len(rows)) if rows else 0.0
+    def avg(key):
+        vals = _collect_numeric(ok, key)
+        return _mean(vals)
 
     return {
-        "n_examples": n_examples,
-        "mean_latency_s": _mean(latencies),
-        "p50_latency_s": _percentile(latencies, 50.0),
-        "p95_latency_s": _percentile(latencies, 95.0),
-        "n_generated": n_generated,
-        "n_cache_hits": n_cache_hits,
-        "cache_hit_rate": cache_hit_rate,
-        "mean_compute_latency_s": _mean(compute_latencies),
-        "mean_lookup_latency_s": _mean(lookup_latencies),
+        "exact_match": avg("exact_match"),
+        "token_f1": avg("token_f1"),
+        "char_f1": avg("char_f1"),
     }
 
 
@@ -287,89 +140,15 @@ def summarize_baseline_metrics(records: List[Dict[str, Any]]) -> Dict[str, Any]:
 # -----------------------------
 
 def summarize_run(run_jsonl_path: str) -> Dict[str, Any]:
-    """
-    High-level entrypoint:
-      - loads JSONL
-      - extracts example_result records
-      - returns nested summary dict
-    """
     records = load_run_jsonl(run_jsonl_path)
     ex = extract_example_records(records)
 
-    summary: Dict[str, Any] = {
-        "run_jsonl": str(Path(run_jsonl_path).expanduser().resolve()),
+    summary = {
         "counts": summarize_counts(ex),
         "latency": summarize_latency(ex),
         "tokens": summarize_tokens(ex),
-        "memory": summarize_memory(ex),
         "devices": summarize_devices(ex),
-        "cache": summarize_cache(ex),
         "quality": summarize_quality(ex),
-        **summarize_baseline_metrics(ex),
     }
 
-    # If a header exists, include some provenance fields
-    header = next((r for r in records if r.get("type") == "run_header"), None)
-    if header:
-        summary["run_id"] = header.get("run_id")
-        summary["created_at"] = header.get("created_at")
-        summary["config"] = header.get("config")
-
-    footer = next((r for r in records if r.get("type") == "run_footer"), None)
-    if footer:
-        summary["finished_at"] = footer.get("finished_at")
-
     return summary
-
-
-# -----------------------------
-# CSV Output
-# -----------------------------
-
-def _flatten_dict(d: Dict[str, Any], prefix: str = "") -> Dict[str, Any]:
-    """
-    Flatten nested dictionaries into a single-level dict with dotted keys.
-    Non-dict values are kept as-is.
-
-    Example:
-      {"latency": {"mean": 1.2}} -> {"latency.mean": 1.2}
-    """
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        key = f"{prefix}{k}" if not prefix else f"{prefix}.{k}"
-        if isinstance(v, dict):
-            out.update(_flatten_dict(v, key))
-        else:
-            out[key] = v
-    return out
-
-
-def write_summary_csv(summary: Dict[str, Any], out_csv: str) -> str:
-    """
-    Write a single-row CSV of the flattened summary.
-
-    Returns:
-      Absolute path to the written CSV.
-    """
-    out_path = Path(out_csv).expanduser().resolve()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    flat = _flatten_dict(summary)
-
-    # Make values CSV-safe (e.g., lists or objects -> JSON string)
-    safe: Dict[str, Any] = {}
-    for k, v in flat.items():
-        if isinstance(v, (dict, list, tuple)):
-            safe[k] = json.dumps(v, ensure_ascii=False)
-        else:
-            safe[k] = v
-
-    # Stable column order: sort keys
-    fieldnames = sorted(safe.keys())
-
-    with out_path.open("w", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fieldnames)
-        w.writeheader()
-        w.writerow(safe)
-
-    return str(out_path)

@@ -49,7 +49,7 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
 
     This is intentionally approximate but stable across platforms.
     """
-    overhead = 512  # rough constant for Python object/container overhead
+    overhead = 768  # slightly more realistic fixed Python/container overhead
     n = overhead
 
     def b(s: str) -> int:
@@ -70,12 +70,20 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
         n += b(item.provenance.quantization)
 
     # quality signals
-    for k in item.quality.metrics.keys():
+    for k, v in item.quality.metrics.items():
         n += b(str(k))
+        if isinstance(v, str):
+            n += b(v)
+        else:
+            n += 16
 
     # shallow meta
-    for k in item.meta.keys():
+    for k, v in item.meta.items():
         n += b(str(k))
+        if isinstance(v, str):
+            n += b(v)
+        elif v is not None:
+            n += 16
 
     # evidence/source fields
     if getattr(item, "evidence_text", None):
@@ -84,6 +92,8 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
         n += b(item.doc_signature)
     if getattr(item, "source_file", None):
         n += b(item.source_file)
+    if getattr(item, "source_id", None):
+        n += b(item.source_id)
     if getattr(item, "chunk_id", None):
         n += b(item.chunk_id)
     if getattr(item, "question_type", None):
@@ -92,20 +102,19 @@ def _estimate_item_bytes(item: MemoryItem) -> int:
         n += b(item.answer_canonical)
 
     if getattr(item, "chunk_index", None) is not None:
-        n += 16  # small fixed accounting for stored integer metadata
+        n += 16
 
     # semantic fields
     if item.embedding_model_id:
         n += b(item.embedding_model_id)
 
     if item.embedding_norm is not None:
-        n += 16  # small fixed accounting for stored float metadata
+        n += 16
 
     if item.query_embedding is not None:
-        # Rough accounting:
-        # a Python float typically costs much more than 4 bytes, but we do not want a
-        # highly version-dependent estimate. Use a fixed per-dimension budget instead.
-        n += len(item.query_embedding) * 8
+        # Use a larger per-dimension budget than raw float bytes because the vector
+        # lives as Python objects/lists in RAM, not as a compact tensor.
+        n += len(item.query_embedding) * 24
 
     return n
 
@@ -119,8 +128,11 @@ class RamStoreStats:
     deletes: int = 0
     evictions: int = 0
     iter_calls: int = 0
+    iter_candidate_calls: int = 0
     bytes_current: int = 0
     bytes_capacity: int = 0
+    items_current: int = 0
+    items_capacity: Optional[int] = None
 
 
 class RamStoreLRU:
@@ -149,10 +161,14 @@ class RamStoreLRU:
 
         self._ns_maps: Dict[str, OrderedDict[str, Tuple[MemoryItem, int]]] = {}
         self._bytes_current: int = 0
-        self._stats = RamStoreStats(bytes_capacity=self._capacity_bytes)
+        self._items_current: int = 0
+        self._stats = RamStoreStats(
+            bytes_capacity=self._capacity_bytes,
+            items_capacity=self._capacity_items,
+        )
 
     def item_count(self) -> int:
-        return sum(len(od) for od in self._ns_maps.values())
+        return self._items_current
 
     def capacity_bytes(self) -> int:
         return self._capacity_bytes
@@ -176,8 +192,11 @@ class RamStoreLRU:
             deletes=s.deletes,
             evictions=s.evictions,
             iter_calls=s.iter_calls,
+            iter_candidate_calls=s.iter_candidate_calls,
             bytes_current=self._bytes_current,
             bytes_capacity=self._capacity_bytes,
+            items_current=self._items_current,
+            items_capacity=self._capacity_items,
         )
 
     def get(self, namespace: str, key: str) -> Optional[MemoryItem]:
@@ -200,7 +219,6 @@ class RamStoreLRU:
         od.move_to_end(key, last=True)
         self._stats.hits += 1
 
-        # Touch access stats
         item.stats.touch()
         return item
 
@@ -217,20 +235,20 @@ class RamStoreLRU:
             od = OrderedDict()
             self._ns_maps[namespace] = od
 
-        # If overwriting existing, subtract old size first
         if key in od:
             _old_item, old_est = od.pop(key)
             self._bytes_current -= old_est
+            self._items_current -= 1
 
         est = _estimate_item_bytes(item)
 
-        # If a single item exceeds capacity, do not store it
         if est > self._capacity_bytes:
             return
 
         od[key] = (item, est)
         od.move_to_end(key, last=True)
         self._bytes_current += est
+        self._items_current += 1
 
         self._evict_as_needed()
 
@@ -248,6 +266,7 @@ class RamStoreLRU:
 
         _item, est = entry
         self._bytes_current -= est
+        self._items_current -= 1
         self._stats.deletes += 1
 
         if not od:
@@ -274,6 +293,91 @@ class RamStoreLRU:
 
         return _gen()
 
+    def iter_candidates(
+        self,
+        namespace: str,
+        *,
+        task: Optional[str] = None,
+        source_file: Optional[str] = None,
+        doc_signature: Optional[str] = None,
+        limit: Optional[int] = None,
+    ) -> Iterator[MemoryItem]:
+        """
+        Iterate candidate items from a namespace with cheap coarse filtering.
+
+        Filtering is intentionally lightweight and mirrors disk_store behavior:
+        - task via item.meta["task"]
+        - source_file via item.source_file / item.meta["source_file"]
+        - doc_signature via item.doc_signature / item.meta["doc_signature"]
+
+        Iteration does not mutate LRU order.
+        """
+        self._stats.iter_candidate_calls += 1
+        if not namespace:
+            return iter(())
+
+        od = self._ns_maps.get(namespace)
+        if od is None:
+            return iter(())
+
+        task_norm = str(task).strip() if task is not None else None
+        source_norm = str(source_file).strip() if source_file is not None else None
+        doc_norm = str(doc_signature).strip() if doc_signature is not None else None
+
+        def _item_task(item: MemoryItem) -> Optional[str]:
+            value = item.meta.get("task")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def _item_source(item: MemoryItem) -> Optional[str]:
+            if getattr(item, "source_file", None):
+                text = str(item.source_file).strip()
+                if text:
+                    return text
+            value = item.meta.get("source_file")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def _item_doc(item: MemoryItem) -> Optional[str]:
+            if getattr(item, "doc_signature", None):
+                text = str(item.doc_signature).strip()
+                if text:
+                    return text
+            value = item.meta.get("doc_signature")
+            if value is None:
+                return None
+            text = str(value).strip()
+            return text or None
+
+        def _gen() -> Iterator[MemoryItem]:
+            yielded = 0
+            for item, _est in od.values():
+                if task_norm is not None:
+                    itask = _item_task(item)
+                    if itask is not None and itask != task_norm:
+                        continue
+
+                if source_norm is not None:
+                    isource = _item_source(item)
+                    if isource is None or isource != source_norm:
+                        continue
+
+                if doc_norm is not None:
+                    idoc = _item_doc(item)
+                    if idoc is None or idoc != doc_norm:
+                        continue
+
+                yield item
+                yielded += 1
+                if limit is not None and yielded >= int(limit):
+                    break
+
+        return _gen()
+
     def _evict_as_needed(self) -> None:
         """
         Evict least-recently-used entries across namespaces until under both:
@@ -283,7 +387,7 @@ class RamStoreLRU:
         def over_capacity() -> bool:
             over_bytes = self._bytes_current > self._capacity_bytes
             over_items = (
-                self._capacity_items is not None and self.item_count() > self._capacity_items
+                self._capacity_items is not None and self._items_current > self._capacity_items
             )
             return over_bytes or over_items
 
@@ -325,6 +429,7 @@ class RamStoreLRU:
             od = self._ns_maps[victim_ns]
             _itm, est = od.pop(victim_key)
             self._bytes_current -= est
+            self._items_current -= 1
             self._stats.evictions += 1
 
             if not od:
@@ -334,4 +439,8 @@ class RamStoreLRU:
         """Clear all namespaces and reset counters except capacity."""
         self._ns_maps.clear()
         self._bytes_current = 0
-        self._stats = RamStoreStats(bytes_capacity=self._capacity_bytes)
+        self._items_current = 0
+        self._stats = RamStoreStats(
+            bytes_capacity=self._capacity_bytes,
+            items_capacity=self._capacity_items,
+        )

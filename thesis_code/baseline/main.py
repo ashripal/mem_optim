@@ -1,6 +1,11 @@
-# main.py
 """
 Entry point for running the LongBench baseline experiment.
+
+TRUE BASELINE:
+- Stateless LLM execution
+- NO caching
+- NO memory reuse
+- Each query is processed independently
 
 Responsibilities:
 - Load config
@@ -21,7 +26,7 @@ def main() -> None:
     cfg = get_config()
 
     print("========================================")
-    print(" LongBench Baseline Run")
+    print(" LongBench TRUE Baseline Run (Stateless)")
     print("========================================")
     print(f"Tier2 repo        : {cfg.tier2_repo}")
     print(f"Model             : {cfg.model_id}")
@@ -30,8 +35,16 @@ def main() -> None:
     print(f"Max examples      : {cfg.max_examples}")
     print(f"Max input tokens  : {cfg.max_input_tokens}")
     print(f"Max new tokens    : {cfg.max_new_tokens}")
-    print(f"Cache capacity    : {cfg.max_cache_items}")
     print(f"CPU fallback      : {cfg.cpu_fallback_on_long}")
+
+    # --- Edge-relevant debug knobs ---
+    print("----------------------------------------")
+    print("Tokenizer / Model Settings")
+    print("----------------------------------------")
+    print(f"Use fast tokenizer : {cfg.use_fast_tokenizer}")
+    print(f"Attention impl     : {cfg.attn_implementation}")
+    print(f"Trust remote code  : {cfg.trust_remote_code}")
+
     print("========================================")
 
     run_path = run_experiment(cfg)

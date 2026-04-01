@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import time
 from dataclasses import dataclass
@@ -21,6 +22,25 @@ def _cuda_available() -> bool:
         return torch.cuda.is_available()
     except Exception:
         return False
+
+
+def _looks_like_local_model_path(model_id: str) -> bool:
+    model_id = str(model_id or "").strip()
+    if not model_id:
+        return False
+    if os.path.isabs(model_id):
+        return True
+    if model_id.startswith(".") or model_id.startswith("~"):
+        return True
+    if os.path.sep in model_id:
+        return True
+    return os.path.exists(os.path.expanduser(model_id))
+
+
+def _resolve_model_source(model_id: str) -> str:
+    if _looks_like_local_model_path(model_id):
+        return os.path.abspath(os.path.expanduser(model_id))
+    return str(model_id)
 
 
 def _select_device(device: str = "auto") -> str:
@@ -86,6 +106,13 @@ class GeneratorConfig:
     trec_use_few_shot: bool = False
     skip_special_tokens: bool = True
 
+    # Jetson / edge-oriented knobs
+    low_cpu_mem_usage: bool = True
+    use_safetensors: bool = True
+    trust_remote_code: bool = False
+    attn_implementation: str = "auto"  # auto | eager | sdpa | flash_attention_2
+    use_kv_cache: bool = True
+
 
 class HFGenerator:
     _TREC_LABELS = {"ABBR", "DESC", "ENTY", "HUM", "LOC", "NUM"}
@@ -145,26 +172,15 @@ class HFGenerator:
         self.cfg = cfg or GeneratorConfig()
         self._validate_config()
 
+        self.model_source = _resolve_model_source(self.cfg.model_id)
         self.device = _select_device(self.cfg.device)
+        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, self.device)
 
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.cfg.model_id,
-            use_fast=self.cfg.use_fast_tokenizer,
-            local_files_only=self.cfg.local_files_only,
-        )
-
+        self.tokenizer = self._load_tokenizer(self.model_source)
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, self.device)
-
-        self.model = AutoModelForCausalLM.from_pretrained(
-            self.cfg.model_id,
-            local_files_only=self.cfg.local_files_only,
-            torch_dtype=self.model_dtype,
-        )
-        self.model.eval()
-        self.model.to(device=self.device, dtype=self.model_dtype)
+        self.model = self._load_model(self.model_source, self.device, self.model_dtype)
 
         self.last_prompt: Optional[str] = None
         self.last_generation_meta: Optional[Dict[str, object]] = None
@@ -193,6 +209,10 @@ class HFGenerator:
         if int(self.cfg.qa_max_output_words) <= 0:
             raise ValueError("qa_max_output_words must be > 0")
 
+        attn_impl = (self.cfg.attn_implementation or "auto").strip()
+        if attn_impl not in {"auto", "eager", "sdpa", "flash_attention_2"}:
+            raise ValueError("attn_implementation must be one of: auto, eager, sdpa, flash_attention_2")
+
     @staticmethod
     def _resolve_torch_dtype(dtype_name: str, device: str):
         dtype_name = (dtype_name or "auto").lower().strip()
@@ -212,6 +232,48 @@ class HFGenerator:
             return torch.float32
 
         raise ValueError(f"Unsupported torch_dtype: {dtype_name}")
+
+    def _load_tokenizer(self, model_source: str):
+        return AutoTokenizer.from_pretrained(
+            model_source,
+            use_fast=self.cfg.use_fast_tokenizer,
+            local_files_only=self.cfg.local_files_only,
+            trust_remote_code=self.cfg.trust_remote_code,
+        )
+
+    def _model_load_kwargs(self, device: str, dtype):
+        kwargs = {
+            "local_files_only": self.cfg.local_files_only,
+            "torch_dtype": dtype,
+            "low_cpu_mem_usage": bool(self.cfg.low_cpu_mem_usage),
+            "trust_remote_code": bool(self.cfg.trust_remote_code),
+        }
+
+        if bool(self.cfg.use_safetensors):
+            kwargs["use_safetensors"] = True
+
+        attn_impl = (self.cfg.attn_implementation or "auto").strip()
+        if attn_impl != "auto":
+            kwargs["attn_implementation"] = attn_impl
+
+        # On CUDA edge devices like Jetson, load directly to GPU when possible.
+        # On CPU/MPS, let HF load normally and then move.
+        if device == "cuda":
+            kwargs["device_map"] = {"": 0}
+
+        return kwargs
+
+    def _load_model(self, model_source: str, device: str, dtype):
+        model = AutoModelForCausalLM.from_pretrained(
+            model_source,
+            **self._model_load_kwargs(device, dtype),
+        )
+        model.eval()
+
+        if device != "cuda":
+            model.to(device=device, dtype=dtype)
+
+        return model
 
     @staticmethod
     def _safe_text(value: Optional[str]) -> str:
@@ -300,7 +362,6 @@ class HFGenerator:
                 if span:
                     spans.append(span)
 
-        # preserve order but dedupe
         seen = set()
         out: List[str] = []
         for s in spans:
@@ -310,13 +371,6 @@ class HFGenerator:
         return out
 
     def _snap_answer_to_context(self, answer: str, context: str) -> str:
-        """
-        Try to convert a verbose answer into the shortest answer-like span
-        present in the local context. This is especially useful for outputs like:
-        - "The threat is climate change" -> "climate change"
-        - "From Germany" -> "Germany"
-        - "... Marc Nelson ..." -> "Marc Nelson"
-        """
         raw = self._collapse_ws(answer)
         ctx = self._safe_text(context)
         if not raw or not ctx:
@@ -370,29 +424,20 @@ class HFGenerator:
         raw = re.sub(r"\s{2,}", " ", raw).strip()
         raw = raw.strip(" \t\r\n\"'`")
 
-        # Remove leading answer phrases like "The answer is ..." / "From ..."
         raw = self._LEADING_ANSWER_PHRASE_RE.sub("", raw).strip()
 
-        # If the model gives "Name. More text", keep the first answer-like chunk.
         parts = re.split(r"(?<=[\.\!\?])\s+|;\s+|,\s+(?=[A-Z])", raw, maxsplit=1)
         if parts:
             raw = parts[0].strip()
 
         raw = self._strip_chat_turns(raw)
-
-        # Remove leading punctuation fragments often produced by continuation-style models
         raw = re.sub(r"^[\-\–\—\,\.\:\;\"\']+\s*", "", raw).strip()
-
-        # If a short answer is followed by glued chat text like "Arne Frager.Human"
         raw = re.sub(r"([A-Za-z0-9\)])\.(?=(?:Human|Assistant|User|System)\s*:)", r"\1", raw)
 
         raw = self._trim_edge_punct(raw)
         raw = self._collapse_ws(raw)
 
-        # Snap verbose answer back to a short span from context when possible.
         raw = self._snap_answer_to_context(raw, context_text)
-
-        # Keep answers short for extractive QA.
         raw = self._limit_words(raw, int(self.cfg.qa_max_output_words))
         raw = self._trim_edge_punct(raw)
 
@@ -733,16 +778,21 @@ class HFGenerator:
         generated_ids = input_ids
         generated_mask = attention_mask
         eos_token_id = self.tokenizer.eos_token_id
+        past_key_values = None
 
         if allowed_new_tokens <= 0:
             return generated_ids
 
         with torch.inference_mode():
+            current_input_ids = generated_ids
+            current_attention_mask = generated_mask
+
             for _ in range(int(allowed_new_tokens)):
                 outputs = self.model(
-                    input_ids=generated_ids,
-                    attention_mask=generated_mask,
-                    use_cache=False,
+                    input_ids=current_input_ids,
+                    attention_mask=current_attention_mask,
+                    use_cache=bool(self.cfg.use_kv_cache),
+                    past_key_values=past_key_values,
                 )
 
                 next_token_logits = outputs.logits[:, -1, :]
@@ -758,6 +808,14 @@ class HFGenerator:
                     )
                     generated_mask = torch.cat([generated_mask, next_mask], dim=-1)
 
+                if bool(self.cfg.use_kv_cache) and hasattr(outputs, "past_key_values"):
+                    past_key_values = outputs.past_key_values
+                    current_input_ids = next_token_id
+                    current_attention_mask = generated_mask
+                else:
+                    current_input_ids = generated_ids
+                    current_attention_mask = generated_mask
+
                 if eos_token_id is not None and bool((next_token_id == eos_token_id).all()):
                     break
 
@@ -767,6 +825,23 @@ class HFGenerator:
         if dtype is None:
             dtype = self.model_dtype
         self.model.to(device=device, dtype=dtype)
+        self.device = device
+
+    def _reload_model_for_device(self, device: str) -> None:
+        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, device)
+
+        try:
+            del self.model
+        except Exception:
+            pass
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        self.model = self._load_model(self.model_source, device, self.model_dtype)
         self.device = device
 
     def _record_meta(
@@ -781,6 +856,9 @@ class HFGenerator:
         decode_time_s: float,
         backend_used: str,
         retrieved: Optional[MemoryHit],
+        fallback_used: bool = False,
+        fallback_from: Optional[str] = None,
+        fallback_reason: Optional[str] = None,
     ) -> None:
         prior_meta = dict(self.last_generation_meta or {})
 
@@ -808,6 +886,10 @@ class HFGenerator:
             "reduced_context_used": prior_meta.get("reduced_context_used"),
             "full_context_chars": prior_meta.get("full_context_chars"),
             "final_context_chars": prior_meta.get("final_context_chars"),
+            "use_kv_cache": bool(self.cfg.use_kv_cache),
+            "fallback_used": bool(fallback_used),
+            "fallback_from": fallback_from,
+            "fallback_reason": fallback_reason,
         }
 
         if self.device == "cuda":
@@ -835,6 +917,7 @@ class HFGenerator:
             "max_new_tokens": allowed_new_tokens,
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
+            "use_cache": bool(self.cfg.use_kv_cache),
         }
 
         if mode == "beam":
@@ -882,6 +965,9 @@ class HFGenerator:
             attention_mask = attention_mask.to(self.device)
 
         backend_used = self._select_generation_backend()
+        fallback_used = False
+        fallback_from = None
+        fallback_reason = None
 
         try:
             gen_t0 = time.time()
@@ -926,8 +1012,11 @@ class HFGenerator:
 
         except RuntimeError as e:
             if self.device in {"cuda", "mps"} and self.cfg.cpu_fallback_on_failure:
-                self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, "cpu")
-                self._move_model("cpu", dtype=self.model_dtype)
+                fallback_used = True
+                fallback_from = self.device
+                fallback_reason = f"{type(e).__name__}: {e}"
+
+                self._reload_model_for_device("cpu")
 
                 input_ids = input_ids.detach().to("cpu")
                 attention_mask = attention_mask.detach().to("cpu") if attention_mask is not None else None
@@ -1008,6 +1097,9 @@ class HFGenerator:
             decode_time_s=decode_time_s,
             backend_used=backend_used,
             retrieved=retrieved,
+            fallback_used=fallback_used,
+            fallback_from=fallback_from,
+            fallback_reason=fallback_reason,
         )
 
         provenance = Provenance(
@@ -1064,6 +1156,7 @@ class HFGenerator:
     def info(self) -> dict:
         return {
             "model_id": self.cfg.model_id,
+            "model_source": self.model_source,
             "device": self.device,
             "dtype": str(self.model_dtype).replace("torch.", "") if self.model_dtype is not None else "none",
             "max_input_length": self.cfg.max_input_length,
@@ -1086,6 +1179,11 @@ class HFGenerator:
             "qa_max_output_words": self.cfg.qa_max_output_words,
             "trec_use_few_shot": self.cfg.trec_use_few_shot,
             "model_max_positions": self._model_max_positions(),
+            "local_files_only": self.cfg.local_files_only,
+            "low_cpu_mem_usage": self.cfg.low_cpu_mem_usage,
+            "use_safetensors": self.cfg.use_safetensors,
+            "attn_implementation": self.cfg.attn_implementation,
+            "use_kv_cache": self.cfg.use_kv_cache,
         }
 
 

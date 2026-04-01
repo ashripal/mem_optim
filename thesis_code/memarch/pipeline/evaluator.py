@@ -144,17 +144,30 @@ class Evaluator:
         This keeps the evaluator simple and deterministic while preserving the
         exact / lexical / semantic metadata returned by MemoryManager.answer().
         """
-        # 1) time retrieval separately (for breakdown + debugging)
-        hit, retrieve_dbg, retrieval_probe_ms = self._retrieve_with_debug(mq)
-        memory_lookup_ms = float(
-            retrieve_dbg.get("memory_lookup_ms", retrieval_probe_ms) or retrieval_probe_ms
-        )
+        # # 1) time retrieval separately (for breakdown + debugging)
+        # hit, retrieve_dbg, retrieval_probe_ms = self._retrieve_with_debug(mq)
+        # memory_lookup_ms = float(
+        #     retrieve_dbg.get("memory_lookup_ms", retrieval_probe_ms) or retrieval_probe_ms
+        # )
 
-        # 2) time full answer path
+        # # 2) time full answer path
+        # t2 = time.perf_counter()
+        # answer_text, meta = self._manager.answer(mq, self._generator)
+        # t3 = time.perf_counter()
+        # total_ms = (t3 - t2) * 1000.0
+        # 1) time full answer path (includes retrieval)
         t2 = time.perf_counter()
         answer_text, meta = self._manager.answer(mq, self._generator)
         t3 = time.perf_counter()
         total_ms = (t3 - t2) * 1000.0
+
+        meta = dict(meta or {})
+
+        # Use manager-reported retrieval timing if available
+        memory_lookup_ms = float(meta.get("memory_lookup_ms", 0.0))
+        retrieval_probe_ms = memory_lookup_ms
+        hit = meta.get("retrieved_memory", None)
+        retrieve_dbg = {}
 
         meta = dict(meta or {})
 
@@ -214,7 +227,8 @@ class Evaluator:
             **meta,
 
             # retrieval probe metadata
-            "retrieval_hit_present": hit is not None,
+            # "retrieval_hit_present": hit is not None,
+            "retrieval_hit_present": bool(meta.get("retrieved_memory") is not None),
             "retrieval_hit_match_type": getattr(getattr(hit, "match_type", None), "value", None)
             if hit is not None else None,
             "retrieval_hit_source_tier": getattr(getattr(hit, "source_tier", None), "value", None)

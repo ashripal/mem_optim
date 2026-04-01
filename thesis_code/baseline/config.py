@@ -1,6 +1,11 @@
-# config.py
 """
 Central configuration for the LongBench baseline.
+
+TRUE BASELINE:
+- Stateless LLM execution
+- NO caching
+- NO memory reuse
+- Each query is processed independently
 
 Responsibilities:
 - Parse CLI arguments
@@ -9,8 +14,8 @@ Responsibilities:
 
 This allows:
 - Reproducible experiments
-- Easy baseline vs optimized comparisons
-- Clean logging of config into run_header
+- Clean baseline vs memarch comparison
+- Transparent logging into run_header
 """
 
 from __future__ import annotations
@@ -36,17 +41,19 @@ class Config:
     max_input_tokens: int
     max_new_tokens: int
 
-    # Tier 1 (RAM)
-    max_cache_items: int
-
-    # Device behavior
+    # Device / precision behavior
     device: str
     dtype: str
     cpu_fallback_on_long: bool
 
+    # Tokenizer / model loading behavior
+    use_fast_tokenizer: bool
+    attn_implementation: str | None
+    trust_remote_code: bool
+
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="LongBench Baseline Runner")
+    parser = argparse.ArgumentParser(description="LongBench TRUE Baseline Runner (Stateless)")
 
     # -----------------------------
     # Tier 2
@@ -107,16 +114,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     # -----------------------------
-    # Tier 1
-    # -----------------------------
-    parser.add_argument(
-        "--max_cache_items",
-        type=int,
-        default=64,
-        help="Maximum number of items in RAM cache.",
-    )
-
-    # -----------------------------
     # Device / precision behavior
     # -----------------------------
     parser.add_argument(
@@ -129,14 +126,45 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--dtype",
         type=str,
-        default="auto",
+        default="fp16",
         choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
-        help="Model dtype policy. 'auto' uses accelerator-friendly defaults.",
+        help="Model dtype policy. fp16 recommended for Jetson.",
     )
     parser.add_argument(
         "--cpu_fallback_on_long",
         action="store_true",
         help="Retry generation on CPU if CUDA/MPS fails for long sequences.",
+    )
+
+    # -----------------------------
+    # Tokenizer / model loading behavior
+    # -----------------------------
+    parser.add_argument(
+        "--use_fast_tokenizer",
+        action="store_true",
+        default=True,
+        help="Use the fast tokenizer implementation when available.",
+    )
+    parser.add_argument(
+        "--no_use_fast_tokenizer",
+        action="store_false",
+        dest="use_fast_tokenizer",
+        help="Disable the fast tokenizer implementation.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        type=str,
+        default=None,
+        choices=[None, "eager", "sdpa", "flash_attention_2"],
+        help=(
+            "Optional attention backend passed to the model loader. "
+            "Use only if supported by the selected model/runtime."
+        ),
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="Allow Hugging Face models with custom remote code.",
     )
 
     return parser
@@ -154,8 +182,10 @@ def get_config() -> Config:
         max_examples=args.max_examples,
         max_input_tokens=args.max_input_tokens,
         max_new_tokens=args.max_new_tokens,
-        max_cache_items=args.max_cache_items,
         device=args.device,
         dtype=args.dtype,
         cpu_fallback_on_long=args.cpu_fallback_on_long,
+        use_fast_tokenizer=args.use_fast_tokenizer,
+        attn_implementation=args.attn_implementation,
+        trust_remote_code=args.trust_remote_code,
     )

@@ -487,6 +487,7 @@ def semantic_decision(
     *,
     score: float,
     item: MemoryItem,
+    mq: MemoryQuery,  # ✅ FIX: added mq
     policy: RetrievalPolicy,
     query_context_signature: Optional[str] = None,
 ) -> Tuple[str, Dict[str, Any]]:

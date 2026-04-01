@@ -1,4 +1,5 @@
-# memarch/models/embedder.py
+from __future__ import annotations
+
 """
 Embedding backend for memarch using Hugging Face Transformers.
 
@@ -23,8 +24,7 @@ Notes:
     memarch/memory/manager.py or a higher-level embedding cache if needed.
 """
 
-from __future__ import annotations
-
+import os
 import time
 from dataclasses import dataclass
 from math import sqrt
@@ -47,6 +47,25 @@ def _cuda_available() -> bool:
         return torch.cuda.is_available()
     except Exception:
         return False
+
+
+def _looks_like_local_model_path(model_id: str) -> bool:
+    model_id = str(model_id or "").strip()
+    if not model_id:
+        return False
+    if os.path.isabs(model_id):
+        return True
+    if model_id.startswith(".") or model_id.startswith("~"):
+        return True
+    if os.path.sep in model_id:
+        return True
+    return os.path.exists(os.path.expanduser(model_id))
+
+
+def _resolve_model_source(model_id: str) -> str:
+    if _looks_like_local_model_path(model_id):
+        return os.path.abspath(os.path.expanduser(model_id))
+    return str(model_id)
 
 
 def _select_device(device: str = "auto") -> str:
@@ -109,6 +128,11 @@ class EmbedderConfig:
     # Loading behavior
     local_files_only: bool = False
     use_fast_tokenizer: bool = False
+    torch_dtype: str = "auto"  # auto | float16 | bfloat16 | float32
+    low_cpu_mem_usage: bool = True
+    use_safetensors: bool = True
+    trust_remote_code: bool = False
+    attn_implementation: str = "auto"  # auto | eager | sdpa | flash_attention_2
 
     # Runtime behavior
     cpu_fallback_on_failure: bool = True
@@ -129,22 +153,100 @@ class HFEmbedder:
 
     def __init__(self, cfg: Optional[EmbedderConfig] = None) -> None:
         self.cfg = cfg or EmbedderConfig()
+        self._validate_config()
+
+        self.model_source = _resolve_model_source(self.cfg.model_id)
         self.device = _select_device(self.cfg.device)
+        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, self.device)
 
         self.tokenizer = AutoTokenizer.from_pretrained(
-            self.cfg.model_id,
+            self.model_source,
             use_fast=self.cfg.use_fast_tokenizer,
             local_files_only=self.cfg.local_files_only,
+            trust_remote_code=self.cfg.trust_remote_code,
         )
 
-        self.model = AutoModel.from_pretrained(
-            self.cfg.model_id,
-            local_files_only=self.cfg.local_files_only,
-        )
-        self.model.eval()
-        self.model.to(self.device)
-
+        self.model = self._load_model(self.model_source, self.device, self.model_dtype)
         self.last_batch_meta: Optional[Dict[str, object]] = None
+
+    def _validate_config(self) -> None:
+        if int(self.cfg.max_length) <= 0:
+            raise ValueError("max_length must be > 0")
+        if int(self.cfg.batch_size) <= 0:
+            raise ValueError("batch_size must be > 0")
+
+        attn_impl = (self.cfg.attn_implementation or "auto").strip()
+        if attn_impl not in {"auto", "eager", "sdpa", "flash_attention_2"}:
+            raise ValueError("attn_implementation must be one of: auto, eager, sdpa, flash_attention_2")
+
+        dtype_name = (self.cfg.torch_dtype or "auto").lower().strip()
+        if dtype_name not in {"auto", "float16", "bfloat16", "float32"}:
+            raise ValueError("torch_dtype must be one of: auto, float16, bfloat16, float32")
+
+    @staticmethod
+    def _resolve_torch_dtype(dtype_name: str, device: str):
+        dtype_name = (dtype_name or "auto").lower().strip()
+
+        if dtype_name == "auto":
+            if device == "cuda":
+                return torch.float16
+            if device == "mps":
+                return torch.float16
+            return torch.float32
+
+        if dtype_name == "float16":
+            return torch.float32 if device == "cpu" else torch.float16
+        if dtype_name == "bfloat16":
+            if device == "cuda":
+                return torch.bfloat16
+            return torch.float32
+        if dtype_name == "float32":
+            return torch.float32
+
+        raise ValueError(f"Unsupported torch_dtype: {dtype_name}")
+
+    def _model_load_kwargs(self, device: str, dtype):
+        kwargs = {
+            "local_files_only": self.cfg.local_files_only,
+            "torch_dtype": dtype,
+            "low_cpu_mem_usage": bool(self.cfg.low_cpu_mem_usage),
+            "trust_remote_code": bool(self.cfg.trust_remote_code),
+        }
+
+        if bool(self.cfg.use_safetensors):
+            kwargs["use_safetensors"] = True
+
+        attn_impl = (self.cfg.attn_implementation or "auto").strip()
+        if attn_impl != "auto":
+            kwargs["attn_implementation"] = attn_impl
+
+        return kwargs
+
+    def _load_model(self, model_source: str, device: str, dtype):
+        model = AutoModel.from_pretrained(
+            model_source,
+            **self._model_load_kwargs(device, dtype),
+        )
+        model.eval()
+        model.to(device=device, dtype=dtype)
+        return model
+
+    def _reload_model_for_device(self, device: str) -> None:
+        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, device)
+
+        try:
+            del self.model
+        except Exception:
+            pass
+
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        self.model = self._load_model(self.model_source, device, self.model_dtype)
+        self.device = device
 
     @staticmethod
     def _sanitize_text(text: Optional[str]) -> str:
@@ -184,9 +286,13 @@ class HFEmbedder:
         tokenize_time_s: float,
         embed_time_s: float,
         backend_used: str,
+        fallback_used: bool = False,
+        fallback_from: Optional[str] = None,
+        fallback_reason: Optional[str] = None,
     ) -> None:
         meta: Dict[str, object] = {
             "device": self.device,
+            "dtype": str(self.model_dtype).replace("torch.", "") if self.model_dtype is not None else "none",
             "batch_size": batch_size,
             "truncated_count": truncated_count,
             "tokenize_time_s": tokenize_time_s,
@@ -194,6 +300,9 @@ class HFEmbedder:
             "normalize": self.cfg.normalize,
             "embedding_dim": self.embedding_dim(),
             "backend_used": backend_used,
+            "fallback_used": bool(fallback_used),
+            "fallback_from": fallback_from,
+            "fallback_reason": fallback_reason,
         }
 
         if self.device == "cuda":
@@ -219,8 +328,8 @@ class HFEmbedder:
         )
         tokenize_time_s = time.time() - tok_t0
 
-        input_ids = enc["input_ids"].to(self.device)
-        attention_mask = enc["attention_mask"].to(self.device)
+        input_ids = enc["input_ids"].to(self.device, non_blocking=True)
+        attention_mask = enc["attention_mask"].to(self.device, non_blocking=True)
 
         truncated_count = int((attention_mask.sum(dim=1) >= self.cfg.max_length).sum().item())
 
@@ -279,9 +388,16 @@ class HFEmbedder:
                 batch_vectors = self._embed_batch_once(batch)
             except RuntimeError as e:
                 if self.device in {"cuda", "mps"} and self.cfg.cpu_fallback_on_failure:
-                    self.model.to("cpu")
-                    self.device = "cpu"
+                    fallback_from = self.device
+                    fallback_reason = f"{type(e).__name__}: {e}"
+
+                    self._reload_model_for_device("cpu")
                     batch_vectors = self._embed_batch_once(batch)
+
+                    if isinstance(self.last_batch_meta, dict):
+                        self.last_batch_meta["fallback_used"] = True
+                        self.last_batch_meta["fallback_from"] = fallback_from
+                        self.last_batch_meta["fallback_reason"] = fallback_reason
                 else:
                     raise RuntimeError(
                         f"HFEmbedder failed on device={self.device}: {type(e).__name__}: {e}"
@@ -291,7 +407,6 @@ class HFEmbedder:
 
         return all_vectors
 
-    # Backward-compatible aliases
     def encode(self, text: str) -> Vector:
         return self.embed(text)
 
@@ -328,16 +443,21 @@ class HFEmbedder:
         """
         return {
             "model_id": self.cfg.model_id,
+            "model_source": self.model_source,
             "device": self.device,
+            "dtype": str(self.model_dtype).replace("torch.", "") if self.model_dtype is not None else "none",
             "max_length": self.cfg.max_length,
             "batch_size": self.cfg.batch_size,
             "normalize": self.cfg.normalize,
             "embedding_dim": self.embedding_dim(),
             "use_fast_tokenizer": self.cfg.use_fast_tokenizer,
+            "local_files_only": self.cfg.local_files_only,
+            "low_cpu_mem_usage": self.cfg.low_cpu_mem_usage,
+            "use_safetensors": self.cfg.use_safetensors,
+            "attn_implementation": self.cfg.attn_implementation,
             "cpu_fallback_on_failure": self.cfg.cpu_fallback_on_failure,
             "last_batch_meta": self.last_batch_meta,
         }
 
 
-# Simple canonical interface for the rest of memarch
 Embedder = HFEmbedder

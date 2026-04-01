@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, Optional, Mapping, List
 from datetime import datetime, timedelta, timezone
+from array import array
 
 
 # -------------------------
@@ -11,7 +12,6 @@ from datetime import datetime, timedelta, timezone
 # -------------------------
 
 class Scope(str, Enum):
-    """Where a memory item is allowed to be used from."""
     SESSION = "session"
     USER = "user"
     COHORT = "cohort"
@@ -19,13 +19,11 @@ class Scope(str, Enum):
 
 
 class SourceTier(str, Enum):
-    """Which storage tier produced the hit."""
     RAM = "ram"
     DISK = "disk"
 
 
 class MatchType(str, Enum):
-    """How we matched."""
     EXACT = "exact"
     LEXICAL = "lexical"
     SEMANTIC = "semantic"
@@ -37,7 +35,6 @@ class MatchType(str, Enum):
 
 @dataclass(frozen=True)
 class Provenance:
-    """Tracks where an answer came from and under what configuration."""
     model_id: str
     prompt_version: str
     generated_at_utc: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
@@ -57,9 +54,6 @@ class Provenance:
 
 @dataclass
 class QualitySignals:
-    """
-    Quality metadata for gating admission/reuse.
-    """
     score: Optional[float] = None
     success: Optional[bool] = None
     metrics: Dict[str, float] = field(default_factory=dict)
@@ -79,7 +73,6 @@ class QualitySignals:
 
 @dataclass
 class AccessStats:
-    """Tracks usage for promotion/eviction policies."""
     access_count: int = 0
     last_access_utc: Optional[datetime] = None
 
@@ -100,9 +93,6 @@ class AccessStats:
 
 @dataclass(frozen=True)
 class MemoryQuery:
-    """
-    Inputs to MemoryManager for a single user request.
-    """
     raw_query: str
 
     user_id: Optional[str] = None
@@ -148,37 +138,15 @@ class MemoryQuery:
         if not isinstance(self.context, dict):
             raise TypeError("MemoryQuery.context must be a dict")
 
-        if self.chunk_index is not None and self.chunk_index < 0:
-            raise ValueError("MemoryQuery.chunk_index must be >= 0 when provided")
-
-        if self.doc_signature is not None and not str(self.doc_signature).strip():
-            raise ValueError("MemoryQuery.doc_signature must be non-empty when provided")
-        if self.source_file is not None and not str(self.source_file).strip():
-            raise ValueError("MemoryQuery.source_file must be non-empty when provided")
-        if self.source_id is not None and not str(self.source_id).strip():
-            raise ValueError("MemoryQuery.source_id must be non-empty when provided")
-        if self.chunk_id is not None and not str(self.chunk_id).strip():
-            raise ValueError("MemoryQuery.chunk_id must be non-empty when provided")
-        if self.question_type is not None and not str(self.question_type).strip():
-            raise ValueError("MemoryQuery.question_type must be non-empty when provided")
-        if self.evidence_text is not None and not str(self.evidence_text).strip():
-            raise ValueError("MemoryQuery.evidence_text must be non-empty when provided")
-        if self.answer_canonical is not None and not str(self.answer_canonical).strip():
-            raise ValueError("MemoryQuery.answer_canonical must be non-empty when provided")
-
 
 @dataclass
 class MemoryItem:
-    """
-    A stored memory record.
-    """
     key: str
     scope: Scope
     namespace: str
 
     query_canonical: str
     context_signature: str
-
     answer_text: str
 
     provenance: Provenance
@@ -200,9 +168,13 @@ class MemoryItem:
     question_type: Optional[str] = None
     answer_canonical: Optional[str] = None
 
-    query_embedding: Optional[List[float]] = None
+    # 🔥 Jetson-optimized embedding storage
+    query_embedding: Optional[array] = None
     embedding_model_id: Optional[str] = None
     embedding_norm: Optional[float] = None
+
+    MAX_EMBED_DIM = 1024
+    MAX_META_KEYS = 32
 
     def __post_init__(self) -> None:
         if not self.key:
@@ -211,6 +183,7 @@ class MemoryItem:
             raise TypeError("MemoryItem.scope must be a Scope")
         if not self.namespace:
             raise ValueError("MemoryItem.namespace must be non-empty")
+
         if not self.query_canonical:
             raise ValueError("MemoryItem.query_canonical must be non-empty")
         if not self.context_signature:
@@ -218,67 +191,27 @@ class MemoryItem:
         if not self.answer_text:
             raise ValueError("MemoryItem.answer_text must be non-empty")
 
-        if self.created_at_utc.tzinfo is None:
-            raise ValueError("MemoryItem.created_at_utc must be timezone-aware (UTC)")
-
-        if self.ttl_seconds is not None and self.ttl_seconds < 0:
-            raise ValueError("MemoryItem.ttl_seconds must be >= 0 or None")
-
+        # TTL handling
         if self.expires_at_utc is None and self.ttl_seconds is not None:
             self.expires_at_utc = self.created_at_utc + timedelta(seconds=self.ttl_seconds)
 
-        if self.expires_at_utc is not None and self.expires_at_utc.tzinfo is None:
-            raise ValueError("MemoryItem.expires_at_utc must be timezone-aware (UTC)")
-
-        if self.scope == Scope.SESSION and not self.namespace.startswith("session:"):
-            raise ValueError("SESSION scope requires namespace starting with 'session:'")
-        if self.scope == Scope.USER and not self.namespace.startswith("user:"):
-            raise ValueError("USER scope requires namespace starting with 'user:'")
-        if self.scope == Scope.COHORT and not self.namespace.startswith("cohort:"):
-            raise ValueError("COHORT scope requires namespace starting with 'cohort:'")
-        if self.scope == Scope.GLOBAL and not self.namespace.startswith("global:"):
-            raise ValueError("GLOBAL scope requires namespace starting with 'global:'")
-
-        if self.doc_signature is not None and not str(self.doc_signature).strip():
-            raise ValueError("MemoryItem.doc_signature must be non-empty when provided")
-        if self.source_file is not None and not str(self.source_file).strip():
-            raise ValueError("MemoryItem.source_file must be non-empty when provided")
-        if self.source_id is not None and not str(self.source_id).strip():
-            raise ValueError("MemoryItem.source_id must be non-empty when provided")
-        if self.chunk_index is not None and self.chunk_index < 0:
-            raise ValueError("MemoryItem.chunk_index must be >= 0 when provided")
-        if self.chunk_id is not None and not str(self.chunk_id).strip():
-            raise ValueError("MemoryItem.chunk_id must be non-empty when provided")
-        if self.question_type is not None and not str(self.question_type).strip():
-            raise ValueError("MemoryItem.question_type must be non-empty when provided")
-        if self.answer_canonical is not None and not str(self.answer_canonical).strip():
-            raise ValueError("MemoryItem.answer_canonical must be non-empty when provided")
-        if self.evidence_text is not None and not str(self.evidence_text).strip():
-            raise ValueError("MemoryItem.evidence_text must be non-empty when provided")
-
+        # 🔒 Meta bounding (important for Jetson)
         if not isinstance(self.meta, dict):
             raise TypeError("MemoryItem.meta must be a dict")
 
+        if len(self.meta) > self.MAX_META_KEYS:
+            raise ValueError("MemoryItem.meta exceeds max allowed keys")
+
+        # 🔥 Embedding optimization
         if self.query_embedding is not None:
-            if not isinstance(self.query_embedding, list):
-                raise TypeError("MemoryItem.query_embedding must be a list[float] or None")
-            if len(self.query_embedding) == 0:
-                raise ValueError("MemoryItem.query_embedding cannot be an empty list")
-            cleaned_vec: List[float] = []
-            for i, value in enumerate(self.query_embedding):
-                try:
-                    cleaned_vec.append(float(value))
-                except (TypeError, ValueError) as exc:
-                    raise TypeError(
-                        f"MemoryItem.query_embedding[{i}] must be numeric, got {value!r}"
-                    ) from exc
-            self.query_embedding = cleaned_vec
+            if isinstance(self.query_embedding, list):
+                if len(self.query_embedding) > self.MAX_EMBED_DIM:
+                    raise ValueError("Embedding too large for Jetson")
 
-        if self.embedding_model_id is not None and not str(self.embedding_model_id).strip():
-            raise ValueError("MemoryItem.embedding_model_id must be non-empty when provided")
+                self.query_embedding = array("f", self.query_embedding)
 
-        if self.embedding_norm is not None and float(self.embedding_norm) < 0.0:
-            raise ValueError("MemoryItem.embedding_norm must be >= 0 or None")
+            elif not isinstance(self.query_embedding, array):
+                raise TypeError("query_embedding must be list or array('f')")
 
     def is_expired(self, now_utc: Optional[datetime] = None) -> bool:
         if self.expires_at_utc is None:
@@ -289,9 +222,6 @@ class MemoryItem:
 
 @dataclass(frozen=True)
 class MemoryHit:
-    """
-    Returned by MemoryManager.retrieve() when it finds an item.
-    """
     item: MemoryItem
     source_tier: SourceTier
     match_type: MatchType = MatchType.EXACT
@@ -310,7 +240,3 @@ class MemoryHit:
             raise TypeError("MemoryHit.match_type must be a MatchType")
         if not (0.0 <= float(self.score) <= 1.0):
             raise ValueError(f"MemoryHit.score must be in [0,1], got {self.score}")
-        if self.semantic_rank is not None and self.semantic_rank < 1:
-            raise ValueError("MemoryHit.semantic_rank must be >= 1 when provided")
-        if not isinstance(self.debug, Mapping):
-            raise TypeError("MemoryHit.debug must be a mapping")
