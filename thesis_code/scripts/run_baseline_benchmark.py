@@ -1,4 +1,3 @@
-# scripts/run_baseline_benchmark.py
 from __future__ import annotations
 
 import sys
@@ -15,174 +14,123 @@ from baseline.benchmarks.configs import BenchmarkConfig, OutputConfig, WorkloadC
 from baseline.benchmarks.execute import run_benchmark
 
 
+def _normalize_dtype(dtype: str) -> str:
+    mapping = {
+        "fp16": "float16",
+        "bf16": "bfloat16",
+        "fp32": "float32",
+        "float16": "float16",
+        "bfloat16": "bfloat16",
+        "float32": "float32",
+        "auto": "auto",
+    }
+    return mapping[str(dtype).strip().lower()]
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Run a baseline LongBench benchmark with configurable workload replay/caching."
+        description=(
+            "Run a baseline LongBench benchmark with configurable workload and "
+            "generation settings. This runner mirrors the memarch CLI surface "
+            "as closely as possible, excluding retrieval-specific memory options."
+        )
     )
 
-    # Required / core paths
+    parser.add_argument("--tier2_repo", type=str, required=True)
+    parser.add_argument("--benchmark_name", type=str, default="baseline_longbench_benchmark")
+    parser.add_argument("--out_root", type=str, default="artifacts/benchmark_runs/baseline")
+    parser.add_argument("--notes", type=str, default="")
+
+    parser.add_argument("--task_glob", type=str, default="")
     parser.add_argument(
-        "--tier2_repo",
+        "--input_path",
         type=str,
-        required=True,
-        help="Path to the directory containing LongBench task .jsonl files.",
-    )
-    parser.add_argument(
-        "--benchmark_name",
-        type=str,
-        default="baseline_longbench_benchmark",
-        help="Logical name for this benchmark run.",
-    )
-    parser.add_argument(
-        "--out_root",
-        type=str,
-        default="artifacts/benchmark_runs/baseline",
-        help="Root directory for benchmark outputs.",
+        default=None,
+        help="Direct path to a JSONL workload file (overrides task_glob).",
     )
 
-    # Workload selection / shaping
-    parser.add_argument(
-        "--task_glob",
-        type=str,
-        default="",
-        help="Substring filter for LongBench task filenames. Empty means all tasks.",
-    )
-    parser.add_argument(
-        "--max_examples",
-        type=int,
-        default=25,
-        help="Maximum number of base examples to load before replay expansion.",
-    )
+    parser.add_argument("--max_examples", type=int, default=25)
     parser.add_argument(
         "--mode",
         type=str,
         default="cold",
-        choices=["cold", "replay_once", "replay_k", "cache_pressure", "mixed_reuse"],
-        help="Workload mode controlling reuse behavior.",
+        choices=[
+            "cold",
+            "replay_once",
+            "replay_k",
+            "cache_pressure",
+            "mixed_reuse",
+            "exact_interleaved",
+            "approx_interleaved",
+            "family_clustered",
+        ],
     )
-    parser.add_argument(
-        "--replay_k",
-        type=int,
-        default=2,
-        help="Total number of passes when mode=replay_k.",
-    )
-    parser.add_argument(
-        "--shuffle",
-        action="store_true",
-        help="Shuffle the base example list before workload expansion.",
-    )
-    parser.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed used when --shuffle is enabled.",
-    )
+    parser.add_argument("--replay_k", type=int, default=2)
+    parser.add_argument("--shuffle", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--total_requests", type=int, default=None)
+    parser.add_argument("--repeat_fraction", type=float, default=0.0)
 
-    # System / model knobs
+    parser.add_argument("--model_id", type=str, default="microsoft/Phi-3-mini-128k-instruct")
+    parser.add_argument("--max_input_tokens", type=int, default=8192)
+    parser.add_argument("--max_new_tokens", type=int, default=64)
+
     parser.add_argument(
-        "--model_id",
+        "--decoding_mode",
         type=str,
-        default="microsoft/Phi-3-mini-128k-instruct",
-        help="Hugging Face model id for Tier 0 generation.",
+        default="greedy",
+        choices=["greedy", "beam", "sample"],
+        help="Generation decoding mode. Accepted for CLI parity with memarch.",
     )
     parser.add_argument(
-        "--max_input_tokens",
+        "--num_beams",
         type=int,
-        default=8192,
-        help="Maximum input tokens sent to the model.",
+        default=1,
+        help="Beam count. Must be >1 only when decoding_mode=beam.",
     )
-    parser.add_argument(
-        "--max_new_tokens",
-        type=int,
-        default=64,
-        help="Maximum new tokens to generate.",
-    )
-    parser.add_argument(
-        "--max_cache_items",
-        type=int,
-        default=64,
-        help="Tier 1 RAM cache capacity in items.",
-    )
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--do_sample", action="store_true")
+
     parser.add_argument(
         "--device",
         type=str,
         default="auto",
-        choices=["auto", "cuda", "mps", "cpu"],
-        help="Execution device preference. 'auto' selects cuda -> mps -> cpu.",
+        choices=["auto", "cpu", "cuda", "mps"],
     )
     parser.add_argument(
         "--dtype",
         type=str,
         default="auto",
         choices=["auto", "fp16", "bf16", "fp32", "float16", "bfloat16", "float32"],
-        help="Model dtype policy. 'auto' uses accelerator-friendly defaults.",
     )
-    parser.add_argument(
-        "--cpu_fallback_on_long",
-        action="store_true",
-        help="Enable CPU fallback when CUDA/MPS execution fails on long inputs.",
-    )
-    parser.add_argument(
-        "--jetson_safe_mode",
-        action="store_true",
-        help="Clamp token budget to a Jetson-safe limit for embedded testing.",
-    )
+    parser.add_argument("--local_files_only", action="store_true")
+    parser.add_argument("--cpu_fallback_on_long", action="store_true")
 
-    # Output behavior
-    parser.add_argument(
-        "--write_workload_manifest",
-        action="store_true",
-        default=True,
-        help="Write a workload manifest JSON next to the run JSONL.",
-    )
+    parser.add_argument("--jetson_safe_mode", action="store_true")
+
+    parser.add_argument("--write_workload_manifest", action="store_true", default=True)
     parser.add_argument(
         "--no_write_workload_manifest",
-        action="store_true",
-        help="Disable workload manifest writing.",
+        dest="write_workload_manifest",
+        action="store_false",
     )
-    parser.add_argument(
-        "--write_summary_json",
-        action="store_true",
-        help="Also write a summary JSON after the run completes.",
-    )
-
-    # Provenance
-    parser.add_argument(
-        "--notes",
-        type=str,
-        default="",
-        help="Optional freeform notes stored in the run config.",
-    )
-
-    parser.add_argument(
-        "--total_requests",
-        type=int,
-        default=None,
-        help="Total number of workload requests when mode=mixed_reuse.",
-    )
-    parser.add_argument(
-        "--repeat_fraction",
-        type=float,
-        default=0.0,
-        help="Fraction of requests that should be repeats when mode=mixed_reuse.",
-    )
+    parser.add_argument("--write_summary_json", action="store_true")
 
     return parser
 
 
 def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
-    write_workload_manifest = True
-    if args.no_write_workload_manifest:
-        write_workload_manifest = False
-    elif args.write_workload_manifest:
-        write_workload_manifest = True
+    effective_task_glob = str(args.task_glob or "").strip()
+    if str(args.input_path or "").strip():
+        effective_task_glob = str(Path(args.input_path).expanduser().resolve())
 
     max_input_tokens = int(args.max_input_tokens)
     if args.jetson_safe_mode:
         max_input_tokens = min(max_input_tokens, 2048)
 
     workload = WorkloadConfig(
-        task_glob=args.task_glob,
+        task_glob=effective_task_glob,
         max_examples=args.max_examples,
         mode=args.mode,
         replay_k=args.replay_k,
@@ -194,7 +142,7 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
 
     output = OutputConfig(
         root_dir=args.out_root,
-        write_workload_manifest=write_workload_manifest,
+        write_workload_manifest=args.write_workload_manifest,
         write_summary_json=args.write_summary_json,
     )
 
@@ -206,13 +154,25 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         model_id=args.model_id,
         max_input_tokens=max_input_tokens,
         max_new_tokens=args.max_new_tokens,
-        max_cache_items=args.max_cache_items,
         device=args.device,
-        dtype=args.dtype,
+        dtype=_normalize_dtype(args.dtype),
         cpu_fallback_on_long=args.cpu_fallback_on_long,
         workload=workload,
         output=output,
     )
+
+    if args.decoding_mode != "greedy":
+        print("[warn] Non-greedy decoding flags were provided for baseline CLI parity.")
+        print("[warn] Ensure the underlying baseline generator/config consumes them if intended.")
+
+    if args.do_sample:
+        print("[warn] --do_sample was provided for baseline CLI parity.")
+        print("[warn] Ensure the underlying baseline generator/config consumes it if intended.")
+
+    if args.local_files_only:
+        print("[warn] --local_files_only was provided for baseline CLI parity.")
+        print("[warn] Ensure the underlying baseline loader/config consumes it if intended.")
+
     cfg.validate()
     return cfg
 
@@ -220,17 +180,23 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
 def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
-
     cfg = args_to_config(args)
+
+    print("========================================")
+    print(" Baseline LongBench Benchmark")
+    print("========================================")
+    print(json.dumps(cfg.to_dict(), indent=2, default=str))
+    print("========================================")
+
     artifacts = run_benchmark(cfg)
 
-    print("\nBaseline benchmark completed.\n")
-    print("Resolved configuration:")
-    print(json.dumps(cfg.to_dict(), indent=2, default=str))
-
-    print("\nArtifacts:")
-    for key, value in artifacts.items():
-        print(f"- {key}: {value}")
+    print("Run complete.")
+    print("Artifacts:")
+    if isinstance(artifacts, dict):
+        for key, value in artifacts.items():
+            print(f"- {key}: {value}")
+    else:
+        print(artifacts)
 
 
 if __name__ == "__main__":

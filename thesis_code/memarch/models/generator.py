@@ -84,7 +84,7 @@ class GeneratorConfig:
     num_beams: int = 1
 
     local_files_only: bool = False
-    torch_dtype: str = "auto"
+    torch_dtype: str = "auto"  # auto | float16 | bfloat16 | float32
     use_fast_tokenizer: bool = False
 
     cpu_fallback_on_failure: bool = True
@@ -96,12 +96,16 @@ class GeneratorConfig:
 
     prefer_retrieved_evidence_context: bool = True
     reduce_context_on_semantic_hit: bool = True
-    max_evidence_chars: int = 400
+    # max_evidence_chars: int = 400
+    # max_local_context_chars: int = 260
+    # max_full_context_chars: int = 1200
+
+    max_evidence_chars: int = 260
     max_local_context_chars: int = 260
-    max_full_context_chars: int = 1200
+    max_full_context_chars: int = 900
 
     prefer_local_context_for_qa: bool = True
-    qa_max_output_words: int = 6
+    qa_max_output_words: int = 10
 
     trec_use_few_shot: bool = False
     skip_special_tokens: bool = True
@@ -166,7 +170,11 @@ class HFGenerator:
 
         self.model_source = _resolve_model_source(self.cfg.model_id)
         self.device = _select_device(self.cfg.device)
-        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, self.device)
+        self.model_dtype = self._resolve_torch_dtype(
+            dtype_name=self.cfg.torch_dtype,
+            device=self.device,
+            model_source=self.model_source,
+        )
 
         self.tokenizer = self._load_tokenizer(self.model_source)
         if self.tokenizer.pad_token is None and self.tokenizer.eos_token is not None:
@@ -198,20 +206,42 @@ class HFGenerator:
             raise ValueError("attn_implementation must be one of: auto, eager, sdpa, flash_attention_2")
 
     @staticmethod
-    def _resolve_torch_dtype(dtype_name: str, device: str):
+    def _auto_cuda_dtype_for_model(model_source: str):
+        """
+        Auto precision heuristic for CUDA.
+
+        Empirical rule for this Jetson setup:
+        - Qwen2.5-1.5B-Instruct: bf16 is stable, fp16 is unstable
+        - Qwen2.5-0.5B-Instruct: fp16 is fine and lighter
+        - fallback default on CUDA: fp16
+        """
+        name = str(model_source or "").lower()
+
+        if "qwen2.5-1.5b-instruct" in name or "qwen2-1.5b" in name:
+            return torch.bfloat16
+
+        return torch.float16
+
+    @classmethod
+    def _resolve_torch_dtype(cls, dtype_name: str, device: str, model_source: str):
         dtype_name = (dtype_name or "auto").lower().strip()
+
         if dtype_name == "auto":
             if device == "cuda":
-                return torch.float16
+                return cls._auto_cuda_dtype_for_model(model_source)
             if device == "mps":
                 return torch.float16
             return torch.float32
+
         if dtype_name == "float16":
             return torch.float32 if device == "cpu" else torch.float16
+
         if dtype_name == "bfloat16":
             return torch.float32 if device == "cpu" else torch.bfloat16
+
         if dtype_name == "float32":
             return torch.float32
+
         raise ValueError(f"Unsupported torch_dtype: {dtype_name}")
 
     def _load_tokenizer(self, model_source: str):
@@ -225,10 +255,13 @@ class HFGenerator:
     def _model_load_kwargs(self, device: str, dtype):
         kwargs = {
             "local_files_only": self.cfg.local_files_only,
-            "torch_dtype": dtype,
-            "low_cpu_mem_usage": bool(self.cfg.low_cpu_mem_usage),
             "trust_remote_code": bool(self.cfg.trust_remote_code),
+            "low_cpu_mem_usage": bool(self.cfg.low_cpu_mem_usage),
         }
+
+        if dtype is not None:
+            kwargs["torch_dtype"] = dtype
+
         if bool(self.cfg.use_safetensors):
             kwargs["use_safetensors"] = True
 
@@ -236,8 +269,6 @@ class HFGenerator:
         if attn_impl != "auto":
             kwargs["attn_implementation"] = attn_impl
 
-        if device == "cuda":
-            kwargs["device_map"] = {"": 0}
         return kwargs
 
     def _load_model(self, model_source: str, device: str, dtype):
@@ -246,8 +277,12 @@ class HFGenerator:
             **self._model_load_kwargs(device, dtype),
         )
         model.eval()
-        if device != "cuda":
-            model.to(device=device, dtype=dtype)
+
+        if dtype is not None:
+            model = model.to(device=device, dtype=dtype)
+        else:
+            model = model.to(device=device)
+
         return model
 
     @staticmethod
@@ -512,8 +547,6 @@ class HFGenerator:
             self._retrieved_evidence_text(retrieved),
             int(self.cfg.max_evidence_chars),
         )
-        answer_text = self._safe_text(retrieved.item.answer_text)
-        answer_text = self._truncate_chars(answer_text, 180)
         same_doc = self._retrieved_same_document(mq, retrieved)
 
         meta_parts = [
@@ -530,9 +563,9 @@ class HFGenerator:
             ", ".join(meta_parts),
         ]
         if evidence_text:
-            lines.extend(["", "RETRIEVED EVIDENCE:", evidence_text])
-        if answer_text:
-            lines.extend(["", "PRIOR ANSWER:", answer_text])
+            header = "RETRIEVED EVIDENCE (same document):" if same_doc else "RETRIEVED EVIDENCE:"
+            lines.extend(["", header, evidence_text])
+
         return "\n".join(lines)
 
     def _task_instruction(self, mq: MemoryQuery) -> str:
@@ -650,18 +683,22 @@ class HFGenerator:
             same_document = self._retrieved_same_document(mq, retrieved)
 
             parts = []
-            if retrieved_evidence:
-                parts.append("RETRIEVED EVIDENCE:\n" + retrieved_evidence)
+
             if query_evidence:
                 parts.append("CURRENT LOCAL CONTEXT:\n" + query_evidence)
 
-            context_block = "\n\n".join(parts)
+            if retrieved_evidence:
+                parts.append("RETRIEVED SUPPORT:\n" + retrieved_evidence)
+
+            context_block = "\n\n".join(parts).strip()
+
             return context_block, {
                 "reduced_context_used": bool(context_block),
                 "full_context_chars": full_context_chars,
                 "final_context_chars": len(context_block),
                 "retrieved_evidence_chars": len(retrieved_evidence) if retrieved_evidence else None,
                 "retrieved_doc_signature_match": same_document,
+                "context_already_contains_retrieved": True,
             }
 
         question_type = self._query_question_type(mq).lower()
@@ -673,6 +710,7 @@ class HFGenerator:
                     "final_context_chars": len(query_evidence),
                     "retrieved_evidence_chars": None,
                     "retrieved_doc_signature_match": None,
+                    "context_already_contains_retrieved": False,
                 }
 
         trimmed_full_ctx = self._truncate_chars(dataset_ctx, int(self.cfg.max_full_context_chars))
@@ -682,6 +720,7 @@ class HFGenerator:
             "final_context_chars": len(trimmed_full_ctx),
             "retrieved_evidence_chars": None,
             "retrieved_doc_signature_match": None,
+            "context_already_contains_retrieved": False,
         }
 
     def build_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
@@ -702,7 +741,17 @@ class HFGenerator:
         if context_block:
             parts.append(f"CONTEXT:\n{context_block}")
 
-        if self.cfg.include_retrieved_memory_context and retrieved is not None:
+        # if self.cfg.include_retrieved_memory_context and retrieved is not None:
+        #     retrieved_block = self._retrieved_section(mq, retrieved)
+        #     if retrieved_block:
+        #         parts.append(retrieved_block)
+        already_contains_retrieved = bool(prompt_stats.get("context_already_contains_retrieved"))
+
+        if (
+            self.cfg.include_retrieved_memory_context
+            and retrieved is not None
+            and not already_contains_retrieved
+        ):
             retrieved_block = self._retrieved_section(mq, retrieved)
             if retrieved_block:
                 parts.append(retrieved_block)
@@ -723,6 +772,9 @@ class HFGenerator:
         self.last_generation_meta["final_context_chars"] = prompt_stats["final_context_chars"]
         self.last_generation_meta["retrieved_evidence_chars"] = prompt_stats["retrieved_evidence_chars"]
         self.last_generation_meta["retrieved_doc_signature_match"] = prompt_stats["retrieved_doc_signature_match"]
+        self.last_generation_meta["context_already_contains_retrieved"] = bool(
+            prompt_stats.get("context_already_contains_retrieved", False)
+        )
 
         return prompt
 
@@ -786,7 +838,11 @@ class HFGenerator:
         self.device = device
 
     def _reload_model_for_device(self, device: str) -> None:
-        self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, device)
+        self.model_dtype = self._resolve_torch_dtype(
+            dtype_name=self.cfg.torch_dtype,
+            device=device,
+            model_source=self.model_source,
+        )
 
         try:
             del self.model
@@ -876,7 +932,17 @@ class HFGenerator:
             "pad_token_id": self.tokenizer.pad_token_id,
             "eos_token_id": self.tokenizer.eos_token_id,
             "use_cache": bool(self.cfg.use_kv_cache),
+            "synced_gpus": False,
         }
+
+        generation_config = getattr(self.model, "generation_config", None)
+        if generation_config is not None and mode != "sample":
+            try:
+                generation_config.temperature = None
+                generation_config.top_p = None
+                generation_config.top_k = None
+            except Exception:
+                pass
 
         if mode == "beam":
             kwargs["do_sample"] = False
@@ -887,9 +953,13 @@ class HFGenerator:
             kwargs["num_beams"] = 1
             kwargs["temperature"] = float(self.cfg.temperature)
             kwargs["top_p"] = float(self.cfg.top_p)
+            kwargs["top_k"] = 20
         else:
             kwargs["do_sample"] = False
             kwargs["num_beams"] = 1
+            kwargs["temperature"] = None
+            kwargs["top_p"] = None
+            kwargs["top_k"] = None
 
         return self.model.generate(**kwargs)
 

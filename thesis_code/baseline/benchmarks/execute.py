@@ -29,7 +29,6 @@ from baseline.benchmarks.workload import prepare_workload, build_workload_manife
 from baseline.pipeline.evaluator import evaluate_example
 from baseline.pipeline.logging import JSONLLogger
 from baseline.tiers.tier0_compute import ComputeEngine
-from baseline.tiers.tier1_cache import LRUCache
 from baseline.tiers.tier2_disk import DiskLoader
 
 try:
