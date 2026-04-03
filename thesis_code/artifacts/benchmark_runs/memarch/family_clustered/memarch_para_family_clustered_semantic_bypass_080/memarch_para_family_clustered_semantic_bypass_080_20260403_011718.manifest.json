@@ -1,0 +1,65 @@
+{
+  "benchmark_name": "memarch_para_family_clustered_semantic_bypass_080",
+  "notes": "family clustered paraphrase test before canonicalization",
+  "tier2_repo": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+  "workload_mode": "family_clustered",
+  "task_glob": "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_family_clustered.jsonl",
+  "base_max_examples": 8,
+  "total_workload_examples": 32,
+  "unique_base_examples": 8,
+  "unique_families": 8,
+  "variant_rows": 24,
+  "tasks": [
+    "squad"
+  ],
+  "source_files": [
+    "/Users/ashripal/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_family_clustered.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "ram_capacity_items": 64,
+  "disk_store_path": "/Users/ashripal/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite",
+  "retrieval_mode": "semantic_bypass",
+  "lexical_enabled": false,
+  "lexical_threshold_context": 0.55,
+  "lexical_threshold_bypass": 0.75,
+  "lexical_top_k": 3,
+  "prefer_same_source": true,
+  "safe_direct_reuse_tasks": [
+    "trec"
+  ],
+  "semantic_enabled": true,
+  "semantic_threshold_context": 0.55,
+  "semantic_threshold_bypass": 0.9,
+  "max_semantic_candidates": 5,
+  "allow_semantic_bypass": true,
+  "require_same_document_for_semantic_bypass": true,
+  "semantic_bypass_min_margin": 0.02,
+  "require_evidence_support_for_semantic_bypass": true,
+  "semantic_direct_reuse_tasks": [
+    "squad",
+    "extractive_qa",
+    "qa",
+    "trec"
+  ],
+  "semantic_bypass_max_answer_words": 12,
+  "embedding_model_id": "/Users/ashripal/mem_optim/thesis_code/models/all-MiniLM-L6-v2",
+  "promote_disk_hits_to_ram": true,
+  "return_memory_directly": true,
+  "enable_storage": true,
+  "store_in_ram": true,
+  "store_on_disk": true,
+  "max_input_tokens": 8192,
+  "max_new_tokens": 64,
+  "model_id": "/Users/ashripal/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+  "namespaces": {
+    "user_id": "user_a",
+    "session_id": "session_a",
+    "cohort_id": null
+  },
+  "total_requests": null,
+  "repeat_fraction": 0.0,
+  "observed_repeat_requests": 24,
+  "observed_repeat_rate": 0.75
+}

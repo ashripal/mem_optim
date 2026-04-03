@@ -3,6 +3,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+# Make the repository root importable when this script is run directly.
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -20,19 +21,35 @@ from memarch.benchmarks.configs import (
 from memarch.benchmarks.execute import run_benchmark
 
 
+# =============================================================================
+# CLI construction
+# =============================================================================
+
 def build_parser() -> argparse.ArgumentParser:
+    """
+    Build the CLI parser for memarch benchmark execution.
+
+    This runner now exposes the verified semantic paraphrase reuse controls
+    needed by the updated spec and policy stack.
+    """
     parser = argparse.ArgumentParser(
         description=(
             "Run a memarch LongBench benchmark with configurable workload and "
-            "evidence-guided multi-tier memory settings."
+            "verified paraphrase reuse settings."
         )
     )
 
+    # -------------------------------------------------------------------------
+    # Benchmark/run metadata
+    # -------------------------------------------------------------------------
     parser.add_argument("--tier2_repo", type=str, required=True)
     parser.add_argument("--benchmark_name", type=str, default="memarch_longbench_benchmark")
     parser.add_argument("--out_root", type=str, default="artifacts/benchmark_runs/memarch")
     parser.add_argument("--notes", type=str, default="")
 
+    # -------------------------------------------------------------------------
+    # Input/workload selection
+    # -------------------------------------------------------------------------
     parser.add_argument("--task_glob", type=str, default="")
     parser.add_argument(
         "--input_path",
@@ -63,6 +80,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--total_requests", type=int, default=None)
     parser.add_argument("--repeat_fraction", type=float, default=0.0)
 
+    # -------------------------------------------------------------------------
+    # Generator/model controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--model_id", type=str, default="microsoft/Phi-3-mini-128k-instruct")
     parser.add_argument("--max_input_tokens", type=int, default=8192)
     parser.add_argument("--max_new_tokens", type=int, default=64)
@@ -102,10 +122,16 @@ def build_parser() -> argparse.ArgumentParser:
     # Kept only for convenience/documentation.
     parser.add_argument("--jetson_safe_mode", action="store_true")
 
+    # -------------------------------------------------------------------------
+    # Namespace controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--user_id", type=str, default="user_a")
     parser.add_argument("--session_id", type=str, default="session_a")
     parser.add_argument("--cohort_id", type=str, default=None)
 
+    # -------------------------------------------------------------------------
+    # Memory store controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--ram_capacity_items", type=int, default=64)
     parser.add_argument(
         "--disk_store_path",
@@ -114,6 +140,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--clear_disk_store_before_run", action="store_true")
 
+    # -------------------------------------------------------------------------
+    # Retrieval mode
+    # -------------------------------------------------------------------------
     parser.add_argument(
         "--retrieval_mode",
         type=str,
@@ -141,7 +170,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_false",
     )
 
-    # Lexical controls
+    # -------------------------------------------------------------------------
+    # Lexical retrieval controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--lexical_enabled", action="store_true")
     parser.add_argument("--lexical_context_threshold", type=float, default=0.55)
     parser.add_argument("--lexical_direct_threshold", type=float, default=0.75)
@@ -155,12 +186,53 @@ def build_parser() -> argparse.ArgumentParser:
         help="Comma-separated task list allowed for lexical direct reuse.",
     )
 
-    # Semantic controls
+    # -------------------------------------------------------------------------
+    # Semantic retrieval controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--semantic_enabled", action="store_true")
-    parser.add_argument("--semantic_threshold_context", type=float, default=0.75)
-    parser.add_argument("--semantic_threshold_bypass", type=float, default=1.01)
+    parser.add_argument("--semantic_threshold_context", type=float, default=0.85)
+    parser.add_argument("--semantic_threshold_bypass", type=float, default=0.95)
     parser.add_argument("--max_semantic_candidates", type=int, default=5)
 
+    # Verified semantic direct reuse gates
+    parser.add_argument("--allow_semantic_bypass", action="store_true", default=True)
+    parser.add_argument(
+        "--no_allow_semantic_bypass",
+        dest="allow_semantic_bypass",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--require_same_document_for_semantic_bypass",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_require_same_document_for_semantic_bypass",
+        dest="require_same_document_for_semantic_bypass",
+        action="store_false",
+    )
+    parser.add_argument("--semantic_bypass_min_margin", type=float, default=0.02)
+    parser.add_argument(
+        "--require_evidence_support_for_semantic_bypass",
+        action="store_true",
+        default=True,
+    )
+    parser.add_argument(
+        "--no_require_evidence_support_for_semantic_bypass",
+        dest="require_evidence_support_for_semantic_bypass",
+        action="store_false",
+    )
+    parser.add_argument(
+        "--semantic_direct_reuse_tasks",
+        type=str,
+        default="squad,extractive_qa,qa,trec",
+        help="Comma-separated task list allowed for verified semantic direct reuse.",
+    )
+    parser.add_argument("--semantic_bypass_max_answer_words", type=int, default=12)
+
+    # -------------------------------------------------------------------------
+    # Embedding controls
+    # -------------------------------------------------------------------------
     parser.add_argument(
         "--embedding_model_id",
         type=str,
@@ -174,10 +246,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--embedding_local_files_only", action="store_true")
 
+    # -------------------------------------------------------------------------
+    # Storage controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--disable_storage", action="store_true")
     parser.add_argument("--disable_store_in_ram", action="store_true")
     parser.add_argument("--disable_store_on_disk", action="store_true")
 
+    # -------------------------------------------------------------------------
+    # Artifact controls
+    # -------------------------------------------------------------------------
     parser.add_argument("--write_workload_manifest", action="store_true", default=True)
     parser.add_argument("--no_write_workload_manifest", dest="write_workload_manifest", action="store_false")
     parser.add_argument("--write_summary_json", action="store_true")
@@ -185,7 +263,14 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# =============================================================================
+# Small helpers
+# =============================================================================
+
 def _normalize_dtype(dtype: str) -> str:
+    """
+    Normalize dtype aliases into the values expected by BenchmarkConfig.
+    """
     mapping = {
         "fp16": "float16",
         "bf16": "bfloat16",
@@ -199,12 +284,22 @@ def _normalize_dtype(dtype: str) -> str:
 
 
 def _parse_task_list(text: str) -> list[str]:
+    """
+    Parse a comma-separated task list into a cleaned list[str].
+    """
     if not str(text or "").strip():
         return []
     return [x.strip() for x in str(text).split(",") if x.strip()]
 
 
+# =============================================================================
+# CLI args -> config translation
+# =============================================================================
+
 def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
+    """
+    Convert parsed CLI args into a BenchmarkConfig.
+    """
     effective_task_glob = str(args.task_glob or "").strip()
     if args.input_path:
         effective_task_glob = str(Path(args.input_path).expanduser().resolve())
@@ -264,6 +359,12 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
         semantic_threshold_context=args.semantic_threshold_context,
         semantic_threshold_bypass=args.semantic_threshold_bypass,
         max_semantic_candidates=args.max_semantic_candidates,
+        allow_semantic_bypass=bool(args.allow_semantic_bypass),
+        require_same_document_for_semantic_bypass=bool(args.require_same_document_for_semantic_bypass),
+        semantic_bypass_min_margin=args.semantic_bypass_min_margin,
+        require_evidence_support_for_semantic_bypass=bool(args.require_evidence_support_for_semantic_bypass),
+        semantic_direct_reuse_tasks=_parse_task_list(args.semantic_direct_reuse_tasks),
+        semantic_bypass_max_answer_words=args.semantic_bypass_max_answer_words,
         embedding_model_id=args.embedding_model_id,
         embedding_device=args.embedding_device,
         embedding_local_files_only=args.embedding_local_files_only,
@@ -298,9 +399,16 @@ def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
     if args.decoding_mode != "greedy":
         print("[warn] Non-greedy decoding may introduce noise in evaluation")
 
+    if args.jetson_safe_mode:
+        print("[info] jetson_safe_mode enabled (informational flag only)")
+
     cfg.validate()
     return cfg
 
+
+# =============================================================================
+# Main entrypoint
+# =============================================================================
 
 def main() -> None:
     parser = build_parser()

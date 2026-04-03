@@ -3,12 +3,12 @@ from __future__ import annotations
 """
 Embedding backend for memarch using Hugging Face Transformers.
 
-Phase 1 semantic retrieval goals:
-- provide a stable embedding interface for semantic memory lookup
-- keep embedding logic separate from memory policy / storage logic
-- support constrained and heterogeneous devices:
-    - MacBook (CPU / MPS if available)
-    - Jetson Orin Nano / AGX Orin (CPU / CUDA if available)
+Role in the verified paraphrase reuse system:
+- provide stable embeddings for semantic candidate retrieval
+- stay separate from memory policy / storage / verification logic
+- remain lightweight and portable across:
+    - MacBook (CPU / MPS)
+    - Jetson Orin Nano / AGX Orin (CPU / CUDA)
     - other Linux edge devices
 
 Design choices:
@@ -17,11 +17,10 @@ Design choices:
 - Supports optional L2 normalization
 - Returns plain Python lists for portability with SQLite / JSON-backed storage
 
-Notes:
-- This file does NOT build a vector index. That belongs in:
-    memarch/memory/embed_index.py
-- This file does NOT implement caching. That belongs in:
-    memarch/memory/manager.py or a higher-level embedding cache if needed.
+Important non-goals:
+- This file does NOT build a vector index
+- This file does NOT decide whether a semantic hit is safe to bypass
+- This file does NOT cache embeddings beyond the loaded model/tokenizer
 """
 
 import os
@@ -38,6 +37,10 @@ from transformers import AutoModel, AutoTokenizer
 Vector = List[float]
 
 
+# =============================================================================
+# Device helpers
+# =============================================================================
+
 def _mps_available() -> bool:
     return bool(getattr(torch.backends, "mps", None)) and torch.backends.mps.is_available()
 
@@ -50,6 +53,9 @@ def _cuda_available() -> bool:
 
 
 def _looks_like_local_model_path(model_id: str) -> bool:
+    """
+    Heuristic for distinguishing a local model path from a HF repo id.
+    """
     model_id = str(model_id or "").strip()
     if not model_id:
         return False
@@ -63,6 +69,11 @@ def _looks_like_local_model_path(model_id: str) -> bool:
 
 
 def _resolve_model_source(model_id: str) -> str:
+    """
+    Resolve the configured model source to either:
+    - absolute local path
+    - or the original HF model id string
+    """
     if _looks_like_local_model_path(model_id):
         return os.path.abspath(os.path.expanduser(model_id))
     return str(model_id)
@@ -102,6 +113,10 @@ def _select_device(device: str = "auto") -> str:
     raise ValueError(f"Unsupported device: {device}")
 
 
+# =============================================================================
+# Config
+# =============================================================================
+
 @dataclass(frozen=True)
 class EmbedderConfig:
     """
@@ -110,10 +125,14 @@ class EmbedderConfig:
     Default model:
       sentence-transformers/all-MiniLM-L6-v2
 
-    This is a practical default because it is:
+    This remains a practical default because it is:
     - widely used
     - small enough for constrained devices
     - effective for semantic similarity tasks
+
+    Notes for paraphrase reuse:
+    - normalized embeddings are recommended because semantic scoring in the
+      index/retrieval layer often assumes cosine-like similarity behavior
     """
     model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
     device: str = "auto"
@@ -138,6 +157,10 @@ class EmbedderConfig:
     cpu_fallback_on_failure: bool = True
 
 
+# =============================================================================
+# HF embedder
+# =============================================================================
+
 class HFEmbedder:
     """
     Lightweight embedding wrapper around a Hugging Face encoder model.
@@ -149,6 +172,13 @@ class HFEmbedder:
     Backward-compatible aliases:
       - encode(text)
       - encode_batch(texts)
+
+    Design note:
+    This class should stay focused on representation learning only.
+    The verified paraphrase reuse strategy is implemented later by:
+    - candidate retrieval
+    - policy verification
+    - manager-level decision logic
     """
 
     def __init__(self, cfg: Optional[EmbedderConfig] = None) -> None:
@@ -167,7 +197,13 @@ class HFEmbedder:
         )
 
         self.model = self._load_model(self.model_source, self.device, self.model_dtype)
+
+        # Metadata from the most recent batch. Helpful for tests/debugging.
         self.last_batch_meta: Optional[Dict[str, object]] = None
+
+    # -------------------------------------------------------------------------
+    # Validation / model loading
+    # -------------------------------------------------------------------------
 
     def _validate_config(self) -> None:
         if int(self.cfg.max_length) <= 0:
@@ -177,7 +213,9 @@ class HFEmbedder:
 
         attn_impl = (self.cfg.attn_implementation or "auto").strip()
         if attn_impl not in {"auto", "eager", "sdpa", "flash_attention_2"}:
-            raise ValueError("attn_implementation must be one of: auto, eager, sdpa, flash_attention_2")
+            raise ValueError(
+                "attn_implementation must be one of: auto, eager, sdpa, flash_attention_2"
+            )
 
         dtype_name = (self.cfg.torch_dtype or "auto").lower().strip()
         if dtype_name not in {"auto", "float16", "bfloat16", "float32"}:
@@ -185,6 +223,14 @@ class HFEmbedder:
 
     @staticmethod
     def _resolve_torch_dtype(dtype_name: str, device: str):
+        """
+        Resolve the torch dtype for the current device.
+
+        Current default behavior:
+        - CUDA: float16 by default
+        - MPS: float16 by default
+        - CPU: float32 by default
+        """
         dtype_name = (dtype_name or "auto").lower().strip()
 
         if dtype_name == "auto":
@@ -206,6 +252,9 @@ class HFEmbedder:
         raise ValueError(f"Unsupported torch_dtype: {dtype_name}")
 
     def _model_load_kwargs(self, device: str, dtype):
+        """
+        Collect model loading kwargs in one place for easier maintenance.
+        """
         kwargs = {
             "local_files_only": self.cfg.local_files_only,
             "torch_dtype": dtype,
@@ -242,7 +291,6 @@ class HFEmbedder:
         except TypeError:
             pass
 
-        # Last-resort variants for unusual test doubles / wrappers.
         try:
             model.to(device=device)
             return
@@ -256,7 +304,6 @@ class HFEmbedder:
             except TypeError:
                 pass
 
-        # Re-raise with the simplest call if everything failed.
         model.to(device)
 
     @staticmethod
@@ -273,6 +320,9 @@ class HFEmbedder:
             return t.to(device)
 
     def _load_model(self, model_source: str, device: str, dtype):
+        """
+        Load the encoder model and move it to the selected device.
+        """
         model = AutoModel.from_pretrained(
             model_source,
             **self._model_load_kwargs(device, dtype),
@@ -282,6 +332,10 @@ class HFEmbedder:
         return model
 
     def _reload_model_for_device(self, device: str) -> None:
+        """
+        Reload the model on a different device, mainly for CPU fallback after
+        CUDA/MPS runtime failure.
+        """
         self.model_dtype = self._resolve_torch_dtype(self.cfg.torch_dtype, device)
 
         try:
@@ -297,6 +351,10 @@ class HFEmbedder:
 
         self.model = self._load_model(self.model_source, device, self.model_dtype)
         self.device = device
+
+    # -------------------------------------------------------------------------
+    # Text / pooling helpers
+    # -------------------------------------------------------------------------
 
     @staticmethod
     def _sanitize_text(text: Optional[str]) -> str:
@@ -328,6 +386,10 @@ class HFEmbedder:
         counts = mask.sum(dim=1).clamp(min=1e-9)
         return summed / counts
 
+    # -------------------------------------------------------------------------
+    # Metadata helpers
+    # -------------------------------------------------------------------------
+
     def _record_batch_meta(
         self,
         *,
@@ -340,6 +402,9 @@ class HFEmbedder:
         fallback_from: Optional[str] = None,
         fallback_reason: Optional[str] = None,
     ) -> None:
+        """
+        Record batch-level runtime metadata for debugging and analysis.
+        """
         meta: Dict[str, object] = {
             "device": self.device,
             "dtype": str(self.model_dtype).replace("torch.", "") if self.model_dtype is not None else "none",
@@ -365,7 +430,19 @@ class HFEmbedder:
 
         self.last_batch_meta = meta
 
+    # -------------------------------------------------------------------------
+    # Core embedding methods
+    # -------------------------------------------------------------------------
+
     def _embed_batch_once(self, texts: Sequence[str]) -> List[Vector]:
+        """
+        Embed one batch on the current device.
+
+        Returns plain Python lists for portability with:
+        - RAM store
+        - SQLite disk store
+        - JSON logs
+        """
         cleaned_texts = [self._sanitize_text(t) for t in texts]
 
         tok_t0 = time.time()
@@ -457,11 +534,38 @@ class HFEmbedder:
 
         return all_vectors
 
+    # -------------------------------------------------------------------------
+    # Backward-compatible aliases
+    # -------------------------------------------------------------------------
+
     def encode(self, text: str) -> Vector:
         return self.embed(text)
 
     def encode_batch(self, texts: Sequence[str]) -> List[Vector]:
         return self.embed_batch(texts)
+
+    # -------------------------------------------------------------------------
+    # Optional future helper
+    # -------------------------------------------------------------------------
+
+    def embed_query_text(self, raw_query: str, canonical_query: Optional[str] = None) -> Vector:
+        """
+        Helper for future migration if you want to embed canonical query text
+        instead of raw query text.
+
+        Current behavior:
+        - if canonical_query is provided and non-empty, embed it
+        - otherwise embed raw_query
+
+        This keeps the embedder ready for a future canonical-intent layer
+        without forcing that change today.
+        """
+        text = self._sanitize_text(canonical_query) or self._sanitize_text(raw_query)
+        return self.embed(text)
+
+    # -------------------------------------------------------------------------
+    # Introspection / math helpers
+    # -------------------------------------------------------------------------
 
     def embedding_dim(self) -> int:
         """
@@ -510,4 +614,5 @@ class HFEmbedder:
         }
 
 
+# Backward-compatible alias used elsewhere in the project.
 Embedder = HFEmbedder

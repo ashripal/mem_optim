@@ -5,10 +5,18 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 
+# =============================================================================
+# Workload config
+# =============================================================================
+
 @dataclass
 class WorkloadConfig:
     """
     Controls how raw LongBench examples are selected and replayed.
+
+    Notes:
+    - approx_interleaved is the key workload for paraphrase reuse evaluation
+    - family_clustered can also be useful when testing paraphrase families
     """
     task_glob: str = ""
     max_examples: Optional[int] = 25
@@ -70,6 +78,10 @@ class WorkloadConfig:
                 )
 
 
+# =============================================================================
+# Output config
+# =============================================================================
+
 @dataclass
 class OutputConfig:
     """
@@ -87,6 +99,10 @@ class OutputConfig:
         return Path(self.root_dir).expanduser().resolve() / workload_mode / benchmark_name
 
 
+# =============================================================================
+# Namespace config
+# =============================================================================
+
 @dataclass
 class NamespaceConfig:
     """
@@ -103,23 +119,38 @@ class NamespaceConfig:
             raise ValueError("session_id must be non-empty")
 
 
+# =============================================================================
+# Memory / retrieval config
+# =============================================================================
+
 @dataclass
 class MemoryConfig:
     """
     Memarch-specific memory and retrieval controls.
+
+    Retrieval ladder intended by the verified paraphrase reuse spec:
+      exact reuse
+      -> lexical direct/context (optional)
+      -> verified semantic direct reuse
+      -> semantic context-only
+      -> generation
+
+    This config does not itself implement the logic; it only exposes the knobs
+    used later by manager.py and policy.py.
     """
     ram_capacity_items: int = 64
     disk_store_path: str = "artifacts/benchmark_runs/memarch/memory/memarch_benchmark.sqlite"
     clear_disk_store_before_run: bool = False
 
-    # Default to the full intended retrieval stack for paraphrased workloads:
-    # exact -> lexical gated direct -> semantic context
+    # Default to the intended stack for paraphrased workloads.
     retrieval_mode: str = "lexical_gated_direct_semantic_context"
 
     promote_disk_hits_to_ram: bool = True
     return_memory_directly: bool = True
 
+    # -------------------------------------------------------------------------
     # Lexical retrieval
+    # -------------------------------------------------------------------------
     lexical_enabled: bool = True
     lexical_threshold_context: float = 0.55
     lexical_threshold_bypass: float = 0.75
@@ -127,16 +158,41 @@ class MemoryConfig:
     prefer_same_source: bool = True
     safe_direct_reuse_tasks: list[str] = field(default_factory=lambda: ["trec"])
 
+    # -------------------------------------------------------------------------
     # Semantic retrieval
+    # -------------------------------------------------------------------------
     semantic_enabled: bool = True
-    semantic_threshold_context: float = 0.75
-    semantic_threshold_bypass: float = 1.01
+
+    # Context threshold should be lower than direct-reuse threshold.
+    semantic_threshold_context: float = 0.85
+
+    # Verified semantic bypass threshold from the spec.
+    semantic_threshold_bypass: float = 0.95
+
     max_semantic_candidates: int = 5
 
+    # -------------------------------------------------------------------------
+    # Verified semantic direct reuse gates
+    # -------------------------------------------------------------------------
+    allow_semantic_bypass: bool = True
+    require_same_document_for_semantic_bypass: bool = True
+    semantic_bypass_min_margin: float = 0.02
+    require_evidence_support_for_semantic_bypass: bool = True
+    semantic_direct_reuse_tasks: list[str] = field(
+        default_factory=lambda: ["squad", "extractive_qa", "qa", "trec"]
+    )
+    semantic_bypass_max_answer_words: int = 12
+
+    # -------------------------------------------------------------------------
+    # Embedding model config
+    # -------------------------------------------------------------------------
     embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2"
     embedding_device: str = "auto"
     embedding_local_files_only: bool = False
 
+    # -------------------------------------------------------------------------
+    # Storage
+    # -------------------------------------------------------------------------
     enable_storage: bool = True
     store_in_ram: bool = True
     store_on_disk: bool = True
@@ -163,6 +219,9 @@ class MemoryConfig:
                 f"Expected one of: {sorted(valid_modes)}"
             )
 
+        # ------------------------------
+        # Lexical validation
+        # ------------------------------
         if not (0.0 <= float(self.lexical_threshold_context) <= 1.0):
             raise ValueError("lexical_threshold_context must be in [0.0, 1.0]")
 
@@ -177,11 +236,14 @@ class MemoryConfig:
         if int(self.lexical_top_k) <= 0:
             raise ValueError("lexical_top_k must be > 0")
 
+        # ------------------------------
+        # Semantic validation
+        # ------------------------------
         if not (0.0 <= float(self.semantic_threshold_context) <= 1.0):
             raise ValueError("semantic_threshold_context must be in [0.0, 1.0]")
 
-        if float(self.semantic_threshold_bypass) < 0.0:
-            raise ValueError("semantic_threshold_bypass must be >= 0.0")
+        if not (0.0 <= float(self.semantic_threshold_bypass) <= 1.0):
+            raise ValueError("semantic_threshold_bypass must be in [0.0, 1.0]")
 
         if float(self.semantic_threshold_bypass) < float(self.semantic_threshold_context):
             raise ValueError(
@@ -191,6 +253,26 @@ class MemoryConfig:
         if int(self.max_semantic_candidates) <= 0:
             raise ValueError("max_semantic_candidates must be > 0")
 
+        # ------------------------------
+        # Verified semantic bypass gates
+        # ------------------------------
+        if float(self.semantic_bypass_min_margin) < 0.0:
+            raise ValueError("semantic_bypass_min_margin must be >= 0.0")
+
+        if int(self.semantic_bypass_max_answer_words) <= 0:
+            raise ValueError("semantic_bypass_max_answer_words must be > 0")
+
+        for task in self.safe_direct_reuse_tasks:
+            if not str(task).strip():
+                raise ValueError("safe_direct_reuse_tasks must not contain empty task names")
+
+        for task in self.semantic_direct_reuse_tasks:
+            if not str(task).strip():
+                raise ValueError("semantic_direct_reuse_tasks must not contain empty task names")
+
+        # ------------------------------
+        # Embedding validation
+        # ------------------------------
         if not str(self.embedding_model_id).strip():
             raise ValueError("embedding_model_id must be non-empty")
 
@@ -200,15 +282,29 @@ class MemoryConfig:
                 f"embedding_device must be one of {sorted(valid_embed_devices)}"
             )
 
+        # ------------------------------
+        # Storage validation
+        # ------------------------------
         if not self.enable_storage and (self.store_in_ram or self.store_on_disk):
             raise ValueError(
                 "store_in_ram/store_on_disk cannot be True when enable_storage is False"
             )
 
+        # exact_only means only exact reuse should be active; we allow the other
+        # fields to remain populated for convenience across experiments.
         if self.retrieval_mode == "exact_only":
-            # Allow the flags to be True, but they won't be used. This keeps the
-            # config convenient across experiments.
             pass
+
+        # semantic_bypass mode is the narrow explicit benchmark mode for testing
+        # verified semantic direct reuse. It should not run with semantic disabled.
+        if self.retrieval_mode == "semantic_bypass" and not self.semantic_enabled:
+            raise ValueError(
+                "semantic_enabled must be True when retrieval_mode='semantic_bypass'"
+            )
+
+    # -------------------------------------------------------------------------
+    # Effective feature flags
+    # -------------------------------------------------------------------------
 
     def effective_lexical_enabled(self) -> bool:
         return self.retrieval_mode in {
@@ -233,8 +329,22 @@ class MemoryConfig:
         } and self.semantic_enabled
 
     def effective_bypass_enabled(self) -> bool:
-        return self.retrieval_mode == "semantic_bypass" and self.semantic_enabled
+        """
+        Whether verified semantic direct reuse should be enabled.
 
+        This replaces the old looser notion of 'semantic_bypass'. The actual
+        bypass remains gated by policy-time verification.
+        """
+        return (
+            self.retrieval_mode in {"semantic_bypass"}
+            and self.semantic_enabled
+            and self.allow_semantic_bypass
+        )
+
+
+# =============================================================================
+# Full benchmark config
+# =============================================================================
 
 @dataclass
 class BenchmarkConfig:
@@ -362,9 +472,15 @@ class BenchmarkConfig:
         prefer_same_source: bool = True,
         safe_direct_reuse_tasks: Optional[list[str]] = None,
         semantic_enabled: bool = True,
-        semantic_threshold_context: float = 0.75,
-        semantic_threshold_bypass: float = 1.01,
+        semantic_threshold_context: float = 0.85,
+        semantic_threshold_bypass: float = 0.95,
         max_semantic_candidates: int = 5,
+        allow_semantic_bypass: bool = True,
+        require_same_document_for_semantic_bypass: bool = True,
+        semantic_bypass_min_margin: float = 0.02,
+        require_evidence_support_for_semantic_bypass: bool = True,
+        semantic_direct_reuse_tasks: Optional[list[str]] = None,
+        semantic_bypass_max_answer_words: int = 12,
         embedding_model_id: str = "sentence-transformers/all-MiniLM-L6-v2",
         embedding_device: str = "auto",
         embedding_local_files_only: bool = False,
@@ -385,6 +501,9 @@ class BenchmarkConfig:
         total_requests: Optional[int] = None,
         repeat_fraction: float = 0.0,
     ) -> "BenchmarkConfig":
+        """
+        Convenience constructor used by benchmark scripts.
+        """
         cfg = cls(
             benchmark_name=benchmark_name,
             notes=notes,
@@ -433,6 +552,12 @@ class BenchmarkConfig:
                 semantic_threshold_context=semantic_threshold_context,
                 semantic_threshold_bypass=semantic_threshold_bypass,
                 max_semantic_candidates=max_semantic_candidates,
+                allow_semantic_bypass=allow_semantic_bypass,
+                require_same_document_for_semantic_bypass=require_same_document_for_semantic_bypass,
+                semantic_bypass_min_margin=semantic_bypass_min_margin,
+                require_evidence_support_for_semantic_bypass=require_evidence_support_for_semantic_bypass,
+                semantic_direct_reuse_tasks=semantic_direct_reuse_tasks or ["squad", "extractive_qa", "qa", "trec"],
+                semantic_bypass_max_answer_words=semantic_bypass_max_answer_words,
                 embedding_model_id=embedding_model_id,
                 embedding_device=embedding_device,
                 embedding_local_files_only=embedding_local_files_only,

@@ -7,7 +7,7 @@ This module sits above dataset loading and below benchmark execution.
 Responsibilities:
 - Load the base LongBench example set selected by BenchmarkConfig
 - Transform that base set into a benchmark workload sequence
-- Make replay / cache-pressure behavior explicit
+- Make replay / cache-pressure / paraphrase-family behavior explicit
 - Attach benchmark-specific metadata to each workload item
 
 This module does NOT:
@@ -19,12 +19,26 @@ This module does NOT:
 Design goal:
 Keep workload construction as parallel as possible to baseline so benchmark
 comparisons isolate architecture differences rather than workload differences.
+
+Verified paraphrase reuse relevance:
+- approx_interleaved is the main workload for testing second-pass paraphrases
+- family_clustered is useful for family-level consistency analysis
+- workload metadata should preserve family/base relationships so later analysis
+  can measure repeated-query and paraphrase-family behavior
+
+Temporary debug additions:
+- family-level prints inside _build_approx_interleaved()
+- assertions that enforce:
+    * pass 0 = originals only
+    * pass 1 = variants only
+These are intentionally loud while debugging workload correctness.
 """
 
 from __future__ import annotations
 
 import copy
 import json
+import math
 import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -35,6 +49,10 @@ from baseline.tiers.tier2_disk import DiskLoader
 
 Example = Dict[str, Any]
 
+
+# =============================================================================
+# Small helpers
+# =============================================================================
 
 def _safe_str(x: Any) -> str:
     if x is None:
@@ -50,7 +68,17 @@ def _first_nonempty(*values: Any) -> str:
     return ""
 
 
+def _is_paraphrase_mode(mode: str) -> bool:
+    """
+    Modes where family-aware semantics matter most.
+    """
+    return str(mode or "").strip() in {"approx_interleaved", "family_clustered"}
+
+
 def _family_id_for_example(ex: Example) -> str:
+    """
+    Stable family identifier for paraphrase-family workloads.
+    """
     return _first_nonempty(
         ex.get("family_id"),
         ex.get("original_row_id"),
@@ -63,34 +91,87 @@ def _variant_label(ex: Example) -> str:
     return _safe_str(ex.get("variant")).lower()
 
 
+def _example_id_text(ex: Example) -> str:
+    """
+    Stable string form of example_id for id-pattern heuristics.
+    """
+    return _safe_str(ex.get("example_id"))
+
+
 def _is_original_variant(ex: Example) -> bool:
-    v = _variant_label(ex)
-    if v == "original":
+    """
+    Stronger heuristic for identifying the original/base row within a paraphrase family.
+
+    Why this change:
+    - The previous version relied too heavily on paraphrase_index / missing fields
+    - In workload_paraphrase-style files, the safest original indicators are often:
+        * example_id == family_id
+        * example_id == original_row_id
+        * example_id does NOT contain a paraphrase suffix
+    - We also explicitly reject rows that look like paraphrases by id/variant/query fields
+    """
+    variant = _variant_label(ex)
+    ex_id = _example_id_text(ex)
+    family_id = _safe_str(ex.get("family_id"))
+    original_row_id = _safe_str(ex.get("original_row_id"))
+
+    # -------------------------------------------------------------------------
+    # Strong positive signals for original/base rows
+    # -------------------------------------------------------------------------
+    if variant == "original":
         return True
 
-    pidx = ex.get("paraphrase_index")
-    if pidx is not None:
+    if ex_id and family_id and ex_id == family_id:
+        return True
+
+    if ex_id and original_row_id and ex_id == original_row_id:
+        return True
+
+    # -------------------------------------------------------------------------
+    # Strong negative signals for paraphrase rows
+    # -------------------------------------------------------------------------
+    if ex.get("paraphrase_index") is not None:
         return False
 
-    if ex.get("family_id") or ex.get("original_row_id"):
-        # In paraphrase-family data, missing explicit variant but same row id family
-        # is usually the original/base row.
-        return not any(
-            _safe_str(ex.get(k))
-            for k in (
-                "paraphrase",
-                "paraphrase_text",
-                "paraphrased_question",
-                "question_paraphrase",
-                "query_paraphrase",
-                "variant_query",
-            )
-        )
+    if variant.startswith("para_") or variant in {"paraphrase", "rewrite", "rephrased"}:
+        return False
 
+    # Common id pattern in these workload files, e.g. squad_000083_para_0
+    if "_para_" in ex_id or ex_id.endswith(("_p0", "_p1", "_p2", "_p3")):
+        return False
+
+    # If any paraphrase-specific surface-form field is populated, treat as non-original.
+    if any(
+        _safe_str(ex.get(k))
+        for k in (
+            "paraphrase",
+            "paraphrase_text",
+            "paraphrased_question",
+            "question_paraphrase",
+            "query_paraphrase",
+            "variant_query",
+            "rewrite",
+            "rephrased_question",
+        )
+    ):
+        return False
+
+    # -------------------------------------------------------------------------
+    # Fallback rule:
+    # If this row belongs to a family and does not carry paraphrase signals,
+    # treat it as original.
+    # -------------------------------------------------------------------------
+    if family_id or original_row_id:
+        return True
+
+    # Standalone non-family rows are treated as originals.
     return True
 
 
 def _variant_sort_key(ex: Example) -> tuple[int, int, str]:
+    """
+    Sort original first, then paraphrases by paraphrase index if available.
+    """
     if _is_original_variant(ex):
         return (0, -1, "original")
 
@@ -174,18 +255,12 @@ def _limit_base_examples_for_mode(
     """
     Apply workload.max_examples after loading, with family-aware semantics for
     paraphrase/family modes.
-
-    Why:
-    - For approx_interleaved and family_clustered, max_examples should refer to
-      the number of *families/originals*, not raw JSONL rows.
-    - Truncating by raw row count can cut families in half and produce totals like
-      22 instead of the expected 24.
     """
     max_examples = workload_cfg.max_examples
     if max_examples is None or max_examples <= 0:
         return [dict(ex) for ex in examples]
 
-    if workload_cfg.mode in {"approx_interleaved", "family_clustered"}:
+    if _is_paraphrase_mode(workload_cfg.mode):
         groups = _group_by_family(examples)
         kept_family_ids = list(groups.keys())[:max_examples]
         out: List[Example] = []
@@ -198,16 +273,16 @@ def _limit_base_examples_for_mode(
     return [dict(ex) for ex in examples[:max_examples]]
 
 
+# =============================================================================
+# Loading
+# =============================================================================
+
 def _load_examples_from_jsonl(path: Path) -> List[Example]:
     """
     Load examples directly from a single JSONL file.
 
-    This is used when workload.task_glob is actually a direct file path rather
-    than a glob/pattern intended for DiskLoader.
-
-    Important:
-    - We intentionally load the full file first and apply max_examples later in a
-      family-aware way. This avoids cutting paraphrase families in half.
+    We intentionally load the full file first and apply max_examples later in a
+    family-aware way. This avoids cutting paraphrase families in half.
     """
     rows: List[Example] = []
 
@@ -222,9 +297,6 @@ def _load_examples_from_jsonl(path: Path) -> List[Example]:
                 continue
 
             ex = dict(ex)
-
-            # Preserve existing fields when present, but ensure the benchmark
-            # always has stable identifiers and source metadata.
             ex.setdefault("example_id", idx)
             ex.setdefault("task", ex.get("task") or path.stem)
             ex.setdefault("source_file", str(path.resolve()))
@@ -240,15 +312,10 @@ def load_base_examples(cfg: BenchmarkConfig) -> List[Example]:
     """
     Load the base example set.
 
-    Notes:
-    - workload.task_glob="" means "all task files"
-    - workload.max_examples applies to the base selection only
-    - examples are materialized into a list so replay / reordering is deterministic
-
     Behavior:
     - If workload.task_glob points to a real .jsonl file, load that file directly.
     - Otherwise, treat workload.task_glob as a pattern for DiskLoader.
-    - For paraphrase-aware modes, apply max_examples *after* loading in a
+    - For paraphrase-aware modes, apply max_examples after loading in a
       family-aware way.
     """
     cfg.validate()
@@ -261,8 +328,6 @@ def load_base_examples(cfg: BenchmarkConfig) -> List[Example]:
             rows = _load_examples_from_jsonl(task_path.resolve())
             return _limit_base_examples_for_mode(rows, cfg.workload)
 
-    # For non-direct-file loading, also avoid early truncation so family-aware
-    # selection can happen correctly downstream.
     disk = DiskLoader(
         repo_dir=cfg.tier2_repo,
         task_glob=task_glob,
@@ -272,30 +337,16 @@ def load_base_examples(cfg: BenchmarkConfig) -> List[Example]:
     return _limit_base_examples_for_mode(rows, cfg.workload)
 
 
+# =============================================================================
+# Workload sequence construction
+# =============================================================================
+
 def build_workload_sequence(
     examples: List[Example],
     workload_cfg: WorkloadConfig,
 ) -> List[Example]:
     """
     Build the benchmark sequence from the base example set.
-
-    Supported modes:
-    - cold:
-        Each selected example appears exactly once.
-    - replay_once:
-        Sequence is repeated one additional time.
-        Example: [A, B, C, A, B, C]
-    - replay_k:
-        Sequence is repeated replay_k total times.
-        Example with replay_k=3: [A, B, C, A, B, C, A, B, C]
-    - cache_pressure:
-        The first pass is preserved, then examples are revisited in a
-        delayed/interleaved pattern that is more likely to cause RAM eviction
-        and expose disk-tier reuse.
-
-    Shuffle behavior:
-    - Applied to the base example list before mode expansion.
-    - Controlled by workload_cfg.shuffle and workload_cfg.seed.
     """
     workload_cfg.validate()
 
@@ -339,26 +390,16 @@ def build_workload_sequence(
     raise ValueError(f"Unsupported workload mode: {workload_cfg.mode!r}")
 
 
+# =============================================================================
+# Metadata annotation
+# =============================================================================
+
 def annotate_workload_positions(
     sequence: List[Example],
     workload_cfg: WorkloadConfig,
 ) -> List[Example]:
     """
     Attach benchmark-specific metadata to each workload item.
-
-    Added fields:
-    - workload_mode
-    - workload_pos
-    - workload_repeat_index
-    - workload_pass
-    - base_example_id
-    - base_task
-    - base_source_file
-
-    Important:
-    - The original example_id is preserved
-    - Benchmark metadata is additive
-    - For paraphrase/family modes, repeat accounting is family-aware
     """
     annotated: List[Example] = []
     seen_counts: Dict[Any, int] = {}
@@ -366,7 +407,7 @@ def annotate_workload_positions(
     for pos, ex in enumerate(sequence):
         item = dict(ex)
 
-        if workload_cfg.mode in {"approx_interleaved", "family_clustered"}:
+        if _is_paraphrase_mode(workload_cfg.mode):
             anchor_id = _family_id_for_example(item)
         else:
             anchor_id = item.get("example_id")
@@ -382,6 +423,10 @@ def annotate_workload_positions(
         item["base_example_id"] = anchor_id
         item["base_task"] = item.get("task")
         item["base_source_file"] = item.get("source_file")
+
+        item["family_id"] = _family_id_for_example(item)
+        item["variant_label"] = _variant_label(item) or ("original" if _is_original_variant(item) else "variant")
+        item["is_original_variant"] = bool(_is_original_variant(item))
 
         annotated.append(item)
 
@@ -420,6 +465,10 @@ def prepare_workload(cfg: BenchmarkConfig) -> List[Example]:
     return annotated
 
 
+# =============================================================================
+# Manifest helpers
+# =============================================================================
+
 def build_workload_manifest(
     cfg: BenchmarkConfig,
     workload: List[Example],
@@ -430,6 +479,14 @@ def build_workload_manifest(
     unique_ids = sorted({ex.get("base_example_id", ex.get("example_id")) for ex in workload})
     tasks = sorted({ex.get("task") for ex in workload if ex.get("task") is not None})
     source_files = sorted({ex.get("source_file") for ex in workload if ex.get("source_file")})
+    family_ids = sorted({ex.get("family_id") for ex in workload if ex.get("family_id")})
+    variant_rows = [ex for ex in workload if not bool(ex.get("is_original_variant", False))]
+
+    observed_repeat_requests = max(0, len(workload) - len(unique_ids))
+    observed_repeat_rate = (
+        observed_repeat_requests / len(workload)
+        if workload else 0.0
+    )
 
     return {
         "benchmark_name": cfg.benchmark_name,
@@ -440,6 +497,8 @@ def build_workload_manifest(
         "base_max_examples": cfg.workload.max_examples,
         "total_workload_examples": len(workload),
         "unique_base_examples": len(unique_ids),
+        "unique_families": len(family_ids),
+        "variant_rows": len(variant_rows),
         "tasks": tasks,
         "source_files": source_files,
         "shuffle": cfg.workload.shuffle,
@@ -448,10 +507,30 @@ def build_workload_manifest(
         "ram_capacity_items": cfg.memory.ram_capacity_items,
         "disk_store_path": cfg.resolved_disk_store_path(),
         "retrieval_mode": cfg.memory.retrieval_mode,
+        "lexical_enabled": cfg.memory.lexical_enabled,
+        "lexical_threshold_context": cfg.memory.lexical_threshold_context,
+        "lexical_threshold_bypass": cfg.memory.lexical_threshold_bypass,
+        "lexical_top_k": cfg.memory.lexical_top_k,
+        "prefer_same_source": cfg.memory.prefer_same_source,
+        "safe_direct_reuse_tasks": list(cfg.memory.safe_direct_reuse_tasks),
         "semantic_enabled": cfg.memory.semantic_enabled,
         "semantic_threshold_context": cfg.memory.semantic_threshold_context,
         "semantic_threshold_bypass": cfg.memory.semantic_threshold_bypass,
         "max_semantic_candidates": cfg.memory.max_semantic_candidates,
+        "allow_semantic_bypass": getattr(cfg.memory, "allow_semantic_bypass", True),
+        "require_same_document_for_semantic_bypass": getattr(
+            cfg.memory, "require_same_document_for_semantic_bypass", True
+        ),
+        "semantic_bypass_min_margin": getattr(cfg.memory, "semantic_bypass_min_margin", 0.02),
+        "require_evidence_support_for_semantic_bypass": getattr(
+            cfg.memory, "require_evidence_support_for_semantic_bypass", True
+        ),
+        "semantic_direct_reuse_tasks": list(
+            getattr(cfg.memory, "semantic_direct_reuse_tasks", ["squad", "extractive_qa", "qa", "trec"])
+        ),
+        "semantic_bypass_max_answer_words": getattr(
+            cfg.memory, "semantic_bypass_max_answer_words", 12
+        ),
         "embedding_model_id": cfg.memory.embedding_model_id,
         "promote_disk_hits_to_ram": cfg.memory.promote_disk_hits_to_ram,
         "return_memory_directly": cfg.memory.return_memory_directly,
@@ -468,11 +547,8 @@ def build_workload_manifest(
         },
         "total_requests": cfg.workload.total_requests,
         "repeat_fraction": cfg.workload.repeat_fraction,
-        "observed_repeat_requests": max(0, len(workload) - len(unique_ids)),
-        "observed_repeat_rate": (
-            max(0, len(workload) - len(unique_ids)) / len(workload)
-            if workload else 0.0
-        ),
+        "observed_repeat_requests": observed_repeat_requests,
+        "observed_repeat_rate": observed_repeat_rate,
     }
 
 
@@ -488,10 +564,9 @@ def group_workload_by_base_id(workload: List[Example]) -> Dict[Any, List[Example
     return grouped
 
 
-# ---------------------------------------------------------------------
+# =============================================================================
 # Internal builders
-# ---------------------------------------------------------------------
-
+# =============================================================================
 
 def _clone_example(ex: Example) -> Example:
     return copy.deepcopy(ex)
@@ -517,6 +592,9 @@ def _build_replay_k(base: List[Example], replay_k: int) -> List[Example]:
 
 
 def _build_cache_pressure(base: List[Example]) -> List[Example]:
+    """
+    First pass, then delayed even/odd revisits to apply RAM pressure.
+    """
     out: List[Example] = []
 
     for ex in base:
@@ -561,11 +639,17 @@ def _build_mixed_reuse(
             f"total_requests ({total_requests}) must be >= number of selected base examples ({n_unique})"
         )
 
-    n_repeats = total_requests - n_unique
+    target_repeats = int(math.floor(float(total_requests) * float(repeat_fraction)))
+    max_possible_repeats = total_requests - n_unique
+    n_repeats = min(target_repeats, max_possible_repeats)
 
     out: List[Example] = [_clone_example(ex) for ex in unique_pool]
 
     for _ in range(n_repeats):
+        src = rng.choice(base)
+        out.append(_clone_example(src))
+
+    while len(out) < total_requests:
         src = rng.choice(base)
         out.append(_clone_example(src))
 
@@ -574,6 +658,9 @@ def _build_mixed_reuse(
 
 
 def _build_exact_interleaved(base: List[Example]) -> List[Example]:
+    """
+    Build [all originals] + [same exact questions again].
+    """
     out: List[Example] = []
 
     for ex in base:
@@ -587,9 +674,15 @@ def _build_exact_interleaved(base: List[Example]) -> List[Example]:
 
 def _build_approx_interleaved(base: List[Example]) -> List[Example]:
     """
-    Build [all originals] + [one paraphrase per same family].
+    Build an interleaved approximate-reuse workload:
+    [orig A, para A, orig B, para B, ...]
 
     This is the key workload for approximate reuse testing.
+
+    Critical behavior:
+    - each original must appear before its paired paraphrase
+    - each paraphrase should be close enough to its original for reuse
+    - never silently use a paraphrase as the family's "original"
     """
     groups = _group_by_family(base)
     out: List[Example] = []
@@ -597,52 +690,153 @@ def _build_approx_interleaved(base: List[Example]) -> List[Example]:
     originals: List[Example] = []
     variants: List[Example] = []
 
-    for fam in groups.values():
+    # Deterministic family order helps debugging and reproducibility.
+    for fid in sorted(groups.keys()):
+        fam = groups[fid]
         fam_sorted = sorted(fam, key=_variant_sort_key)
         if not fam_sorted:
             continue
 
-        original = None
+        # ---------------------------------------------------------------------
+        # DEBUG: print family composition and original classification
+        # ---------------------------------------------------------------------
+        print(f"[DEBUG] FAMILY {fid}")
         for ex in fam_sorted:
-            if _is_original_variant(ex):
-                original = ex
-                break
-        if original is None:
-            original = fam_sorted[0]
+            print(
+                "  ID:", _example_id_text(ex),
+                "| is_original:", _is_original_variant(ex),
+                "| variant:", _variant_label(ex),
+                "| paraphrase_index:", ex.get("paraphrase_index"),
+                "| family_id:", _safe_str(ex.get("family_id")),
+                "| original_row_id:", _safe_str(ex.get("original_row_id")),
+            )
 
-        non_originals = [ex for ex in fam_sorted if ex is not original]
+        # ---------------------------------------------------------------------
+        # Pick the original/base row conservatively.
+        # Do NOT fall back to fam_sorted[0], because that can accidentally be a
+        # paraphrase when family labeling is imperfect.
+        # ---------------------------------------------------------------------
+        original_candidates = [ex for ex in fam_sorted if _is_original_variant(ex)]
+
+        if not original_candidates:
+            # Try one last id-based rescue before skipping the family.
+            original_candidates = [
+                ex for ex in fam_sorted
+                if _example_id_text(ex) == fid
+                or _example_id_text(ex) == _safe_str(ex.get("original_row_id"))
+            ]
+
+        if not original_candidates:
+            print(f"[DEBUG] SKIP FAMILY {fid}: no original candidate found")
+            continue
+
+        original = original_candidates[0]
+        original_q = _safe_str(_normalize_query_fields(original).get("query_text"))
+
+        # ---------------------------------------------------------------------
+        # Pick a true non-original variant whose query surface differs from the
+        # original query.
+        # ---------------------------------------------------------------------
+        non_originals: List[Example] = []
+        for ex in fam_sorted:
+            if ex is original:
+                continue
+            if _is_original_variant(ex):
+                continue
+
+            norm_ex = _normalize_query_fields(ex)
+            ex_q = _safe_str(norm_ex.get("query_text"))
+
+            # Skip duplicates of the original surface form.
+            if ex_q and original_q and ex_q == original_q:
+                continue
+
+            non_originals.append(ex)
+
         if not non_originals:
-            # No paraphrase partner => skip this family from approx_interleaved.
+            print(f"[DEBUG] SKIP FAMILY {fid}: no usable paraphrase variant found")
             continue
 
         variant = sorted(non_originals, key=_variant_sort_key)[0]
 
-        orig_item = _clone_example(original)
-        var_item = _clone_example(variant)
+        orig_item = _normalize_query_fields(_clone_example(original))
+        var_item = _normalize_query_fields(_clone_example(variant))
 
-        fid = _family_id_for_example(original)
         orig_item["approx_family_id"] = fid
         orig_item["approx_role"] = "original"
+        orig_item["is_original_variant"] = True
+
         var_item["approx_family_id"] = fid
         var_item["approx_role"] = "variant"
+        var_item["is_original_variant"] = False
 
-        # Re-normalize query fields to ensure the variant actually uses paraphrase text.
-        orig_item = _normalize_query_fields(orig_item)
-        var_item = _normalize_query_fields(var_item)
+        # ---------------------------------------------------------------------
+        # DEBUG assertions for each selected pair
+        # ---------------------------------------------------------------------
+        assert orig_item["approx_role"] == "original"
+        assert var_item["approx_role"] == "variant"
+
+        print(
+            f"[DEBUG] SELECT FAMILY {fid}: "
+            f"original={_example_id_text(orig_item)} "
+            f"variant={_example_id_text(var_item)}"
+        )
 
         originals.append(orig_item)
         variants.append(var_item)
 
-    for ex in originals:
-        out.append(ex)
+    for orig, var in zip(originals, variants):
+        out.append(orig)
+        out.append(var)
 
-    for ex in variants:
-        out.append(ex)
+    # -------------------------------------------------------------------------
+    # DEBUG assertions across the final workload shape
+    # -------------------------------------------------------------------------
+    # for i, ex in enumerate(out[:len(originals)]):
+    #     assert ex["approx_role"] == "original", f"Bad pass0 at {i}: {ex.get('example_id')}"
+
+    # for i, ex in enumerate(out[len(originals):]):
+    #     assert ex["approx_role"] == "variant", f"Bad pass1 at {i}: {ex.get('example_id')}"
+    for i in range(0, len(out), 2):
+        assert out[i]["approx_role"] == "original", (
+            f"Bad interleaved original at {i}: {out[i].get('example_id')}"
+        )
+        if i + 1 < len(out):
+            assert out[i + 1]["approx_role"] == "variant", (
+                f"Bad interleaved variant at {i+1}: {out[i+1].get('example_id')}"
+            )
+            assert out[i]["approx_family_id"] == out[i + 1]["approx_family_id"], (
+                f"Family mismatch at pair starting {i}: "
+                f"{out[i].get('approx_family_id')} vs {out[i+1].get('approx_family_id')}"
+            )
+
+    print(
+        f"[DEBUG] APPROX_INTERLEAVED BUILT: "
+        f"{len(originals)} interleaved original/variant pairs"
+    )
+
+    for i in range(0, min(len(out), 12), 2):
+        if i + 1 < len(out):
+            print(
+                "[ORDER CHECK]",
+                i,
+                _example_id_text(out[i]),
+                out[i].get("approx_role"),
+                "->",
+                _example_id_text(out[i + 1]),
+                out[i + 1].get("approx_role"),
+                "| family:",
+                out[i].get("approx_family_id"),
+                flush=True,
+            )
 
     return out
 
 
 def _build_family_clustered(base: List[Example]) -> List[Example]:
+    """
+    Keep each family grouped together in stable family order.
+    """
     groups = _group_by_family(base)
     out: List[Example] = []
 

@@ -1,31 +1,3 @@
-# memarch/benchmarks/execute.py
-"""
-Benchmark execution for the memarch LongBench pipeline.
-
-Responsibilities:
-- Build a workload sequence using memarch.benchmarks.workload
-- Initialize RAM store, disk store, memory manager, embedder, and generator
-- Run the workload through memarch retrieval/generation
-- Log benchmark-aware records to JSONL
-- Save a workload manifest next to the run
-- Optionally write a summary JSON after completion
-
-Design goal:
-Keep the benchmark protocol parallel to baseline while exposing richer
-multi-tier behavior:
-- exact RAM hit vs exact disk hit vs lexical-assisted generation vs semantic-assisted generation vs compute miss
-- whether generation was bypassed
-- whether lexical or semantic retrieval was used
-- whether disk hits were promoted to RAM
-- storage decisions
-- timing breakdowns
-
-Evidence-guided extension:
-- build MemoryQuery objects with cheap document/source metadata
-- derive a compact evidence snippet from dataset context
-- preserve low latency by using only lexical heuristics here
-"""
-
 from __future__ import annotations
 
 import hashlib
@@ -420,9 +392,38 @@ def _extract_context_text(example: Dict[str, Any]) -> str:
 
 
 def _extract_doc_signature(example: Dict[str, Any], *, context_text: str) -> str:
+    """
+    Build a stable document signature for same-document reuse.
+
+    Priority order:
+    1. explicit doc_signature if already present
+    2. paraphrase-family identifiers
+    3. stable source/document ids
+    4. deterministic fallback hash over task + source file + context text
+    """
     existing = example.get("doc_signature")
     if isinstance(existing, str) and existing.strip():
         return existing.strip()
+
+    for key in (
+        "family_id",
+        "original_row_id",
+        "base_example_id",
+        "source_id",
+        "_id",
+        "id",
+        "doc_id",
+        "document_id",
+        "article_id",
+        "passage_id",
+        "title",
+    ):
+        value = example.get(key)
+        if value is None:
+            continue
+        sval = str(value).strip()
+        if sval:
+            return _sha256_text(f"docsig::{example.get('task', '')}::{key}::{sval}")
 
     return _sha256_text(
         f"{example.get('task', '')}||{example.get('source_file', '')}||{context_text}"
@@ -498,9 +499,6 @@ def _infer_question_type(example: Dict[str, Any], query_text: str) -> str:
 
 
 def _build_answer_canonical(example: Dict[str, Any]) -> Optional[str]:
-    """
-    Cheap task-specific answer normalization from reference labels when available.
-    """
     task = str(example.get("task") or "").strip().lower()
 
     if task == "trec":
@@ -518,9 +516,6 @@ def _build_answer_canonical(example: Dict[str, Any]) -> Optional[str]:
 
 
 def _pick_best_overlap_window(query_text: str, context_text: str, *, window_chars: int = 320) -> str:
-    """
-    Cheap lexical evidence extraction.
-    """
     ctx = _normalize_ws(context_text)
     if not ctx:
         return ""
@@ -582,6 +577,19 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
     evidence_text = _pick_best_overlap_window(query_text, context_text)
     answer_canonical = _build_answer_canonical(example)
 
+    print(
+        "[EXECUTE DOCSIG]",
+        {
+            "example_id": example.get("example_id"),
+            "family_id": example.get("family_id"),
+            "original_row_id": example.get("original_row_id"),
+            "base_example_id": example.get("base_example_id"),
+            "source_id": example.get("source_id"),
+            "doc_signature": doc_signature,
+        },
+        flush=True,
+    )
+
     retrieval_mode = str(getattr(cfg.memory, "retrieval_mode", "exact_only")).strip()
 
     allow_semantic = bool(getattr(cfg.memory, "semantic_enabled", False)) and retrieval_mode in {
@@ -627,11 +635,6 @@ def _build_memory_query(example: Dict[str, Any], cfg: BenchmarkConfig) -> Memory
 
 
 def _init_ram_store(cfg: BenchmarkConfig) -> Any:
-    """
-    Initialize RAM store with both:
-    - a generous byte budget
-    - an explicit item-count cap for benchmark control
-    """
     return RamStoreLRU(
         max_mb=int(getattr(cfg.memory, "ram_max_mb", 64)),
         max_items=int(cfg.memory.ram_capacity_items),
@@ -682,14 +685,10 @@ def _init_generator(cfg: BenchmarkConfig) -> HFGenerator:
         use_kv_cache=bool(getattr(cfg, "use_kv_cache", True)),
         include_retrieved_memory_context=bool(getattr(cfg, "include_retrieved_memory_context", True)),
         include_dataset_context=bool(getattr(cfg, "include_dataset_context", True)),
-        include_doc_signature=bool(getattr(cfg, "include_doc_signature", False)),
+        include_doc_signature=bool(getattr(cfg, "include_doc_signature", True)),
         prefer_retrieved_evidence_context=bool(getattr(cfg, "prefer_retrieved_evidence_context", True)),
         reduce_context_on_semantic_hit=bool(getattr(cfg, "reduce_context_on_semantic_hit", True)),
-        # max_evidence_chars=int(getattr(cfg, "max_evidence_chars", 400)),
-        # max_local_context_chars=int(getattr(cfg, "max_local_context_chars", 260)),
-        # max_full_context_chars=int(getattr(cfg, "max_full_context_chars", 1200)),
         prefer_local_context_for_qa=bool(getattr(cfg, "prefer_local_context_for_qa", True)),
-        # qa_max_output_words=int(getattr(cfg, "qa_max_output_words", 6)),
         trec_use_few_shot=bool(getattr(cfg, "trec_use_few_shot", False)),
         skip_special_tokens=bool(getattr(cfg, "skip_special_tokens", True)),
     )
@@ -930,6 +929,8 @@ def _build_ok_record(
         "promoted_to_ram": bool(meta.get("promoted_to_ram", False)),
         "stored": meta.get("stored"),
         "stored_scopes": meta.get("stored_scopes", []),
+        "store_debug": meta.get("store"),
+        "store_skipped": meta.get("store_skipped"),
 
         "doc_signature": example.get("doc_signature") or meta.get("doc_signature"),
         "query_question_type": meta.get("question_type") or example.get("question_type"),
@@ -1037,8 +1038,6 @@ def _build_ok_record(
 
         "ram_stats_after": _ram_stats(ram),
         "disk_stats_after": _disk_stats(disk),
-
-        "store_skipped": meta.get("store_skipped"),
     }
 
 
@@ -1204,6 +1203,24 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
                 timings_ms = dict(meta.get("timings_ms") or {})
                 gen_meta_after = dict(getattr(generator, "last_generation_meta", {}) or {})
 
+                # Make storage behavior explicit at executor level.
+                print(
+                    "[EXECUTE ANSWER META]",
+                    {
+                        "example_id": ex.get("example_id"),
+                        "raw_query": getattr(mq, "raw_query", None),
+                        "generated": meta.get("generated"),
+                        "used_memory": meta.get("used_memory"),
+                        "stored": meta.get("stored"),
+                        "stored_scopes": meta.get("stored_scopes"),
+                        "retrieval_stage": meta.get("retrieval_stage"),
+                        "doc_signature": meta.get("doc_signature") or getattr(mq, "doc_signature", None),
+                        "store_present": "store" in meta,
+                        "store_skipped_present": "store_skipped" in meta,
+                    },
+                    flush=True,
+                )
+
                 meta.setdefault("doc_signature", getattr(mq, "doc_signature", None))
                 meta.setdefault("source_file", getattr(mq, "source_file", None))
                 meta.setdefault("source_id", getattr(mq, "source_id", None))
@@ -1282,7 +1299,6 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
 
             logger.write(record)
 
-        # Refresh runtime info at the end in case device/dtype changed via fallback
         generator_info_final = _safe_component_info(generator)
         embedder_info_final = _safe_component_info(embedder)
 

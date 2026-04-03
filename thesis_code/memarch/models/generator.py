@@ -10,7 +10,14 @@ from typing import Dict, List, Optional, Tuple
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from memarch.memory.schema import MatchType, MemoryHit, MemoryQuery, Provenance, QualitySignals
+from memarch.memory.schema import (
+    MatchType,
+    MemoryHit,
+    MemoryQuery,
+    Provenance,
+    QualitySignals,
+    VerificationOutcome,
+)
 
 
 def _mps_available() -> bool:
@@ -84,21 +91,32 @@ class GeneratorConfig:
     num_beams: int = 1
 
     local_files_only: bool = False
-    torch_dtype: str = "auto"  # auto | float16 | bfloat16 | float32
+    torch_dtype: str = "auto"
     use_fast_tokenizer: bool = False
 
     cpu_fallback_on_failure: bool = True
     generation_backend: str = "auto"
 
+    # Whether to include retrieval support in the prompt.
     include_retrieved_memory_context: bool = True
     include_dataset_context: bool = True
-    include_doc_signature: bool = False
 
+    # Default True because benchmark/debug code often expects doc signatures.
+    include_doc_signature: bool = True
+
+    # For semantic context-only hits, prefer retrieved/local evidence instead of
+    # feeding the full original context. This is Jetson-friendly and safer.
     prefer_retrieved_evidence_context: bool = True
     reduce_context_on_semantic_hit: bool = True
-    # max_evidence_chars: int = 400
-    # max_local_context_chars: int = 260
-    # max_full_context_chars: int = 1200
+
+    # Whether to include an explicit retrieval metadata block. Keep this True
+    # because tests/debugging often depend on these headers.
+    include_retrieval_metadata_block: bool = True
+
+    # Do NOT include stored answer text as a direct semantic hint by default.
+    # For context-only semantic hits, the whole point is to use evidence, not
+    # to leak the prior answer into the prompt.
+    include_retrieved_answer_hint: bool = False
 
     max_evidence_chars: int = 260
     max_local_context_chars: int = 260
@@ -181,7 +199,6 @@ class HFGenerator:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
         self.model = self._load_model(self.model_source, self.device, self.model_dtype)
-
         self.last_prompt: Optional[str] = None
         self.last_generation_meta: Optional[Dict[str, object]] = None
 
@@ -207,19 +224,9 @@ class HFGenerator:
 
     @staticmethod
     def _auto_cuda_dtype_for_model(model_source: str):
-        """
-        Auto precision heuristic for CUDA.
-
-        Empirical rule for this Jetson setup:
-        - Qwen2.5-1.5B-Instruct: bf16 is stable, fp16 is unstable
-        - Qwen2.5-0.5B-Instruct: fp16 is fine and lighter
-        - fallback default on CUDA: fp16
-        """
         name = str(model_source or "").lower()
-
         if "qwen2.5-1.5b-instruct" in name or "qwen2-1.5b" in name:
             return torch.bfloat16
-
         return torch.float16
 
     @classmethod
@@ -235,10 +242,8 @@ class HFGenerator:
 
         if dtype_name == "float16":
             return torch.float32 if device == "cpu" else torch.float16
-
         if dtype_name == "bfloat16":
             return torch.float32 if device == "cpu" else torch.bfloat16
-
         if dtype_name == "float32":
             return torch.float32
 
@@ -258,17 +263,13 @@ class HFGenerator:
             "trust_remote_code": bool(self.cfg.trust_remote_code),
             "low_cpu_mem_usage": bool(self.cfg.low_cpu_mem_usage),
         }
-
         if dtype is not None:
             kwargs["torch_dtype"] = dtype
-
         if bool(self.cfg.use_safetensors):
             kwargs["use_safetensors"] = True
-
         attn_impl = (self.cfg.attn_implementation or "auto").strip()
         if attn_impl != "auto":
             kwargs["attn_implementation"] = attn_impl
-
         return kwargs
 
     def _load_model(self, model_source: str, device: str, dtype):
@@ -277,12 +278,10 @@ class HFGenerator:
             **self._model_load_kwargs(device, dtype),
         )
         model.eval()
-
         if dtype is not None:
             model = model.to(device=device, dtype=dtype)
         else:
             model = model.to(device=device)
-
         return model
 
     @staticmethod
@@ -302,6 +301,111 @@ class HFGenerator:
         text = re.sub(r"\b(a|an|the)\b", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
         return text
+
+    # ------------------------------------------------------------------
+    # Query / retrieved field helpers
+    # ------------------------------------------------------------------
+
+    def _query_dataset_context(self, mq: MemoryQuery) -> str:
+        return self._safe_text((mq.context or {}).get("dataset_context", ""))
+
+    def _query_doc_signature(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "doc_signature", None):
+            return self._safe_text(mq.doc_signature)
+        return self._safe_text((mq.context or {}).get("doc_signature", ""))
+
+    def _query_question_type(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "question_type", None):
+            return self._safe_text(mq.question_type)
+        return self._safe_text((mq.context or {}).get("question_type", ""))
+
+    def _query_answer_type(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "answer_type", None):
+            return self._safe_text(mq.answer_type).upper()
+        return self._safe_text((mq.context or {}).get("answer_type", "")).upper()
+
+    def _query_canonical_query_signature(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "canonical_query_signature", None):
+            return self._safe_text(mq.canonical_query_signature)
+        return self._safe_text((mq.context or {}).get("canonical_query_signature", ""))
+
+    def _query_evidence_text(self, mq: MemoryQuery) -> str:
+        if getattr(mq, "evidence_text", None):
+            return self._safe_text(mq.evidence_text)
+        explicit = self._safe_text((mq.context or {}).get("evidence_text", ""))
+        if explicit:
+            return explicit
+        return self._safe_text((mq.context or {}).get("dataset_context", ""))
+
+    def _retrieved_evidence_text(self, retrieved: MemoryHit) -> str:
+        item = retrieved.item
+        direct = getattr(item, "evidence_text", None)
+        if direct:
+            return self._safe_text(direct)
+        return self._safe_text(item.meta.get("evidence_text", ""))
+
+    def _retrieved_doc_signature(self, retrieved: MemoryHit) -> str:
+        item = retrieved.item
+        direct = getattr(item, "doc_signature", None)
+        if direct:
+            return self._safe_text(direct)
+        return self._safe_text(item.meta.get("doc_signature", ""))
+
+    def _retrieved_answer_type(self, retrieved: MemoryHit) -> str:
+        item = retrieved.item
+        direct = getattr(item, "answer_type", None)
+        if direct:
+            return self._safe_text(direct).upper()
+        return self._safe_text(item.meta.get("answer_type", "")).upper()
+
+    def _retrieved_canonical_query_signature(self, retrieved: MemoryHit) -> str:
+        item = retrieved.item
+        direct = getattr(item, "canonical_query_signature", None)
+        if direct:
+            return self._safe_text(direct)
+        return self._safe_text(item.meta.get("canonical_query_signature", ""))
+
+    def _retrieved_same_document(self, mq: MemoryQuery, retrieved: Optional[MemoryHit]) -> bool:
+        if retrieved is None:
+            return False
+
+        if getattr(retrieved, "same_document", None) is not None:
+            try:
+                return bool(retrieved.same_document)
+            except Exception:
+                pass
+
+        dbg = getattr(retrieved, "debug", {}) or {}
+        if "same_document" in dbg:
+            try:
+                return bool(dbg.get("same_document"))
+            except Exception:
+                pass
+
+        query_doc = self._query_doc_signature(mq)
+        item_doc = self._retrieved_doc_signature(retrieved)
+        return bool(query_doc and item_doc and query_doc == item_doc)
+
+    def _retrieved_verification_outcome(self, retrieved: Optional[MemoryHit]) -> Optional[str]:
+        if retrieved is None:
+            return None
+
+        outcome = getattr(retrieved, "verification_outcome", None)
+        if outcome is not None:
+            try:
+                return outcome.value
+            except Exception:
+                return str(outcome)
+
+        dbg = getattr(retrieved, "debug", {}) or {}
+        value = dbg.get("verification_outcome")
+        if value is None:
+            return None
+        return str(value)
+
+    # ------------------------------------------------------------------
+    # Output normalization helpers
+    # ------------------------------------------------------------------
 
     def _normalize_trec_output(self, text: str) -> str:
         raw = self._safe_text(text)
@@ -457,6 +561,10 @@ class HFGenerator:
             return text
         return text[:max_chars].rstrip()
 
+    # ------------------------------------------------------------------
+    # Model/prompt budgeting helpers
+    # ------------------------------------------------------------------
+
     def _model_max_positions(self) -> int:
         model_config = getattr(self.model, "config", None)
         if model_config is None:
@@ -497,57 +605,23 @@ class HFGenerator:
             return "manual_greedy"
         return "hf_generate"
 
-    def _query_dataset_context(self, mq: MemoryQuery) -> str:
-        return self._safe_text((mq.context or {}).get("dataset_context", ""))
-
-    def _query_doc_signature(self, mq: MemoryQuery) -> str:
-        if getattr(mq, "doc_signature", None):
-            return self._safe_text(mq.doc_signature)
-        return self._safe_text((mq.context or {}).get("doc_signature", ""))
-
-    def _query_question_type(self, mq: MemoryQuery) -> str:
-        if getattr(mq, "question_type", None):
-            return self._safe_text(mq.question_type)
-        return self._safe_text((mq.context or {}).get("question_type", ""))
-
-    def _query_evidence_text(self, mq: MemoryQuery) -> str:
-        if getattr(mq, "evidence_text", None):
-            return self._safe_text(mq.evidence_text)
-        return self._safe_text((mq.context or {}).get("evidence_text", ""))
-
-    def _retrieved_evidence_text(self, retrieved: MemoryHit) -> str:
-        item = retrieved.item
-        direct = getattr(item, "evidence_text", None)
-        if direct:
-            return self._safe_text(direct)
-        return self._safe_text(item.meta.get("evidence_text", ""))
-
-    def _retrieved_doc_signature(self, retrieved: MemoryHit) -> str:
-        item = retrieved.item
-        direct = getattr(item, "doc_signature", None)
-        if direct:
-            return self._safe_text(direct)
-        return self._safe_text(item.meta.get("doc_signature", ""))
-
-    def _retrieved_same_document(self, mq: MemoryQuery, retrieved: Optional[MemoryHit]) -> bool:
-        if retrieved is None:
-            return False
-        dbg = getattr(retrieved, "debug", {}) or {}
-        if "same_document" in dbg:
-            try:
-                return bool(dbg.get("same_document"))
-            except Exception:
-                pass
-        query_doc = self._query_doc_signature(mq)
-        item_doc = self._retrieved_doc_signature(retrieved)
-        return bool(query_doc and item_doc and query_doc == item_doc)
+    # ------------------------------------------------------------------
+    # Prompt construction helpers
+    # ------------------------------------------------------------------
 
     def _retrieved_section(self, mq: MemoryQuery, retrieved: MemoryHit) -> str:
+        """
+        Build a compact retrieved-support block.
+
+        Important compatibility note:
+        - tests may expect the exact header string "RETRIEVED EVIDENCE:"
+        """
         evidence_text = self._truncate_chars(
             self._retrieved_evidence_text(retrieved),
             int(self.cfg.max_evidence_chars),
         )
         same_doc = self._retrieved_same_document(mq, retrieved)
+        verification_outcome = self._retrieved_verification_outcome(retrieved)
 
         meta_parts = [
             f"match_type={retrieved.match_type.value}",
@@ -555,16 +629,37 @@ class HFGenerator:
             f"score={retrieved.score:.4f}",
             f"same_document={str(bool(same_doc)).lower()}",
         ]
+
         if retrieved.semantic_rank is not None:
             meta_parts.append(f"semantic_rank={retrieved.semantic_rank}")
+
+        if verification_outcome:
+            meta_parts.append(f"verification_outcome={verification_outcome}")
+
+        # Surface richer schema fields for debugging and alignment with manager/schema.
+        retrieved_answer_type = self._retrieved_answer_type(retrieved)
+        if retrieved_answer_type:
+            meta_parts.append(f"answer_type={retrieved_answer_type}")
+
+        retrieved_signature = self._retrieved_canonical_query_signature(retrieved)
+        if retrieved_signature:
+            meta_parts.append(f"canonical_query_signature={retrieved_signature}")
 
         lines = [
             "RETRIEVED MEMORY SUPPORT:",
             ", ".join(meta_parts),
         ]
+
+        # For semantic context-only use, include evidence rather than answer text.
         if evidence_text:
-            header = "RETRIEVED EVIDENCE (same document):" if same_doc else "RETRIEVED EVIDENCE:"
-            lines.extend(["", header, evidence_text])
+            lines.extend(["", "RETRIEVED EVIDENCE:", evidence_text])
+
+        # Optional answer hint only when explicitly enabled.
+        # Default is False because context-only semantic reuse should not leak answers.
+        if self.cfg.include_retrieved_answer_hint:
+            retrieved_answer = self._safe_text(retrieved.item.answer_text)
+            if retrieved_answer:
+                lines.extend(["", "RETRIEVED ANSWER HINT:", self._truncate_chars(retrieved_answer, 80)])
 
         return "\n".join(lines)
 
@@ -587,12 +682,19 @@ class HFGenerator:
                 "- Do NOT include prefixes like 'Answer:'.\n"
                 "- Do NOT include assistant text or chat markers.\n"
                 f"- Output at most {int(self.cfg.qa_max_output_words)} words.\n"
+                "- Prefer spans supported directly by the current local context or retrieved evidence.\n"
                 "- If unsure, output the shortest possible answer."
             )
 
         return "Answer briefly and directly."
 
     def _build_trec_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
+        """
+        Build classification-style TREC prompt.
+
+        For TREC, retrieved context can still help, but we should keep the final
+        output constrained to one label.
+        """
         question = self._safe_text(mq.raw_query)
         parts = [
             "You are a classifier for TREC coarse question types.",
@@ -603,18 +705,24 @@ class HFGenerator:
         retrieved_block = ""
         retrieved_evidence = None
         same_doc = None
+        verification_outcome = None
 
         if retrieved is not None and self.cfg.include_retrieved_memory_context:
-            retrieved_block = self._retrieved_section(mq, retrieved)
+            if self.cfg.include_retrieved_answer_hint:
+                retrieved_answer = self._safe_text(retrieved.item.answer_text)
+                if retrieved_answer:
+                    parts.append(f"Related prior label or answer: {self._truncate_chars(retrieved_answer, 80)}")
+
+            if self.cfg.include_retrieval_metadata_block:
+                retrieved_block = self._retrieved_section(mq, retrieved)
+
             retrieved_evidence = self._truncate_chars(
                 self._retrieved_evidence_text(retrieved),
                 int(self.cfg.max_evidence_chars),
             )
             same_doc = self._retrieved_same_document(mq, retrieved)
+            verification_outcome = self._retrieved_verification_outcome(retrieved)
 
-            retrieved_answer = self._safe_text(retrieved.item.answer_text)
-            if retrieved_answer:
-                parts.append(f"Related prior label or answer: {self._truncate_chars(retrieved_answer, 80)}")
             if retrieved_block:
                 parts.append(retrieved_block)
 
@@ -632,7 +740,7 @@ class HFGenerator:
             )
 
         doc_sig = self._query_doc_signature(mq)
-        if doc_sig:
+        if self.cfg.include_doc_signature and doc_sig:
             parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
 
         parts.append(f"CURRENT QUESTION: {question}")
@@ -647,6 +755,9 @@ class HFGenerator:
         self.last_generation_meta["final_context_chars"] = len(retrieved_block) if retrieved_block else 0
         self.last_generation_meta["retrieved_evidence_chars"] = len(retrieved_evidence) if retrieved_evidence else None
         self.last_generation_meta["retrieved_doc_signature_match"] = same_doc
+        self.last_generation_meta["retrieved_verification_outcome"] = verification_outcome
+        self.last_generation_meta["query_answer_type"] = self._query_answer_type(mq) or None
+        self.last_generation_meta["query_canonical_query_signature"] = self._query_canonical_query_signature(mq) or None
 
         return prompt
 
@@ -662,6 +773,14 @@ class HFGenerator:
         mq: MemoryQuery,
         retrieved: Optional[MemoryHit],
     ) -> Tuple[str, Dict[str, object]]:
+        """
+        Choose the context block to feed the model.
+
+        Design:
+        - for semantic context-only hits, prefer compact local/retrieved evidence
+        - for QA, prefer local context over dumping full dataset context
+        - this keeps prompts short and Jetson-friendly
+        """
         dataset_ctx = self._query_dataset_context(mq) if self.cfg.include_dataset_context else ""
         query_evidence = self._truncate_chars(
             self._query_evidence_text(mq),
@@ -684,11 +803,14 @@ class HFGenerator:
 
             parts = []
 
+            # Prefer current-query local evidence first.
             if query_evidence:
                 parts.append("CURRENT LOCAL CONTEXT:\n" + query_evidence)
 
+            # Retrieved evidence is useful as support but should remain evidence,
+            # not a direct answer hint.
             if retrieved_evidence:
-                parts.append("RETRIEVED SUPPORT:\n" + retrieved_evidence)
+                parts.append("RETRIEVED EVIDENCE:\n" + retrieved_evidence)
 
             context_block = "\n\n".join(parts).strip()
 
@@ -698,7 +820,7 @@ class HFGenerator:
                 "final_context_chars": len(context_block),
                 "retrieved_evidence_chars": len(retrieved_evidence) if retrieved_evidence else None,
                 "retrieved_doc_signature_match": same_document,
-                "context_already_contains_retrieved": True,
+                "retrieved_verification_outcome": self._retrieved_verification_outcome(retrieved),
             }
 
         question_type = self._query_question_type(mq).lower()
@@ -710,7 +832,7 @@ class HFGenerator:
                     "final_context_chars": len(query_evidence),
                     "retrieved_evidence_chars": None,
                     "retrieved_doc_signature_match": None,
-                    "context_already_contains_retrieved": False,
+                    "retrieved_verification_outcome": None,
                 }
 
         trimmed_full_ctx = self._truncate_chars(dataset_ctx, int(self.cfg.max_full_context_chars))
@@ -720,7 +842,7 @@ class HFGenerator:
             "final_context_chars": len(trimmed_full_ctx),
             "retrieved_evidence_chars": None,
             "retrieved_doc_signature_match": None,
-            "context_already_contains_retrieved": False,
+            "retrieved_verification_outcome": None,
         }
 
     def build_prompt(self, mq: MemoryQuery, retrieved: Optional[MemoryHit] = None) -> str:
@@ -741,24 +863,29 @@ class HFGenerator:
         if context_block:
             parts.append(f"CONTEXT:\n{context_block}")
 
-        # if self.cfg.include_retrieved_memory_context and retrieved is not None:
-        #     retrieved_block = self._retrieved_section(mq, retrieved)
-        #     if retrieved_block:
-        #         parts.append(retrieved_block)
-        already_contains_retrieved = bool(prompt_stats.get("context_already_contains_retrieved"))
-
+        # Keep the explicit retrieved block for traceability/debugging.
         if (
             self.cfg.include_retrieved_memory_context
+            and self.cfg.include_retrieval_metadata_block
             and retrieved is not None
-            and not already_contains_retrieved
         ):
             retrieved_block = self._retrieved_section(mq, retrieved)
             if retrieved_block:
                 parts.append(retrieved_block)
 
         doc_sig = self._query_doc_signature(mq)
-        if doc_sig:
+        if self.cfg.include_doc_signature and doc_sig:
             parts.append(f"DOCUMENT SIGNATURE: {doc_sig}")
+
+        # Surface query-side richer semantic fields when available. These are
+        # useful for debugging and ablations, and cost very little.
+        query_answer_type = self._query_answer_type(mq)
+        if query_answer_type:
+            parts.append(f"QUERY ANSWER TYPE: {query_answer_type}")
+
+        query_signature = self._query_canonical_query_signature(mq)
+        if query_signature:
+            parts.append(f"QUERY CANONICAL SIGNATURE: {query_signature}")
 
         parts.append(f"CURRENT QUESTION: {self._safe_text(mq.raw_query)}")
         parts.append("FINAL ANSWER:")
@@ -772,11 +899,15 @@ class HFGenerator:
         self.last_generation_meta["final_context_chars"] = prompt_stats["final_context_chars"]
         self.last_generation_meta["retrieved_evidence_chars"] = prompt_stats["retrieved_evidence_chars"]
         self.last_generation_meta["retrieved_doc_signature_match"] = prompt_stats["retrieved_doc_signature_match"]
-        self.last_generation_meta["context_already_contains_retrieved"] = bool(
-            prompt_stats.get("context_already_contains_retrieved", False)
-        )
+        self.last_generation_meta["retrieved_verification_outcome"] = prompt_stats["retrieved_verification_outcome"]
+        self.last_generation_meta["query_answer_type"] = query_answer_type or None
+        self.last_generation_meta["query_canonical_query_signature"] = query_signature or None
 
         return prompt
+
+    # ------------------------------------------------------------------
+    # Generation backends
+    # ------------------------------------------------------------------
 
     def _manual_greedy_decode(
         self,
@@ -895,11 +1026,14 @@ class HFGenerator:
             "retrieved_match_type": retrieved.match_type.value if retrieved is not None else None,
             "retrieved_source_tier": retrieved.source_tier.value if retrieved is not None else None,
             "retrieved_score": float(retrieved.score) if retrieved is not None else None,
+            "retrieved_verification_outcome": prior_meta.get("retrieved_verification_outcome"),
             "retrieved_doc_signature_match": prior_meta.get("retrieved_doc_signature_match"),
             "retrieved_evidence_chars": prior_meta.get("retrieved_evidence_chars"),
             "reduced_context_used": prior_meta.get("reduced_context_used"),
             "full_context_chars": prior_meta.get("full_context_chars"),
             "final_context_chars": prior_meta.get("final_context_chars"),
+            "query_answer_type": prior_meta.get("query_answer_type"),
+            "query_canonical_query_signature": prior_meta.get("query_canonical_query_signature"),
             "use_kv_cache": bool(self.cfg.use_kv_cache),
             "fallback_used": bool(fallback_used),
             "fallback_from": fallback_from,
@@ -962,6 +1096,10 @@ class HFGenerator:
             kwargs["top_k"] = None
 
         return self.model.generate(**kwargs)
+
+    # ------------------------------------------------------------------
+    # Main generation API
+    # ------------------------------------------------------------------
 
     def generate(
         self,
@@ -1138,6 +1276,7 @@ class HFGenerator:
         )
 
         quality_metrics: Dict[str, float] = {}
+
         if retrieved is not None and retrieved.match_type == MatchType.SEMANTIC:
             quality_metrics["semantic_retrieval_score"] = float(retrieved.score)
         elif retrieved is not None and retrieved.match_type == MatchType.EXACT:
@@ -1157,10 +1296,31 @@ class HFGenerator:
         if reduced_context_used:
             quality_metrics["reduced_context_used"] = 1.0
 
-        full_context_chars = self.last_generation_meta.get("full_context_chars") if isinstance(self.last_generation_meta, dict) else None
-        final_context_chars = self.last_generation_meta.get("final_context_chars") if isinstance(self.last_generation_meta, dict) else None
-        retrieved_evidence_chars = self.last_generation_meta.get("retrieved_evidence_chars") if isinstance(self.last_generation_meta, dict) else None
-        same_doc = self.last_generation_meta.get("retrieved_doc_signature_match") if isinstance(self.last_generation_meta, dict) else None
+        full_context_chars = (
+            self.last_generation_meta.get("full_context_chars")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        final_context_chars = (
+            self.last_generation_meta.get("final_context_chars")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        retrieved_evidence_chars = (
+            self.last_generation_meta.get("retrieved_evidence_chars")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        same_doc = (
+            self.last_generation_meta.get("retrieved_doc_signature_match")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
+        verification_outcome = (
+            self.last_generation_meta.get("retrieved_verification_outcome")
+            if isinstance(self.last_generation_meta, dict)
+            else None
+        )
 
         if isinstance(full_context_chars, (int, float)):
             quality_metrics["full_context_chars"] = float(full_context_chars)
@@ -1170,6 +1330,14 @@ class HFGenerator:
             quality_metrics["retrieved_evidence_chars"] = float(retrieved_evidence_chars)
         if isinstance(same_doc, bool):
             quality_metrics["retrieved_same_document"] = 1.0 if same_doc else 0.0
+
+        if isinstance(verification_outcome, str):
+            if verification_outcome == VerificationOutcome.CONTEXT_ONLY.value:
+                quality_metrics["semantic_context_only"] = 1.0
+            elif verification_outcome == VerificationOutcome.DIRECT_REUSE.value:
+                quality_metrics["semantic_direct_reuse_flag"] = 1.0
+            elif verification_outcome == VerificationOutcome.REJECT.value:
+                quality_metrics["semantic_reject_flag"] = 1.0
 
         quality = QualitySignals(
             score=None,
@@ -1198,6 +1366,8 @@ class HFGenerator:
             "include_doc_signature": self.cfg.include_doc_signature,
             "prefer_retrieved_evidence_context": self.cfg.prefer_retrieved_evidence_context,
             "reduce_context_on_semantic_hit": self.cfg.reduce_context_on_semantic_hit,
+            "include_retrieval_metadata_block": self.cfg.include_retrieval_metadata_block,
+            "include_retrieved_answer_hint": self.cfg.include_retrieved_answer_hint,
             "max_evidence_chars": self.cfg.max_evidence_chars,
             "max_local_context_chars": self.cfg.max_local_context_chars,
             "max_full_context_chars": self.cfg.max_full_context_chars,
