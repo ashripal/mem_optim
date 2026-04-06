@@ -104,7 +104,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
     # -----------------------------
     # Initialize pipeline
     # -----------------------------
-    cache = LRUCache(capacity=cfg.max_cache_items)
+
     compute = ComputeEngine(cfg)
 
     resolved_device = getattr(compute, "active_device", None)
@@ -154,7 +154,7 @@ def run_benchmark(cfg: BenchmarkConfig) -> Dict[str, str]:
             try:
                 record = evaluate_example(
                     example=ex,
-                    cache=cache,
+                    # cache=cache,
                     compute=compute,
                     cfg=cfg,
                 )

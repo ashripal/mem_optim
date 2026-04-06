@@ -1,0 +1,65 @@
+{
+  "benchmark_name": "memarch__qwen05b__family_reuse__req64",
+  "notes": "Fair paired memarch family-clustered workload",
+  "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+  "workload_mode": "family_clustered",
+  "task_glob": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_family_clustered.jsonl",
+  "base_max_examples": 16,
+  "total_workload_examples": 64,
+  "unique_base_examples": 16,
+  "unique_families": 16,
+  "variant_rows": 48,
+  "tasks": [
+    "squad"
+  ],
+  "source_files": [
+    "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_family_clustered.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "ram_capacity_items": 256,
+  "disk_store_path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/memory/memarch__qwen05b__family_reuse__req64.sqlite",
+  "retrieval_mode": "semantic_bypass",
+  "lexical_enabled": false,
+  "lexical_threshold_context": 0.55,
+  "lexical_threshold_bypass": 0.75,
+  "lexical_top_k": 3,
+  "prefer_same_source": true,
+  "safe_direct_reuse_tasks": [
+    "trec"
+  ],
+  "semantic_enabled": true,
+  "semantic_threshold_context": 0.55,
+  "semantic_threshold_bypass": 0.9,
+  "max_semantic_candidates": 5,
+  "allow_semantic_bypass": true,
+  "require_same_document_for_semantic_bypass": true,
+  "semantic_bypass_min_margin": 0.02,
+  "require_evidence_support_for_semantic_bypass": true,
+  "semantic_direct_reuse_tasks": [
+    "squad",
+    "extractive_qa",
+    "qa",
+    "trec"
+  ],
+  "semantic_bypass_max_answer_words": 12,
+  "embedding_model_id": "/home/sravani/mem_optim/thesis_code/models/all-MiniLM-L6-v2",
+  "promote_disk_hits_to_ram": true,
+  "return_memory_directly": true,
+  "enable_storage": true,
+  "store_in_ram": true,
+  "store_on_disk": true,
+  "max_input_tokens": 1024,
+  "max_new_tokens": 32,
+  "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+  "namespaces": {
+    "user_id": "user_a",
+    "session_id": "session_a",
+    "cohort_id": null
+  },
+  "total_requests": 64,
+  "repeat_fraction": 0.0,
+  "observed_repeat_requests": 48,
+  "observed_repeat_rate": 0.75
+}

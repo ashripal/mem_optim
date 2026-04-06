@@ -1,0 +1,170 @@
+{
+  "run_jsonl": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/cold/baseline_qwen05b_cpu_smoke_squad_8_20260405_232602/baseline_qwen05b_cpu_smoke_squad_8_20260405_232602_20260405_232606.jsonl",
+  "counts": {
+    "total": 8,
+    "ok": 8,
+    "err": 0,
+    "ok_rate": 1.0
+  },
+  "latency": {
+    "count": 8,
+    "mean": 2.1046502075332683,
+    "median": 2.353871227474883,
+    "p90": 2.465011097956449,
+    "p95": 2.475561870029196,
+    "p99": 2.4840024876873943,
+    "min": 1.2935501171741635,
+    "max": 2.4861126421019435
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "output_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "tokens_per_second": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "truncated_count": 0,
+    "truncated_rate": 0.0
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 8,
+      "mean": 3573.1826171875,
+      "median": 3573.8359375,
+      "p90": 3574.0234375,
+      "p95": 3574.0234375,
+      "p99": 3574.0234375,
+      "min": 3569.78515625,
+      "max": 3574.0234375
+    },
+    "rss_after_mb": {
+      "count": 8,
+      "mean": 3573.71240234375,
+      "median": 3574.0234375,
+      "p90": 3574.0234375,
+      "p95": 3574.0234375,
+      "p99": 3574.0234375,
+      "min": 3572.28515625,
+      "max": 3574.0234375
+    },
+    "rss_delta_mb": {
+      "count": 8,
+      "mean": 0.52978515625,
+      "median": 0.0,
+      "p90": 1.7042968749999998,
+      "p95": 2.1021484374999995,
+      "p99": 2.4204296874999995,
+      "min": 0.0,
+      "max": 2.5
+    }
+  },
+  "devices": {
+    "counts": {
+      "cuda": 8
+    },
+    "shares": {
+      "cuda": 1.0
+    }
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 8,
+    "hit_rate": 0.0
+  },
+  "quality": {
+    "exact_match": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "contains_answer": {
+      "count": 8,
+      "mean": 0.5,
+      "median": 0.5,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "token_f1": {
+      "count": 8,
+      "mean": 0.11475095785440613,
+      "median": 0.10344827586206896,
+      "p90": 0.23555555555555552,
+      "p95": 0.25111111111111106,
+      "p99": 0.26355555555555554,
+      "min": 0.0,
+      "max": 0.26666666666666666
+    },
+    "char_f1": {
+      "count": 8,
+      "mean": 0.2202669072804772,
+      "median": 0.19132225102943418,
+      "p90": 0.335951532430506,
+      "p95": 0.40275837491090516,
+      "p99": 0.4562038488952245,
+      "min": 0.1375,
+      "max": 0.46956521739130436
+    }
+  },
+  "run_id": "baseline_qwen05b_cpu_smoke_squad_8_20260405_232602_20260405_232606",
+  "created_at": "2026-04-05T23:26:13.105640",
+  "config": {
+    "benchmark_name": "baseline_qwen05b_cpu_smoke_squad_8_20260405_232602",
+    "notes": "Baseline smoke test (qwen05b)",
+    "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+    "out_dir": "artifacts/benchmark_runs/baseline",
+    "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+    "max_input_tokens": 1024,
+    "max_new_tokens": 32,
+    "device": "cuda",
+    "dtype": "float32",
+    "cpu_fallback_on_long": false,
+    "workload": {
+      "task_glob": "workload_exact",
+      "max_examples": 8,
+      "mode": "cold",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0,
+      "total_requests": null,
+      "repeat_fraction": 0.0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-04-05T23:26:29.952088"
+}

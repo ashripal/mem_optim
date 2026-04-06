@@ -26,6 +26,76 @@ def _normalize_dtype(dtype: str) -> str:
     }
     return mapping[str(dtype).strip().lower()]
 
+def _normalize_workload_mode(mode: str) -> str:
+    """
+    Translate memarch-style workload names into the subset currently supported
+    by the baseline benchmark config.
+    """
+    mode = str(mode).strip().lower()
+
+    mapping = {
+        "cold": "cold",
+        "replay_once": "replay_once",
+        "replay_k": "replay_k",
+        "mixed_reuse": "mixed_reuse",
+        "exact_interleaved": "mixed_reuse",
+        "approx_interleaved": "mixed_reuse",
+        "family_clustered": "mixed_reuse",
+        "cache_pressure": "replay_k",
+    }
+
+    if mode not in mapping:
+        raise ValueError(
+            f"Unsupported CLI mode for baseline runner: {mode!r}. "
+            f"Expected one of: {sorted(mapping.keys())}"
+        )
+
+    normalized = mapping[mode]
+    if normalized != mode:
+        print(f"[info] Baseline runner remapping workload mode {mode!r} -> {normalized!r}")
+    return normalized
+
+def _normalize_total_requests(
+    original_mode: str,
+    normalized_mode: str,
+    total_requests: int | None,
+    max_examples: int,
+    replay_k: int,
+) -> int | None:
+    """
+    Fill in required total_requests when a richer memarch-style mode is remapped
+    onto a baseline mode that requires it.
+    """
+    if total_requests is not None:
+        return int(total_requests)
+
+    original_mode = str(original_mode).strip().lower()
+    normalized_mode = str(normalized_mode).strip().lower()
+
+    if normalized_mode == "mixed_reuse":
+        if original_mode in {"exact_interleaved", "approx_interleaved", "family_clustered"}:
+            inferred = int(max_examples)
+            if inferred <= 0:
+                raise ValueError(
+                    f"Could not infer total_requests for mode={original_mode!r}; "
+                    f"max_examples must be > 0."
+                )
+            print(
+                f"[info] Baseline runner inferring total_requests={inferred} "
+                f"for remapped mode {original_mode!r} -> 'mixed_reuse'"
+            )
+            return inferred
+
+    if normalized_mode == "replay_k":
+        if original_mode == "cache_pressure":
+            inferred = max(1, int(max_examples))
+            print(
+                f"[info] Baseline runner inferring total_requests={inferred} "
+                f"for remapped mode 'cache_pressure' -> 'replay_k'"
+            )
+            return inferred
+
+    return total_requests
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -123,20 +193,29 @@ def build_parser() -> argparse.ArgumentParser:
 def args_to_config(args: argparse.Namespace) -> BenchmarkConfig:
     effective_task_glob = str(args.task_glob or "").strip()
     if str(args.input_path or "").strip():
-        effective_task_glob = str(Path(args.input_path).expanduser().resolve())
+        effective_task_glob = Path(args.input_path).stem
 
     max_input_tokens = int(args.max_input_tokens)
     if args.jetson_safe_mode:
         max_input_tokens = min(max_input_tokens, 2048)
 
+    normalized_mode = _normalize_workload_mode(args.mode)
+    normalized_total_requests = _normalize_total_requests(
+        original_mode=args.mode,
+        normalized_mode=normalized_mode,
+        total_requests=args.total_requests,
+        max_examples=args.max_examples,
+        replay_k=args.replay_k,
+    )
+
     workload = WorkloadConfig(
         task_glob=effective_task_glob,
         max_examples=args.max_examples,
-        mode=args.mode,
+        mode=normalized_mode,
         replay_k=args.replay_k,
         shuffle=args.shuffle,
         seed=args.seed,
-        total_requests=args.total_requests,
+        total_requests=normalized_total_requests,
         repeat_fraction=args.repeat_fraction,
     )
 

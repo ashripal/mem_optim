@@ -210,7 +210,6 @@ def build_workload_manifest(
         "shuffle": cfg.workload.shuffle,
         "seed": cfg.workload.seed,
         "replay_k": cfg.workload.replay_k,
-        "max_cache_items": cfg.max_cache_items,
         "max_input_tokens": cfg.max_input_tokens,
         "max_new_tokens": cfg.max_new_tokens,
         "model_id": cfg.model_id,

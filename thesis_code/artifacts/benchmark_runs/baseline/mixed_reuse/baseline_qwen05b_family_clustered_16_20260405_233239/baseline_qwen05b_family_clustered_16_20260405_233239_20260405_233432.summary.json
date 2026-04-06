@@ -1,0 +1,170 @@
+{
+  "run_jsonl": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/mixed_reuse/baseline_qwen05b_family_clustered_16_20260405_233239/baseline_qwen05b_family_clustered_16_20260405_233239_20260405_233432.jsonl",
+  "counts": {
+    "total": 16,
+    "ok": 16,
+    "err": 0,
+    "ok_rate": 1.0
+  },
+  "latency": {
+    "count": 16,
+    "mean": 2.4744822825014126,
+    "median": 2.473356193047948,
+    "p90": 2.4814294254174456,
+    "p95": 2.4901032316847704,
+    "p99": 2.5047570479917343,
+    "min": 2.458613727008924,
+    "max": 2.508420502068475
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "output_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "tokens_per_second": {
+      "count": 16,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "truncated_count": 0,
+    "truncated_rate": 0.0
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 16,
+      "mean": 3581.816650390625,
+      "median": 3581.94140625,
+      "p90": 3582.154296875,
+      "p95": 3582.3671875,
+      "p99": 3582.3671875,
+      "min": 3579.09375,
+      "max": 3582.3671875
+    },
+    "rss_after_mb": {
+      "count": 16,
+      "mean": 3582.021240234375,
+      "median": 3581.94140625,
+      "p90": 3582.3671875,
+      "p95": 3582.3671875,
+      "p99": 3582.3671875,
+      "min": 3581.94140625,
+      "max": 3582.3671875
+    },
+    "rss_delta_mb": {
+      "count": 16,
+      "mean": 0.20458984375,
+      "median": 0.0,
+      "p90": 0.212890625,
+      "p95": 1.03125,
+      "p99": 2.484374999999999,
+      "min": 0.0,
+      "max": 2.84765625
+    }
+  },
+  "devices": {
+    "counts": {
+      "cuda": 16
+    },
+    "shares": {
+      "cuda": 1.0
+    }
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 16,
+    "hit_rate": 0.0
+  },
+  "quality": {
+    "exact_match": {
+      "count": 16,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "contains_answer": {
+      "count": 16,
+      "mean": 0.375,
+      "median": 0.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "token_f1": {
+      "count": 16,
+      "mean": 0.15194521627102966,
+      "median": 0.10023041474654378,
+      "p90": 0.38104838709677413,
+      "p95": 0.39032258064516123,
+      "p99": 0.39806451612903226,
+      "min": 0.0,
+      "max": 0.4
+    },
+    "char_f1": {
+      "count": 16,
+      "mean": 0.3024879161965406,
+      "median": 0.27375487900078066,
+      "p90": 0.4771043771043771,
+      "p95": 0.4853149327671621,
+      "p99": 0.4945152158527955,
+      "min": 0.1839080459770115,
+      "max": 0.4968152866242038
+    }
+  },
+  "run_id": "baseline_qwen05b_family_clustered_16_20260405_233239_20260405_233432",
+  "created_at": "2026-04-05T23:34:39.119791",
+  "config": {
+    "benchmark_name": "baseline_qwen05b_family_clustered_16_20260405_233239",
+    "notes": "Baseline family clustered test (qwen05b)",
+    "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+    "out_dir": "artifacts/benchmark_runs/baseline",
+    "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+    "max_input_tokens": 1024,
+    "max_new_tokens": 32,
+    "device": "cuda",
+    "dtype": "float32",
+    "cpu_fallback_on_long": false,
+    "workload": {
+      "task_glob": "workload_family_clustered",
+      "max_examples": 16,
+      "mode": "mixed_reuse",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0,
+      "total_requests": 16,
+      "repeat_fraction": 0.0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-04-05T23:35:18.728888"
+}

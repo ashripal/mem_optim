@@ -1,0 +1,170 @@
+{
+  "run_jsonl": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/cold/baseline_jetson_smoke_8/baseline_jetson_smoke_8_20260403_050150.jsonl",
+  "counts": {
+    "total": 8,
+    "ok": 8,
+    "err": 0,
+    "ok_rate": 1.0
+  },
+  "latency": {
+    "count": 8,
+    "mean": 1.539463449997129,
+    "median": 1.5638437593588606,
+    "p90": 1.5737122566672042,
+    "p95": 1.5797810672898778,
+    "p99": 1.5846361157880164,
+    "min": 1.3463816589210182,
+    "max": 1.5858498779125512
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "output_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "tokens_per_second": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "truncated_count": 0,
+    "truncated_rate": 0.0
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 8,
+      "mean": 2828.25341796875,
+      "median": 2829.01953125,
+      "p90": 2829.01953125,
+      "p95": 2829.01953125,
+      "p99": 2829.01953125,
+      "min": 2826.203125,
+      "max": 2829.01953125
+    },
+    "rss_after_mb": {
+      "count": 8,
+      "mean": 2828.60546875,
+      "median": 2829.01953125,
+      "p90": 2829.01953125,
+      "p95": 2829.01953125,
+      "p99": 2829.01953125,
+      "min": 2827.36328125,
+      "max": 2829.01953125
+    },
+    "rss_delta_mb": {
+      "count": 8,
+      "mean": 0.35205078125,
+      "median": 0.0,
+      "p90": 1.308984375,
+      "p95": 1.4826171874999998,
+      "p99": 1.6215234374999998,
+      "min": 0.0,
+      "max": 1.65625
+    }
+  },
+  "devices": {
+    "counts": {
+      "cuda": 8
+    },
+    "shares": {
+      "cuda": 1.0
+    }
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 8,
+    "hit_rate": 0.0
+  },
+  "quality": {
+    "exact_match": {
+      "count": 8,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "contains_answer": {
+      "count": 8,
+      "mean": 0.375,
+      "median": 0.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "token_f1": {
+      "count": 8,
+      "mean": 0.12623716153127917,
+      "median": 0.1111111111111111,
+      "p90": 0.2723809523809524,
+      "p95": 0.27904761904761904,
+      "p99": 0.28438095238095235,
+      "min": 0.0,
+      "max": 0.2857142857142857
+    },
+    "char_f1": {
+      "count": 8,
+      "mean": 0.2772758620628285,
+      "median": 0.25353397172822617,
+      "p90": 0.35723751274209986,
+      "p95": 0.41010023785253136,
+      "p99": 0.45239041794087653,
+      "min": 0.2058823529411765,
+      "max": 0.4629629629629629
+    }
+  },
+  "run_id": "baseline_jetson_smoke_8_20260403_050150",
+  "created_at": "2026-04-03T05:01:57.203293",
+  "config": {
+    "benchmark_name": "baseline_jetson_smoke_8",
+    "notes": "baseline jetson smoke test paraphrase 8",
+    "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+    "out_dir": "artifacts/benchmark_runs/baseline",
+    "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+    "max_input_tokens": 256,
+    "max_new_tokens": 20,
+    "device": "cuda",
+    "dtype": "float16",
+    "cpu_fallback_on_long": false,
+    "workload": {
+      "task_glob": "workload_exact",
+      "max_examples": 8,
+      "mode": "cold",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0,
+      "total_requests": null,
+      "repeat_fraction": 0.0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-04-03T05:02:09.528938"
+}

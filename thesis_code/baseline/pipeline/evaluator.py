@@ -44,9 +44,9 @@ def _build_prompt(example: Dict[str, Any]) -> str:
 
 def evaluate_example(
     example: Dict[str, Any],
-    cache: Optional[Any],  # kept only for temporary API compatibility; intentionally unused
     compute: Any,
     cfg: Any,
+    cache: Any = None,  # optional + last
 ) -> Dict[str, Any]:
     """
     Evaluate a single example with a stateless baseline.

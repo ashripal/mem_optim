@@ -1,0 +1,28 @@
+{
+  "benchmark_name": "baseline_qwen05b_family_clustered_16_20260405_233239",
+  "notes": "Baseline family clustered test (qwen05b)",
+  "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+  "workload_mode": "mixed_reuse",
+  "task_glob": "workload_family_clustered",
+  "base_max_examples": 16,
+  "total_workload_examples": 16,
+  "unique_base_examples": 16,
+  "tasks": [
+    "workload_family_clustered"
+  ],
+  "source_files": [
+    "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_family_clustered.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "max_input_tokens": 1024,
+  "max_new_tokens": 32,
+  "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+  "device": "cuda",
+  "dtype": "float32",
+  "total_requests": 16,
+  "repeat_fraction": 0.0,
+  "observed_repeat_requests": 0,
+  "observed_repeat_rate": 0.0
+}

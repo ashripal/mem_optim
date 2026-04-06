@@ -1,0 +1,28 @@
+{
+  "benchmark_name": "baseline_jetson_smoke_8",
+  "notes": "baseline jetson smoke test paraphrase 8",
+  "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+  "workload_mode": "cold",
+  "task_glob": "workload_exact",
+  "base_max_examples": 8,
+  "total_workload_examples": 8,
+  "unique_base_examples": 8,
+  "tasks": [
+    "workload_exact"
+  ],
+  "source_files": [
+    "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_exact.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "max_input_tokens": 256,
+  "max_new_tokens": 20,
+  "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-0.5B-Instruct",
+  "device": "cuda",
+  "dtype": "float16",
+  "total_requests": null,
+  "repeat_fraction": 0.0,
+  "observed_repeat_requests": 0,
+  "observed_repeat_rate": 0.0
+}
