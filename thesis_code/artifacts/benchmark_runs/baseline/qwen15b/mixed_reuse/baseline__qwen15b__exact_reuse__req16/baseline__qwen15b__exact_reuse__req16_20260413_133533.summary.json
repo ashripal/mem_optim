@@ -1,0 +1,170 @@
+{
+  "run_jsonl": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/qwen15b/mixed_reuse/baseline__qwen15b__exact_reuse__req16/baseline__qwen15b__exact_reuse__req16_20260413_133533.jsonl",
+  "counts": {
+    "total": 16,
+    "ok": 16,
+    "err": 0,
+    "ok_rate": 1.0
+  },
+  "latency": {
+    "count": 16,
+    "mean": 2.7497426789373662,
+    "median": 3.0371580864998577,
+    "p90": 3.1987103994997597,
+    "p95": 3.213796530749846,
+    "p99": 3.2176007269498994,
+    "min": 0.5832230329997401,
+    "max": 3.218551775999913
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "output_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "tokens_per_second": {
+      "count": 16,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "truncated_count": 0,
+    "truncated_rate": 0.0
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 16,
+      "mean": 2557.912841796875,
+      "median": 2558.1484375,
+      "p90": 2558.1484375,
+      "p95": 2558.1484375,
+      "p99": 2558.1484375,
+      "min": 2556.40234375,
+      "max": 2558.1484375
+    },
+    "rss_after_mb": {
+      "count": 16,
+      "mean": 2558.041748046875,
+      "median": 2558.1484375,
+      "p90": 2558.1484375,
+      "p95": 2558.2275390625,
+      "p99": 2558.4173828125,
+      "min": 2556.640625,
+      "max": 2558.46484375
+    },
+    "rss_delta_mb": {
+      "count": 16,
+      "mean": 0.12890625,
+      "median": 0.0,
+      "p90": 0.287109375,
+      "p95": 0.5498046875,
+      "p99": 1.1099609374999997,
+      "min": 0.0,
+      "max": 1.25
+    }
+  },
+  "devices": {
+    "counts": {
+      "cuda": 16
+    },
+    "shares": {
+      "cuda": 1.0
+    }
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 16,
+    "hit_rate": 0.0
+  },
+  "quality": {
+    "exact_match": {
+      "count": 16,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "contains_answer": {
+      "count": 16,
+      "mean": 0.25,
+      "median": 0.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "token_f1": {
+      "count": 16,
+      "mean": 0.07314311594202899,
+      "median": 0.0,
+      "p90": 0.20833333333333334,
+      "p95": 0.3125,
+      "p99": 0.4624999999999999,
+      "min": 0.0,
+      "max": 0.5
+    },
+    "char_f1": {
+      "count": 16,
+      "mean": 0.2552874902831248,
+      "median": 0.19108280254777069,
+      "p90": 0.4,
+      "p95": 0.5413793103448277,
+      "p99": 0.8806896551724136,
+      "min": 0.09523809523809523,
+      "max": 0.9655172413793104
+    }
+  },
+  "run_id": "baseline__qwen15b__exact_reuse__req16_20260413_133533",
+  "created_at": "2026-04-13T13:35:42.947762",
+  "config": {
+    "benchmark_name": "baseline__qwen15b__exact_reuse__req16",
+    "notes": "Fair paired baseline repeated exact-query workload (qwen15b)",
+    "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+    "out_dir": "artifacts/benchmark_runs/baseline/qwen15b",
+    "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-1.5B-Instruct",
+    "max_input_tokens": 1024,
+    "max_new_tokens": 32,
+    "device": "cuda",
+    "dtype": "float32",
+    "cpu_fallback_on_long": false,
+    "workload": {
+      "task_glob": "workload_exact",
+      "max_examples": 8,
+      "mode": "mixed_reuse",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0,
+      "total_requests": 16,
+      "repeat_fraction": 0.0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline/qwen15b",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-04-13T13:36:26.958817"
+}

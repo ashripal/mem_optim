@@ -1,0 +1,170 @@
+{
+  "run_jsonl": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/qwen15/mixed_reuse/baseline__qwen15b__family_reuse__req64/baseline__qwen15b__family_reuse__req64_20260413_144121.jsonl",
+  "counts": {
+    "total": 64,
+    "ok": 64,
+    "err": 0,
+    "ok_rate": 1.0
+  },
+  "latency": {
+    "count": 64,
+    "mean": 4.845168306093711,
+    "median": 4.854766307499631,
+    "p90": 4.92296516430024,
+    "p95": 4.947289353500356,
+    "p99": 4.964943016629968,
+    "min": 4.508613695999884,
+    "max": 4.9664204919999975
+  },
+  "tokens": {
+    "input_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "output_tokens": {
+      "count": 0,
+      "mean": null,
+      "median": null,
+      "p90": null,
+      "p95": null,
+      "p99": null,
+      "min": null,
+      "max": null
+    },
+    "tokens_per_second": {
+      "count": 64,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "truncated_count": 0,
+    "truncated_rate": 0.0
+  },
+  "memory": {
+    "rss_before_mb": {
+      "count": 64,
+      "mean": 2547.5405883789062,
+      "median": 2547.59765625,
+      "p90": 2547.91015625,
+      "p95": 2548.461328125,
+      "p99": 2548.64453125,
+      "min": 2543.703125,
+      "max": 2548.64453125
+    },
+    "rss_after_mb": {
+      "count": 64,
+      "mean": 2547.6203002929688,
+      "median": 2547.59765625,
+      "p90": 2547.91015625,
+      "p95": 2548.55859375,
+      "p99": 2548.7037890624997,
+      "min": 2546.3046875,
+      "max": 2548.8046875
+    },
+    "rss_delta_mb": {
+      "count": 64,
+      "mean": 0.0797119140625,
+      "median": 0.0,
+      "p90": 0.06250000000000022,
+      "p95": 0.28964843749999913,
+      "p99": 1.7131640624999964,
+      "min": 0.0,
+      "max": 2.6015625
+    }
+  },
+  "devices": {
+    "counts": {
+      "cuda": 64
+    },
+    "shares": {
+      "cuda": 1.0
+    }
+  },
+  "cache": {
+    "hits": 0,
+    "misses": 64,
+    "hit_rate": 0.0
+  },
+  "quality": {
+    "exact_match": {
+      "count": 64,
+      "mean": 0.0,
+      "median": 0.0,
+      "p90": 0.0,
+      "p95": 0.0,
+      "p99": 0.0,
+      "min": 0.0,
+      "max": 0.0
+    },
+    "contains_answer": {
+      "count": 64,
+      "mean": 0.46875,
+      "median": 0.0,
+      "p90": 1.0,
+      "p95": 1.0,
+      "p99": 1.0,
+      "min": 0.0,
+      "max": 1.0
+    },
+    "token_f1": {
+      "count": 64,
+      "mean": 0.1902011605440762,
+      "median": 0.14303959131545338,
+      "p90": 0.3834677419354839,
+      "p95": 0.3870967741935483,
+      "p99": 0.3870967741935483,
+      "min": 0.0,
+      "max": 0.3870967741935483
+    },
+    "char_f1": {
+      "count": 64,
+      "mean": 0.3145416678645406,
+      "median": 0.31788079470198677,
+      "p90": 0.4554021491370891,
+      "p95": 0.47475022039377013,
+      "p99": 0.47560975609756095,
+      "min": 0.1780104712041885,
+      "max": 0.47560975609756095
+    }
+  },
+  "run_id": "baseline__qwen15b__family_reuse__req64_20260413_144121",
+  "created_at": "2026-04-13T14:41:31.894768",
+  "config": {
+    "benchmark_name": "baseline__qwen15b__family_reuse__req64",
+    "notes": "Fair paired baseline family-clustered workload (qwen15b)",
+    "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+    "out_dir": "artifacts/benchmark_runs/baseline/qwen15",
+    "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-1.5B-Instruct",
+    "max_input_tokens": 1024,
+    "max_new_tokens": 32,
+    "device": "cuda",
+    "dtype": "float32",
+    "cpu_fallback_on_long": false,
+    "workload": {
+      "task_glob": "workload_family_clustered",
+      "max_examples": 16,
+      "mode": "mixed_reuse",
+      "replay_k": 2,
+      "shuffle": false,
+      "seed": 0,
+      "total_requests": 64,
+      "repeat_fraction": 0.0
+    },
+    "output": {
+      "root_dir": "artifacts/benchmark_runs/baseline/qwen15",
+      "write_workload_manifest": true,
+      "write_summary_json": true
+    }
+  },
+  "finished_at": "2026-04-13T14:46:42.055197"
+}

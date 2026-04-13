@@ -1,0 +1,28 @@
+{
+  "benchmark_name": "baseline__qwen15b__exact_reuse__req16",
+  "notes": "Fair paired baseline repeated exact-query workload (qwen15b)",
+  "tier2_repo": "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean",
+  "workload_mode": "mixed_reuse",
+  "task_glob": "workload_exact",
+  "base_max_examples": 8,
+  "total_workload_examples": 16,
+  "unique_base_examples": 8,
+  "tasks": [
+    "workload_exact"
+  ],
+  "source_files": [
+    "/home/sravani/mem_optim/thesis_code/baseline_old/tier2_disk/data/squad_clean/workload_exact.jsonl"
+  ],
+  "shuffle": false,
+  "seed": 0,
+  "replay_k": 2,
+  "max_input_tokens": 1024,
+  "max_new_tokens": 32,
+  "model_id": "/home/sravani/mem_optim/thesis_code/models/Qwen2.5-1.5B-Instruct",
+  "device": "cuda",
+  "dtype": "float32",
+  "total_requests": 16,
+  "repeat_fraction": 0.0,
+  "observed_repeat_requests": 8,
+  "observed_repeat_rate": 0.5
+}

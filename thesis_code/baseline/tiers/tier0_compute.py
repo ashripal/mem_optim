@@ -125,6 +125,10 @@ class ComputeEngine:
 
         self.model = AutoModelForCausalLM.from_pretrained(self.model_id, **model_kwargs)
 
+        self.model.config.pad_token_id = self.tokenizer.pad_token_id
+        if self.model.config.eos_token_id is None:
+            self.model.config.eos_token_id = self.tokenizer.eos_token_id
+
         if len(self.tokenizer) > self.model.get_input_embeddings().num_embeddings:
             self.model.resize_token_embeddings(len(self.tokenizer))
 
@@ -141,11 +145,33 @@ class ComputeEngine:
         # 🔥 Warmup (VERY important on Jetson)
         self._warmup()
 
+    # def _warmup(self):
+    #     try:
+    #         dummy = self.tokenizer("Hello", return_tensors="pt").input_ids.to(self.active_device)
+    #         with torch.inference_mode():
+    #             _ = self.model.generate(dummy, max_new_tokens=2)
+    #     except Exception:
+    #         pass
     def _warmup(self):
         try:
-            dummy = self.tokenizer("Hello", return_tensors="pt").input_ids.to(self.active_device)
+            dummy_input = self.tokenizer(
+                "Hello",
+                return_tensors="pt",
+                padding=True,  # ADD THIS
+                add_special_tokens=True,
+            )
+            dummy_ids = dummy_input["input_ids"].to(self.active_device)
+            dummy_mask = dummy_input.get("attention_mask")
+            if dummy_mask is not None:
+                dummy_mask = dummy_mask.to(self.active_device)
+            
             with torch.inference_mode():
-                _ = self.model.generate(dummy, max_new_tokens=2)
+                _ = self.model.generate(
+                    input_ids=dummy_ids,
+                    attention_mask=dummy_mask,  # ADD THIS
+                    max_new_tokens=2,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                )
         except Exception:
             pass
 
@@ -182,7 +208,7 @@ class ComputeEngine:
     ) -> Dict[str, Any]:
 
         tok_t0 = time.time()
-        enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
+        enc = self.tokenizer(prompt, return_tensors="pt", add_special_tokens=True, padding=True, truncation=True, max_length=max_input_tokens)
         tok_time_s = time.time() - tok_t0
 
         input_ids = enc["input_ids"]

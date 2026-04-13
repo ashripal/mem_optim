@@ -331,6 +331,7 @@ def generate_llm(
         return_tensors="pt",
         truncation=True,
         max_length=max_input_tokens,
+        padding=True,
     )
     input_len = int(inputs["input_ids"].shape[-1])
     hit_cap = (input_len == max_input_tokens)
@@ -338,11 +339,12 @@ def generate_llm(
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     out = model.generate(
-        **inputs,
+        input_ids=inputs["input_ids"],
+        attention_mask=inputs.get("attention_mask"),
         max_new_tokens=max_new_tokens,
         do_sample=False,
         use_cache=True,
-        pad_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
     )
 
     t1 = time.perf_counter()
@@ -416,10 +418,16 @@ def main() -> None:
     llm_model = None
     if args.mode in ("baseline_llm", "memory_qacache"):
         llm_tok = AutoTokenizer.from_pretrained(args.llm_model_id, use_fast=True)
+
+        if llm_tok.pad_token is None:
+            llm_tok.pad_token = llm_tok.eos_token
+
         dtype = torch.float16 if llm_device.type in ("mps", "cuda") else torch.float32
         llm_model = AutoModelForCausalLM.from_pretrained(args.llm_model_id, torch_dtype=dtype)
         llm_model.to(llm_device)
         llm_model.eval()
+
+        llm_model.config.pad_token_id = llm_tok.pad_token_id
 
         # if model config provides a smaller limit, respect it
         model_max = getattr(llm_model.config, "max_position_embeddings", None)

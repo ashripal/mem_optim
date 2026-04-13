@@ -1,0 +1,58 @@
+{
+  "Cold": {
+    "baseline": {
+      "benchmark_name": "baseline__qwen05b__cold__exact__req8",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/qwen05/cold/baseline__qwen05b__cold__exact__req8/baseline__qwen05b__cold__exact__req8_20260413_141927.jsonl",
+      "mean_latency_s": 2.513893941250103,
+      "num_queries": 8
+    },
+    "memarch": {
+      "benchmark_name": "memarch__qwen05b__cold__exact__req8",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/qwen05/cold/memarch__qwen05b__cold__exact__req8/memarch__qwen05b__cold__exact__req8_20260413_142000.jsonl",
+      "mean_latency_s": 3.6911526322364807,
+      "num_queries": 8
+    }
+  },
+  "Exact Reuse": {
+    "baseline": {
+      "benchmark_name": "baseline__qwen05b__exact_reuse__req16",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/qwen05/mixed_reuse/baseline__qwen05b__exact_reuse__req16/baseline__qwen05b__exact_reuse__req16_20260413_142041.jsonl",
+      "mean_latency_s": 2.4516848444999937,
+      "num_queries": 16
+    },
+    "memarch": {
+      "benchmark_name": "memarch__qwen05b__exact_reuse__req16",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/qwen05/exact_interleaved/memarch__qwen05b__exact_reuse__req16/memarch__qwen05b__exact_reuse__req16_20260413_142133.jsonl",
+      "mean_latency_s": 1.8807750791311264,
+      "num_queries": 16
+    }
+  },
+  "Paraphrase Reuse": {
+    "baseline": {
+      "benchmark_name": "baseline__qwen05b__paraphrase_reuse__req32",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/qwen05/mixed_reuse/baseline__qwen05b__paraphrase_reuse__req32/baseline__qwen05b__paraphrase_reuse__req32_20260413_142215.jsonl",
+      "mean_latency_s": 2.75514675425012,
+      "num_queries": 32
+    },
+    "memarch": {
+      "benchmark_name": "memarch__qwen05b__paraphrase_reuse__req32",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/qwen05/approx_interleaved/memarch__qwen05b__paraphrase_reuse__req32/memarch__qwen05b__paraphrase_reuse__req32_20260413_142357.jsonl",
+      "mean_latency_s": 2.8833297714591026,
+      "num_queries": 32
+    }
+  },
+  "Family Reuse": {
+    "baseline": {
+      "benchmark_name": "baseline__qwen05b__family_reuse__req64",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/baseline/qwen05/mixed_reuse/baseline__qwen05b__family_reuse__req64/baseline__qwen05b__family_reuse__req64_20260413_142541.jsonl",
+      "mean_latency_s": 2.8776792164687635,
+      "num_queries": 64
+    },
+    "memarch": {
+      "benchmark_name": "memarch__qwen05b__family_reuse__req64",
+      "path": "/home/sravani/mem_optim/thesis_code/artifacts/benchmark_runs/memarch/qwen05/family_clustered/memarch__qwen05b__family_reuse__req64/memarch__qwen05b__family_reuse__req64_20260413_142858.jsonl",
+      "mean_latency_s": 1.863918337970972,
+      "num_queries": 64
+    }
+  }
+}

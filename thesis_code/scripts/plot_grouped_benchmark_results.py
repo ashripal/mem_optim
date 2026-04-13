@@ -14,6 +14,11 @@ VALID_GROUP_PATTERNS = {
     "qwen05b__exact_reuse__req16": "Exact Reuse",
     "qwen05b__paraphrase_reuse__req32": "Paraphrase Reuse",
     "qwen05b__family_reuse__req64": "Family Reuse",
+
+    "qwen15b__cold__exact__req8": "Cold",
+    "qwen15b__exact_reuse__req16": "Exact Reuse",
+    "qwen15b__paraphrase_reuse__req32": "Paraphrase Reuse",
+    "qwen15b__family_reuse__req64": "Family Reuse",
 }
 
 
